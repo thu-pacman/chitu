@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Callable
+
 from xgrammar.structural_tag import TagFormat
 
 from chitu.tool_call.grammar.arg_value import AbstractArgValueGrammar
@@ -13,19 +15,29 @@ class AbstractArgumentGrammar:
 
 
 class ArgumentGrammar(AbstractArgumentGrammar):
+    """The argument tag, with the key interpolated into the template:
+    ``begin{key}sep{value}end`` (the two ``{}`` marks of the template).
+
+    ``escape`` transforms the key into the syntax's literal form — e.g. an
+    XTML attribute value is XML-escaped (``&`` first, then ``"``);
+    identity when unset.
+    """
+
     def __init__(
         self,
         template: str = "<parameter name={}>{}</parameter>",
         *,
         arg_value: AbstractArgValueGrammar,
         mark="{}",
+        escape: Callable[[str], str] = lambda s: s,
     ):
         self.arg_value = arg_value
+        self.escape = escape
         self.begin, self.sep, self.end = template.split(mark)
 
     def build(self, arg_name: str, arg_schema: dict) -> TagFormat:
         return TagFormat(
-            begin=f"{self.begin}{arg_name}{self.sep}",
+            begin=f"{self.begin}{self.escape(arg_name)}{self.sep}",
             content=self.arg_value.build(arg_schema),
             end=self.end,
         )

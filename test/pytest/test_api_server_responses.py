@@ -16,6 +16,10 @@ class StaticAsyncStream:
         self.reasoning_tokens = 0
         self.input_cached_tokens = 0
         self._index = 0
+        # A classic model's stream: the tool-parser routing reads this.
+        self.output_parser = SimpleNamespace(
+            params=SimpleNamespace(separated_tool_calling=False)
+        )
 
     def __aiter__(self):
         self._index = 0

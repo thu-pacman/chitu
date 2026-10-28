@@ -22,6 +22,8 @@ if not DOC_GENERATION:
         patch_chat_template,
         build_grammar,
         InvalidToolCallArgumentsError,
+        warn_unparsed_tool_channel_text,
+        warn_plain_tool_channel_text,
     )
 
     # Parser modules register their parser classes during normal runtime import.
@@ -33,3 +35,4 @@ if not DOC_GENERATION:
     from .glm45_parser import GLM45ToolParser
     from .deepseekv32_parser import DeepSeekV32ToolParser
     from .deepseekv4_parser import DeepSeekV4ToolParser
+    from .kimi_k3_parser import KimiK3ToolParser

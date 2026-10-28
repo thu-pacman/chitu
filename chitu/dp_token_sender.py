@@ -280,8 +280,14 @@ class DPAsyncDataStream(AsyncDataStream):
     """DP Async Data Stream with integrated Token Sender capability"""
 
     @classmethod
-    def build(cls, enable_thinking: bool, task: Task, token_sender: DPTokenSender):
-        async_stream = cls(enable_thinking=enable_thinking)
+    def build(
+        cls,
+        enable_thinking: bool,
+        task: Task,
+        token_sender: DPTokenSender,
+        raw_output: bool = False,
+    ):
+        async_stream = cls(enable_thinking=enable_thinking, raw_output=raw_output)
         async_stream.task = task
         async_stream.token_sender = token_sender
         return async_stream
@@ -319,7 +325,7 @@ class DPAsyncDataStream(AsyncDataStream):
             elif self.task.req.finish_reason != "evicted":
                 self.token_sender.send_finish(
                     self.task.req.request_id,
-                    self.task.req.finish_reason,
+                    self.task.req.finish_reason or "stop",  # Don't pass None
                     self.task.req.num_hit_tokens,
                     input_cached_tokens=self.input_cached_tokens,
                 )
@@ -346,7 +352,10 @@ class DPTokenManager:
     def wrap_task(self, task: Task) -> Task:
         """Wrap Task to enable token sending"""
         task.req.async_stream = DPAsyncDataStream.build(
-            task.req.enable_thinking, task=task, token_sender=self.token_sender
+            task.req.enable_thinking,
+            task=task,
+            token_sender=self.token_sender,
+            raw_output=task.req.raw_output,
         )
 
         logger.debug(f"Wrapped task {task.req.request_id} for DP token sending")

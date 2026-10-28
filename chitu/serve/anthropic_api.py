@@ -23,12 +23,14 @@ DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
 if not DOC_GENERATION:
     from chitu.backend import Backend
     from chitu.global_vars import get_global_args
-    from chitu.task import SampleParams, UserRequest, RequestParams, PromptTooLongError
-    from chitu.output_parser import REASONING_OUTPUT_STATES
+    from chitu.task import UserRequest, RequestParams, PromptTooLongError
+    from chitu.output_parser import OutputState, REASONING_OUTPUT_STATES
     from chitu.tool_call import (
         get_tool_parser_cls,
         parse_stream_by_parser,
         InvalidToolCallArgumentsError,
+        warn_unparsed_tool_channel_text,
+        warn_plain_tool_channel_text,
     )
     from chitu.serve.common import (
         build_chat_template_kwargs,
@@ -516,16 +518,22 @@ def build_tool_use_delta(index: int, partial_json: str) -> dict:
     }
 
 
-async def collect_reasoning_and_text(async_stream) -> tuple[str, str]:
+async def collect_reasoning_and_text(async_stream) -> tuple[str, str, str]:
+    """Collect the reasoning text, the response text and the tools-channel
+    text separately (the tools-channel text is non-empty only for a model
+    with separated tool calling)."""
     chunks: list[str] = []
     rchunks: list[str] = []
+    tchunks: list[str] = []
     async for data, state, (_top_logprobs, _top_tokens) in async_stream:
         if data:
             if state in REASONING_OUTPUT_STATES:
                 rchunks.append(data)
+            elif state == OutputState.TOOL:
+                tchunks.append(data)
             else:
                 chunks.append(data)
-    return "".join(rchunks), "".join(chunks)
+    return "".join(rchunks), "".join(chunks), "".join(tchunks)
 
 
 def map_finish_reason_to_stop_reason(finish_reason: Optional[str]) -> str:
@@ -615,7 +623,9 @@ async def anthropic_stream_from_async_stream(
         parser_cls = get_tool_parser_cls()
         tools = user_req.tool_call_params.tools
         tool_parser = parser_cls(tools)
-        stream = parse_stream_by_parser(async_stream, tool_parser)
+        stream = parse_stream_by_parser(
+            async_stream, tool_parser, request_id=user_req.request_id
+        )
     else:
         stream = async_stream
         tool_parser = None
@@ -719,6 +729,8 @@ async def anthropic_stream_from_async_stream(
         async for data, state, (_top_logprobs, _top_tokens) in stream:
             if not data:
                 continue
+            if state == OutputState.TOOL:
+                warn_unparsed_tool_channel_text(data, request_id=user_req.request_id)
             async for event in _emit_text_delta(data, state in REASONING_OUTPUT_STATES):
                 yield event
 
@@ -887,13 +899,13 @@ async def handle_messages_request(
             media_type="text/event-stream",
         )
 
-    reasoning_text, output_text = await run_with_client_abort(
+    reasoning_text, response_text, tool_text = await run_with_client_abort(
         http_request,
         user_req.request_id,
         collect_reasoning_and_text(user_req.async_stream),
     )
     output_text, stop_reason_override, stop_sequence = apply_stop_sequences_weak(
-        output_text, request.stop_sequences
+        response_text, request.stop_sequences
     )
     stop_reason = stop_reason_override or map_finish_reason_to_stop_reason(
         user_req.finish_reason
@@ -903,7 +915,18 @@ async def handle_messages_request(
     if user_req.tool_call_params:
         parser_cls = get_tool_parser_cls()
         parser = parser_cls(user_req.tool_call_params.tools)
-        output_text, tool_calls = parser.parse_string(output_text)
+        if user_req.async_stream.output_parser.params.separated_tool_calling:
+            tool_content, tool_calls = parser.parse_string(tool_text)
+            if tool_content:
+                warn_plain_tool_channel_text(
+                    tool_content, request_id=user_req.request_id
+                )
+            output_text += tool_content
+        else:
+            output_text, tool_calls = parser.parse_string(output_text)
+    elif tool_text:
+        warn_unparsed_tool_channel_text(tool_text, request_id=user_req.request_id)
+        output_text += tool_text
 
     content_blocks: list[dict] = []
     if reasoning_text:
@@ -928,6 +951,16 @@ async def handle_messages_request(
     )
 
 
+async def collect_text(async_stream) -> str:
+    """Join every chunk's text — the raw continuation, no state-based split
+    (the raw-output stream carries plain text only)."""
+    chunks: list[str] = []
+    async for data, _state, (_top_logprobs, _top_tokens) in async_stream:
+        if data:
+            chunks.append(data)
+    return "".join(chunks)
+
+
 async def handle_completion_request(
     *,
     request: AnthropicCompletionRequest,
@@ -947,47 +980,31 @@ async def handle_completion_request(
         except ValueError as e:
             return anthropic_error(400, "invalid_request_error", str(e))
 
-    # bos=False, eos=False matches the /v1/completions path: the client's
-    # text is sent as-is. Going through the tokenizer's own encode() rather
-    # than .model.encode() keeps the long-input splitting in tokenizer.py,
-    # and works for both the tiktoken and the HF tokenizer.
+    # The same raw-prompt construction as /v1/completions
+    # (``UserRequest.from_prompt_text``): the client's text is sent as-is
+    # (bos=False, eos=False, no chat template), and the OUTPUT is the raw
+    # continuation — not parsed by the model's structural delimiters.
     try:
-        prompt_tokens = Backend.tokenizer.encode(prompt_text, bos=False, eos=False)
-    except Exception as e:
-        return anthropic_error(400, "invalid_request_error", f"Tokenize error: {e}")
-    prompt_len = len(prompt_tokens)
-    max_new_tokens = (
-        request.max_tokens_to_sample
-        if request.max_tokens_to_sample is not None
-        else args.infer.max_seq_len
-    )
-    try:
-        max_new_tokens = UserRequest.cap_max_new_tokens(max_new_tokens, prompt_len)
+        user_req = UserRequest.from_prompt_text(
+            prompt_text,
+            gen_req_id(),
+            max_new_tokens=(
+                request.max_tokens_to_sample
+                if request.max_tokens_to_sample is not None
+                else args.infer.max_seq_len
+            ),
+            top_p=request.top_p if request.top_p is not None else 0.9,
+            top_k=request.top_k if request.top_k is not None else 50,
+            temperature=request.temperature if request.temperature is not None else 0.8,
+            stop_with_eos=True,
+            priority=priority,
+            save_trace_dir=args.debug.save_trace_dir,
+            ttft_timeout_s=request.ttft_timeout_s,
+        )
     except PromptTooLongError as e:
         return anthropic_error(400, "invalid_request_error", str(e))
-    sample_params = SampleParams(
-        request.temperature if request.temperature is not None else 0.8,
-        top_p=request.top_p if request.top_p is not None else 0.9,
-        top_k=request.top_k if request.top_k is not None else 50,
-        frequency_penalty=0.0,
-    )
-    user_req = UserRequest(
-        request_id=gen_req_id(),
-        enable_thinking=False,
-        logprobs=False,
-        top_logprobs=None,
-        save_trace_dir=args.debug.save_trace_dir,
-        priority=priority,
-        stop_with_eos=True,
-        sample_params=sample_params,
-        tool_call_params=None,
-        prompt_tokens=prompt_tokens,
-        pixel_values=None,
-        grid_thw=None,
-        prompt_len=prompt_len,
-        max_new_tokens=max_new_tokens,
-    )
-    user_req.ttft_timeout_s = request.ttft_timeout_s
+    except Exception as e:
+        return anthropic_error(400, "invalid_request_error", f"Tokenize error: {e}")
 
     await submit_request(user_req)
 
@@ -1003,10 +1020,10 @@ async def handle_completion_request(
             media_type="text/event-stream",
         )
 
-    _reasoning_text, output_text = await run_with_client_abort(
+    output_text = await run_with_client_abort(
         http_request,
         user_req.request_id,
-        collect_reasoning_and_text(user_req.async_stream),
+        collect_text(user_req.async_stream),
     )
     output_text, stop_reason_override, stop_sequence = apply_stop_sequences_weak(
         output_text, request.stop_sequences

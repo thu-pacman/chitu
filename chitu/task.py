@@ -186,13 +186,17 @@ class UserRequest:
     response_format_params: ResponseFormatParams | None = None
     generated_tokens: list[int] = field(default_factory=list)
     ttft_deadline_ts: Optional[float] = None
+    # Raw continuation (the text-completion APIs): the output is NOT parsed
+    # by the model's structural delimiters — every generated token is plain
+    # text and the markers surface verbatim.
+    raw_output: bool = False
 
     # ============ Serialization fields end ==========
 
     def __post_init__(self):
         # response related
         self.output = ""
-        self.async_stream = AsyncDataStream(self.enable_thinking)
+        self.async_stream = AsyncDataStream(self.enable_thinking, self.raw_output)
         self.finish_reason = None
         self.num_output_tokens = 0
         # Cache hits in the current prefill attempt; reset on eviction before
@@ -341,13 +345,16 @@ class UserRequest:
         ttft_timeout_s: Optional[float] = None,
     ):
         """Build a UserRequest from a raw prompt, bypassing the chat template.
-
         Unlike ``from_request_params``, this does NOT call ``encode_dialog_prompt``
         / ``apply_chat_template``. The prompt is tokenized directly (no special
         tokens, no role markers, no assistant suffix), so the model receives
         exactly the content tokens the client sent. This is the /v1/completions
         (text completion) semantics, suitable for raw throughput benchmarking
         where you want prompt length to be exactly what you sent.
+
+        The OUTPUT is raw too (``raw_output``): no chat structure is assumed,
+        so the generated text is not parsed by the model's delimiters — the
+        reasoning markers and channel markers surface verbatim.
 
         ``prompt`` may be a string (re-tokenized server-side) or a list of token
         ids (used verbatim, giving exact length control with no decode/encode
@@ -385,6 +392,7 @@ class UserRequest:
             grid_thw=None,
             prompt_len=prompt_len,
             max_new_tokens=max_new_tokens,
+            raw_output=True,
         )
         req.ttft_timeout_s = ttft_timeout_s
         return req

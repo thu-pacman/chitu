@@ -34,7 +34,7 @@ class StaticStream:
         self.reasoning_tokens = 0
         self.input_cached_tokens = cached
         self.output_parser = SimpleNamespace(
-            params=SimpleNamespace(enable_reasoning=False)
+            params=SimpleNamespace(enable_reasoning=False, separated_tool_calling=False)
         )
 
     async def wait_input_cached_tokens(self):
@@ -125,7 +125,7 @@ def test_chat_finish_reason_json_and_sse(monkeypatch, stream, reason, tools, exp
             parse_string=lambda text: ("", [{"id": "call_1"}])
         )
 
-        async def parsed(*args):
+        async def parsed(*args, **kwargs):
             yield ChoiceDelta(
                 tool_calls=[
                     {

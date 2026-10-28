@@ -23,7 +23,7 @@ class MarkerMatcher:
     """
 
     def __init__(self, token_ids: list[int]):
-        assert token_ids, "MarkerMatcher requires a non-empty token_ids list"
+        assert len(token_ids) > 0, "MarkerMatcher requires a non-empty token_ids list"
         self.token_ids = list(token_ids)
         # Progresses of the in-flight attempts (1 <= p < len(token_ids)),
         # deduplicated, descending. Progress p means the marker's first p
@@ -69,11 +69,16 @@ class OutputParser:
     """Token-level parser for the model's output structure.
 
     This class decides the structure of the output:
-    1. How reasoning starts and ends by special delimiter tokens.
-    2. How the normal output ends by special delimiter tokens.
+    1. For reasoning models, how reasoning starts and ends by special
+       delimiter tokens.
+    2. For tool calling models with `separated_tool_calling` on, how the
+       tool calling starts and ends by special delimiter tokens.
+    3. For models with delimiters on normal output, how the output ends by
+       special delimiter tokens.
 
     This class does NOT decide:
-    1. Tool calling, which is parsed in text layer instead of token layer.
+    1. Specific tool names and tool arguments, which is parsed in text layer
+       instead of token layer.
     2. Task termination, which is triggered by a single EOS token.
 
     All delimiters come from `OutputParserParams` as token-id sequences with
@@ -89,19 +94,23 @@ class OutputParser:
     If a token may belong to an in-flight match and cannot be classified yet,
     it is buffered. On completion, a whole delimiter is confirmed. On abort,
     the buffered tokens are confirmed as ordinary text of the current region.
-    Anything still buffered at task stop is flushed as text by `flush`.
-    Single-token delimiters never triggers buffering.
+    Anything still buffered at task stop is flushed as text by `flush()`.
+    Single-token delimiters never trigger buffering.
 
-    Watched delimiters for different contexts:
-    - When reasoning is disabled: only the output-end delimiter.
-    - Inside reasoning region: 1) the reasoning-end delimiter. 2) the
-      reasoning-start delimiter (a workaround for stray delimiters).
-    - Inside output region: 1) the output-end delimiter. 2) the reasoning-start
-      delimiter (only when in the `reasoning_start_delimiter_max_delay` windiw,
-      which is a workaround fro '\\n' before '<think>'). 3) the reasoning-end
-      delimiter (a workaround for stray delimiter).
+    Watched delimiters in different regions:
+    - Inside reasoning region:
+        1. the reasoning-end delimiter;
+        2. the reasoning-start delimiter (a workaround for stray delimiters).
+    - Inside output region:
+        1. the output-end delimiter;
+        2. (when `separated_tool_calling`) the message-end delimiter;
+        3. (when reasoning enabled, and when in the `reasoning_start_delimiter_max_delay`
+           window, a workaround for '\n' before '<think>') the reasoning-start delimiter;
+        4. (when `separated_tool_calling`) the tool-start delimiter;
+        5. the reasoning-end delimiter (a workaround for stray delimiter).
+    - Inside tool region: the tool-end delimiter only.
 
-    When several delimiters are possible in the current context they are all
+    When several delimiters are possible in the current region they are all
     matched simultaneously.
     """
 
@@ -123,10 +132,31 @@ class OutputParser:
             self.reasoning_end_match = MarkerMatcher(params.reasoning_end_delimiter_ids)
         else:
             # No reasoning channel: the reasoning-end matcher would never be
-            # consulted (update() only watches the output-end marker when
+            # consulted (update() only watches the output-side markers when
             # disabled).
             self.reasoning_end_match = None
-        self.in_reasoning = params.enable_reasoning and params.initial_state
+        if params.separated_tool_calling:
+            assert (
+                params.output_end_delimiter_ids
+            ), "separated_tool_calling requires models.output_end_delimiter_ids"
+            self.message_end_match = MarkerMatcher(params.message_end_delimiter_ids)
+            self.tool_call_start_match = MarkerMatcher(
+                params.tool_call_start_delimiter_ids
+            )
+            self.tool_call_end_match = MarkerMatcher(params.tool_call_end_delimiter_ids)
+        else:
+            self.message_end_match = None
+            self.tool_call_start_match = None
+            self.tool_call_end_match = None
+
+        self.region: OutputState  # The current region during parsing
+        if params.enable_reasoning and params.initial_state:
+            self.region = OutputState.REASONING
+        elif self.params.separated_tool_calling:
+            self.region = OutputState.OUTPUT
+        else:
+            self.region = OutputState.OUTPUT_OR_TOOL
+
         # Number of generated tokens seen (enabled parser only); gates the
         # reasoning-start marker re-entry window.
         self.count = 0
@@ -138,23 +168,11 @@ class OutputParser:
     def _make_matcher(token_ids: list[int]) -> Optional[MarkerMatcher]:
         return MarkerMatcher(token_ids) if token_ids else None
 
-    def _text_state(self) -> OutputState:
-        """The state of ordinary text confirmed in the current region."""
-        return OutputState.REASONING if self.in_reasoning else OutputState.OUTPUT
-
     def _watched(self) -> list[tuple[MarkerMatcher, OutputState, bool]]:
         """The (matcher, completion state, may-anchor-now) triples watched in
-        the current context, in tie-break order (see the class docstring)."""
+        the current region, in tie-break order (see the class docstring)."""
         watched: list[tuple[MarkerMatcher, OutputState, bool]] = []
-        if not self.params.enable_reasoning:
-            if self.output_end_match is not None:
-                watched.append(
-                    (self.output_end_match, OutputState.CLOSING_OUTPUT, True)
-                )
-            return watched
-        if self.in_reasoning:
-            # reasoning_end_match always exists while reasoning is enabled
-            # (asserted in __init__).
+        if self.region == OutputState.REASONING:
             watched.append(
                 (self.reasoning_end_match, OutputState.CLOSING_REASONING, True)
             )
@@ -163,18 +181,57 @@ class OutputParser:
                     (self.reasoning_start_match, OutputState.OPENING_REASONING, True)
                 )
             return watched
-        if self.output_end_match is not None:
-            watched.append((self.output_end_match, OutputState.CLOSING_OUTPUT, True))
-        if self.reasoning_start_match is not None:
-            watched.append(
-                (
-                    self.reasoning_start_match,
-                    OutputState.OPENING_REASONING,
-                    self.count <= self.params.reasoning_start_delimiter_max_delay,
+        elif self.region == OutputState.TOOL:
+            assert self.tool_call_end_match is not None
+            return [(self.tool_call_end_match, OutputState.CLOSING_TOOL, True)]
+        elif self.region in {OutputState.OUTPUT, OutputState.OUTPUT_OR_TOOL}:
+            if self.output_end_match is not None:
+                watched.append(
+                    (self.output_end_match, OutputState.CLOSING_OUTPUT, True)
                 )
-            )
-        watched.append((self.reasoning_end_match, OutputState.CLOSING_REASONING, True))
-        return watched
+            if self.message_end_match is not None:
+                watched.append(
+                    (self.message_end_match, OutputState.CLOSING_OUTPUT, True)
+                )
+            if self.tool_call_start_match is not None:
+                watched.append(
+                    (self.tool_call_start_match, OutputState.OPENING_TOOL, True)
+                )
+            if self.params.enable_reasoning:
+                if self.reasoning_start_match is not None:
+                    watched.append(
+                        (
+                            self.reasoning_start_match,
+                            OutputState.OPENING_REASONING,
+                            self.count
+                            <= self.params.reasoning_start_delimiter_max_delay,
+                        )
+                    )
+                watched.append(
+                    (self.reasoning_end_match, OutputState.CLOSING_REASONING, True)
+                )
+            return watched
+        else:
+            assert False, f"Unexpected {self.region=}"
+
+    def _transit_region(self, state: OutputState):
+        """Region transition after the winning delimiter completed."""
+        if state == OutputState.OPENING_REASONING:
+            self.region = OutputState.REASONING
+        elif state == OutputState.CLOSING_REASONING:
+            if self.params.separated_tool_calling:
+                self.region = OutputState.OUTPUT
+            else:
+                self.region = OutputState.OUTPUT_OR_TOOL
+        elif state == OutputState.OPENING_TOOL:
+            self.region = OutputState.TOOL
+        elif state == OutputState.CLOSING_TOOL:
+            if self.params.separated_tool_calling:
+                self.region = OutputState.OUTPUT
+            else:
+                self.region = OutputState.OUTPUT_OR_TOOL
+        # NOTE: CLOSING_OUTPUT needs no transition. The stray-marker
+        # workaround also needs no transition.
 
     def update(self, token_id: int) -> list[tuple[int, OutputState]]:
         """Feed one generated token; returns the newly confirmed pairs.
@@ -194,18 +251,14 @@ class OutputParser:
         if winner is not None:
             span, state = winner
             anchor = len(self.buffer) - (span - 1)
-            text_state = self._text_state()
-            resolved = [(t, text_state) for t in self.buffer[:anchor]]
+            resolved = [(t, self.region) for t in self.buffer[:anchor]]
             resolved += [(t, state) for t in self.buffer[anchor:]]
             resolved.append((token_id, state))
             self.buffer.clear()
             # The winner owns its whole span: overlapping attempts die.
             for matcher, _, _ in watched:
                 matcher.reset()
-            if state == OutputState.OPENING_REASONING and not self.in_reasoning:
-                self.in_reasoning = True
-            elif state == OutputState.CLOSING_REASONING and self.in_reasoning:
-                self.in_reasoning = False
+            self._transit_region(state)
             return resolved
         # No completion: buffer the token and confirm the prefix that no
         # in-flight attempt covers (all attempts end at the latest token,
@@ -213,7 +266,7 @@ class OutputParser:
         self.buffer.append(token_id)
         covered = max((m.max_progress for m, _, _ in watched), default=0)
         n_confirmed = len(self.buffer) - covered
-        resolved = [(t, self._text_state()) for t in self.buffer[:n_confirmed]]
+        resolved = [(t, self.region) for t in self.buffer[:n_confirmed]]
         del self.buffer[:n_confirmed]
         return resolved
 
@@ -222,12 +275,15 @@ class OutputParser:
         the current region — a dangling partial delimiter is NOT a delimiter
         (only complete delimiters are structural; vLLM, which strips markers
         textually, likewise strips only complete ones)."""
-        resolved = [(t, self._text_state()) for t in self.buffer]
+        resolved = [(t, self.region) for t in self.buffer]
         self.buffer.clear()
         for matcher in (
             self.reasoning_start_match,
             self.reasoning_end_match,
             self.output_end_match,
+            self.message_end_match,
+            self.tool_call_start_match,
+            self.tool_call_end_match,
         ):
             if matcher is not None:
                 matcher.reset()
@@ -242,3 +298,15 @@ def make_output_parser(enable_thinking: bool) -> OutputParser:
     per-variant subclasses.
     """
     return OutputParser(get_output_parser_params(enable_thinking))
+
+
+def make_raw_output_parser() -> OutputParser:
+    """Create the no-structure parser for raw continuation requests (the
+    text-completion APIs).
+
+    No delimiters and no reasoning channel: every generated token is plain
+    text, so the model's structural markers surface verbatim and nothing
+    counts as reasoning. The chat-structured APIs parse by the model's
+    delimiters; a raw prompt asks for a raw continuation.
+    """
+    return OutputParser(OutputParserParams(False))

@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
+from typing import Callable
+
 from xgrammar.structural_tag import TagFormat
 
 from chitu.tool_call.grammar.arguments import AbstractArgumentsGrammar
@@ -17,20 +19,31 @@ class AbstractToolGrammar(ABC):
 
 
 class ToolGrammar(AbstractToolGrammar):
+    """The tool tag, with the name interpolated into the template:
+    ``begin{name}sep{content}end`` (the two ``{}`` marks of the template;
+    the content is the arguments format).
+
+    ``escape`` transforms the name into the syntax's literal form — e.g. an
+    XTML attribute value is XML-escaped (``&`` first, then ``"``);
+    identity when unset.
+    """
+
     def __init__(
         self,
         template='<tool>{"name": {}, "arguments": {}}</tool>',
         *,
         arguments: AbstractArgumentsGrammar,
         mark="{}",
+        escape: Callable[[str], str] = lambda s: s,
     ):
         self.arguments = arguments
+        self.escape = escape
         self.begin, self.sep, self.end = template.split(mark)
 
     def build(self, name: str, schema: dict) -> TagFormat:
         arguments = self.arguments.build(schema)
         return TagFormat(
-            begin=f"{self.begin}{name}{self.sep}",
+            begin=f"{self.begin}{self.escape(name)}{self.sep}",
             content=arguments,
             end=self.end,
         )

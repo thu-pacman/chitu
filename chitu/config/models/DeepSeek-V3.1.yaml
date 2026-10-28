@@ -16,3 +16,5 @@ source: "https://huggingface.co/deepseek-ai/DeepSeek-V3.1" # Just for displaying
 tokenizer_type: "hf" # one of: hf, tiktoken
 tool_parser: DeepSeekV31ToolParser
 reasoning_type: switchable
+reasoning_start_delimiter_ids: [128798]
+reasoning_end_delimiter_ids: [128799]

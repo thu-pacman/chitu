@@ -219,7 +219,7 @@ class Tokenizer:
             t.append(self.eos_id)
         return t
 
-    def decode(self, t: Sequence[int]) -> str:
+    def decode(self, t: Sequence[int], skip_special_tokens=False) -> str:
         """
         Decodes a list of token IDs into a string.
 
@@ -229,6 +229,12 @@ class Tokenizer:
         Returns:
             str: The decoded string.
         """
+
+        if skip_special_tokens:
+            raise NotImplementedError(
+                "The `Tokenizer` tokenizer backend does not support `skip_special_tokens`"
+            )
+
         # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
         # Single token decode with cache optimization
         if len(t) == 1 and not self.force_full_seq_decode:

@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import uuid
 from typing import Callable, AsyncIterable, AsyncIterator
 from ..type_def import (
@@ -45,7 +46,11 @@ class ParseContext:
         self.arg_count += 1
         prefix = ', "' if self.arg_count > 1 else '{"'
         self.arg_name = string
-        self.arguments += prefix + string
+        # The key becomes part of the assembled arguments JSON: JSON-escape
+        # it (a no-op for the JSON-safe names ordinary tools declare). Same
+        # stateless content escaping as StringArgValueParser.escape — that
+        # class lives in parser.py, which imports this module.
+        self.arguments += prefix + json.dumps(string)[1:-1]
 
     def as_arg_value(self, string: str):
         self.arguments += '": ' + string
@@ -120,12 +125,17 @@ class StreamParseContext:
         is_first_chunk = True
         async for chunk in stream:
             string += chunk
+            # The key becomes part of the assembled arguments JSON: escape
+            # per chunk (json content escaping is stateless per character, so
+            # it composes over chunk boundaries; a no-op for JSON-safe
+            # names).
+            chunk = json.dumps(chunk)[1:-1]
             if is_first_chunk:
                 chunk = prefix + chunk
                 is_first_chunk = False
             yield self.make_arguments_delta(chunk)
         self.arg_name = string
-        self.arguments += prefix + string
+        self.arguments += prefix + json.dumps(string)[1:-1]
 
     async def as_arg_value(self, stream: AsyncIterable[str]):
         prefix = '": '

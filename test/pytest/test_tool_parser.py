@@ -1,4 +1,6 @@
+import os
 import random, asyncio, json
+import pytest
 import rich
 import xgrammar
 
@@ -53,11 +55,16 @@ def run_match(
     parallel_tool_calls=True,
     thinking=False,
     initial_thinking=False,
+    reasoning_start_token=OutputParserParams.reasoning_start_token,
+    reasoning_end_token=OutputParserParams.reasoning_end_token,
 ):
     parser_cls = _registere_parsers[parser]
     _output_parser_params_cache.clear()
     _output_parser_params_cache[thinking] = OutputParserParams(
-        thinking, initial_state=initial_thinking
+        thinking,
+        initial_state=initial_thinking,
+        reasoning_start_token=reasoning_start_token,
+        reasoning_end_token=reasoning_end_token,
     )
     grammar = parser_cls.build_grammar(
         ToolCallParams(
@@ -106,13 +113,17 @@ async def async_stream(data: str):
 
 
 def run_parse(
-    parser: str, data: str, std_content: str, std_tools: list[ChoiceToolCall]
+    parser: str,
+    data: str,
+    std_content: str,
+    std_tools: list[ChoiceToolCall],
+    tools=TOOLS,
 ):
     for i, tool in enumerate(std_tools):
         tool.id = f"tool_id_{i}"
 
     parser_cls = _registere_parsers[parser]
-    parser_obj = parser_cls(TOOLS)
+    parser_obj = parser_cls(tools)
 
     def parse():
         content, tools = parser_obj.parse_string(data)
@@ -547,3 +558,342 @@ def test_forced_reasoning_params():
 
     assert params.enable_reasoning
     assert params.initial_state
+
+
+K3_SWITCH = "<|close|>think<|sep|><|open|>response<|sep|>"
+# The tools tag's begin == trigger (the response close is folded in).
+K3_TOOLS_BEGIN = "<|close|>response<|sep|><|open|>tools<|sep|>"
+# The tools tag's end (the message close is folded in).
+K3_TOOLS_END = "<|close|>tools<|sep|><|close|>message<|sep|>"
+
+k3_calls = (
+    '<|open|>call tool="test_type" index="1"<|sep|>'
+    '<|open|>argument key="ks" type="string"<|sep|>vs<|close|>argument<|sep|>'
+    '<|open|>argument key="ko" type="object"<|sep|>{"kb": true}<|close|>argument<|sep|>'
+    '<|open|>argument key="ka" type="array"<|sep|>[1, 2, 3]<|close|>argument<|sep|>'
+    "<|close|>call<|sep|>"
+    '<|open|>call tool="test_empty" index="2"<|sep|><|close|>call<|sep|>'
+)
+
+
+def test_kimi_k3():
+    parser = "KimiK3ToolParser"
+    # auto: response text, then the tools channel, then the folded tail.
+    run_match(parser, "begin-" + K3_TOOLS_BEGIN + k3_calls + K3_TOOLS_END, True)
+    # auto without tools: the whole answer (incl. the response close and the
+    # message close) is free text.
+    run_match(
+        parser,
+        "just an answer<|close|>response<|sep|><|close|>message<|sep|>",
+        True,
+    )
+    # required: no text before the trigger — the trained empty-response shape.
+    run_match(
+        parser, K3_TOOLS_BEGIN + k3_calls + K3_TOOLS_END, True, tool_choice="required"
+    )
+    run_match(
+        parser, "begin-" + K3_TOOLS_BEGIN + k3_calls, False, tool_choice="required"
+    )
+    # The parser input is the tools channel's text only — the raw call
+    # syntax, no channel markers (the serve layer routes the response text
+    # straight to content).
+    run_parse(parser, k3_calls, "", std_tools)
+
+
+def test_kimi_k3_non_call_text_in_channel_is_content():
+    """Non-call text inside the tools channel (degenerate leftovers, or a
+    truncated call) surfaces as content rather than being dropped."""
+    parser = "KimiK3ToolParser"
+    run_parse(parser, "leftover-" + k3_calls, "leftover-", std_tools)
+
+
+def test_kimi_k3_rejects():
+    parser = "KimiK3ToolParser"
+    # A tool name outside the declared set.
+    run_match(
+        parser,
+        "begin-"
+        + K3_TOOLS_BEGIN
+        + '<|open|>call tool="wrong_name" index="1"<|sep|><|close|>call<|sep|>'
+        + K3_TOOLS_END,
+        False,
+    )
+    # The stream's type attribute must agree with the declared schema type
+    # (schema string, stream number).
+    run_match(
+        parser,
+        "begin-"
+        + K3_TOOLS_BEGIN
+        + '<|open|>call tool="test_type" index="1"<|sep|>'
+        + '<|open|>argument key="ks" type="number"<|sep|>1<|close|>argument<|sep|>'
+        + "<|close|>call<|sep|>"
+        + K3_TOOLS_END,
+        False,
+    )
+    # A typed (non-string) value must be valid JSON of the declared type.
+    run_match(
+        parser,
+        "begin-"
+        + K3_TOOLS_BEGIN
+        + '<|open|>call tool="test_type" index="1"<|sep|>'
+        + '<|open|>argument key="ka" type="array"<|sep|>not json<|close|>argument<|sep|>'
+        + "<|close|>call<|sep|>"
+        + K3_TOOLS_END,
+        False,
+    )
+    # at_most_one: the second call in the channel is rejected.
+    run_match(
+        parser,
+        "begin-" + K3_TOOLS_BEGIN + k3_calls + K3_TOOLS_END,
+        False,
+        parallel_tool_calls=False,
+    )
+
+
+def test_kimi_k3_thinking():
+    """The tool grammar is only reachable OUT of the reasoning span: the
+    channel switch must precede the tools channel, and tools-channel-looking
+    text inside the think channel is plain text."""
+    parser = "KimiK3ToolParser"
+    kwargs = dict(thinking=True, initial_thinking=True, reasoning_end_token=K3_SWITCH)
+    run_match(
+        parser,
+        "let me think" + K3_SWITCH + K3_TOOLS_BEGIN + k3_calls + K3_TOOLS_END,
+        True,
+        **kwargs,
+    )
+    # required + thinking: the empty response + tools channel right after the
+    # switch.
+    run_match(
+        parser,
+        "let me think" + K3_SWITCH + K3_TOOLS_BEGIN + k3_calls + K3_TOOLS_END,
+        True,
+        tool_choice="required",
+        **kwargs,
+    )
+    # A trigger (or a whole call) inside the think channel is plain text —
+    # not forced to be a syntactically valid tool call.
+    run_match(
+        parser,
+        "thinking about "
+        + K3_TOOLS_BEGIN
+        + " which I will not do... "
+        + K3_SWITCH
+        + "Sunny today.<|close|>response<|sep|><|close|>message<|sep|>",
+        True,
+        **kwargs,
+    )
+    # A tools channel without the preceding switch never satisfies the
+    # wrapper (the reasoning span is unclosed).
+    run_match(
+        parser, "begin-" + K3_TOOLS_BEGIN + k3_calls + K3_TOOLS_END, False, **kwargs
+    )
+
+
+ESCAPE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": 'a"b&c',
+            "parameters": {
+                "type": "object",
+                "properties": {'k"ey&': {"type": "string"}},
+                "required": ['k"ey&'],
+            },
+        },
+    }
+]
+
+
+def test_kimi_k3_attr_escape_roundtrip():
+    """Attribute values are XML-escaped in XTML (`&` first, then `"` — the
+    chat template's encoding); the grammar pins the escaped text and the
+    parser unescapes name and key back to the declared values."""
+    parser = "KimiK3ToolParser"
+    escaped_call = (
+        '<|open|>call tool="a&quot;b&amp;c" index="1"<|sep|>'
+        '<|open|>argument key="k&quot;ey&amp;" type="string"<|sep|>v<|close|>argument<|sep|>'
+        "<|close|>call<|sep|>"
+    )
+    run_match(
+        parser,
+        "begin-" + K3_TOOLS_BEGIN + escaped_call + K3_TOOLS_END,
+        True,
+        tools=ESCAPE_TOOLS,
+    )
+    # A wrongly-escaped (raw) attribute value does not match the pinned name.
+    run_match(
+        parser,
+        "begin-"
+        + K3_TOOLS_BEGIN
+        + '<|open|>call tool="a"b&c" index="1"<|sep|><|close|>call<|sep|>'
+        + K3_TOOLS_END,
+        False,
+        tools=ESCAPE_TOOLS,
+    )
+    std = [
+        ChoiceToolCall(
+            id="",
+            function=ChoiceToolCallFunction(
+                name='a"b&c', arguments=json.dumps({'k"ey&': "v"})
+            ),
+        )
+    ]
+    run_parse(parser, escaped_call, "", std, tools=ESCAPE_TOOLS)
+
+
+@pytest.mark.skipif(
+    not os.path.exists("/data/nfs2/Kimi-K3"),
+    reason="the Kimi-K3 checkpoint is not available",
+)
+def test_kimi_k3_real_tokenizer():
+    """The K3 grammar against the REAL tokenizer at token level — catches
+    token-mapping issues the toy char vocab cannot (the XTML markers are
+    single tokens; the trigger and the folded tag end span them)."""
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("/data/nfs2/Kimi-K3", trust_remote_code=True)
+    weather = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "days": {"type": "integer"},
+                    },
+                    "required": ["location"],
+                },
+            },
+        }
+    ]
+    call = (
+        '<|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="location" type="string"<|sep|>beijing<|close|>argument<|sep|>'
+        '<|open|>argument key="days" type="number"<|sep|>3<|close|>argument<|sep|>'
+        "<|close|>call<|sep|>"
+    )
+    call_required_only = (
+        '<|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="location" type="string"<|sep|>beijing<|close|>argument<|sep|>'
+        "<|close|>call<|sep|>"
+    )
+    no_tools_tail = "<|close|>response<|sep|><|close|>message<|sep|>"
+
+    def match(data, std_accept, tool_choice, thinking, initial_thinking):
+        _output_parser_params_cache.clear()
+        _output_parser_params_cache[thinking] = OutputParserParams(
+            thinking,
+            initial_state=initial_thinking,
+            reasoning_end_token=K3_SWITCH,
+        )
+        grammar = _registere_parsers["KimiK3ToolParser"].build_grammar(
+            ToolCallParams(
+                tools=weather,
+                enable_thinking=thinking,
+                config=ToolConfig(choice=tool_choice),
+            )
+        )
+        info = xgrammar.TokenizerInfo.from_huggingface(
+            tok, vocab_size=163840, stop_token_ids=[163585, 163586]
+        )
+        matcher = xgrammar.GrammarMatcher(
+            xgrammar.GrammarCompiler(info).compile_grammar(grammar)
+        )
+        accepted = True
+        for token in tok.model.encode(data, allowed_special="all"):
+            if not matcher.accept_token(token):
+                accepted = False
+                break
+        if accepted:
+            accepted = matcher.accept_token(163586) and matcher.is_terminated()
+        assert accepted == std_accept, (data[:60], accepted)
+
+    # required + thinking: think, switch, empty response, tools channel.
+    match(
+        "Let me check." + K3_SWITCH + K3_TOOLS_BEGIN + call + K3_TOOLS_END,
+        True,
+        "required",
+        True,
+        True,
+    )
+    # auto + thinking: response text before the tools channel.
+    match(
+        "Hmm." + K3_SWITCH + "Checking now." + K3_TOOLS_BEGIN + call + K3_TOOLS_END,
+        True,
+        "auto",
+        True,
+        True,
+    )
+    # auto + thinking, no tools.
+    match(
+        "Hmm." + K3_SWITCH + "It is sunny in Beijing." + no_tools_tail,
+        True,
+        "auto",
+        True,
+        True,
+    )
+    # thinking off + required.
+    match(
+        K3_TOOLS_BEGIN + call + K3_TOOLS_END,
+        True,
+        "required",
+        False,
+        False,
+    )
+    # Optional arguments may be omitted.
+    match(
+        K3_TOOLS_BEGIN + call_required_only + K3_TOOLS_END,
+        True,
+        "required",
+        False,
+        False,
+    )
+    # A trigger inside the think channel is plain text (the tool grammar is
+    # scoped out of the reasoning span).
+    match(
+        "I could "
+        + K3_TOOLS_BEGIN
+        + " to check... "
+        + K3_SWITCH
+        + "Sunny today."
+        + no_tools_tail,
+        True,
+        "auto",
+        True,
+        True,
+    )
+    # Rejects: wrong name / wrong type attr / non-JSON typed value.
+    match(
+        K3_TOOLS_BEGIN
+        + '<|open|>call tool="get_wether" index="1"<|sep|><|close|>call<|sep|>'
+        + K3_TOOLS_END,
+        False,
+        "auto",
+        False,
+        False,
+    )
+    match(
+        K3_TOOLS_BEGIN
+        + '<|open|>call tool="get_weather" index="1"<|sep|>'
+        + '<|open|>argument key="location" type="number"<|sep|>3<|close|>argument<|sep|>'
+        + "<|close|>call<|sep|>"
+        + K3_TOOLS_END,
+        False,
+        "auto",
+        False,
+        False,
+    )
+    match(
+        K3_TOOLS_BEGIN
+        + '<|open|>call tool="get_weather" index="1"<|sep|>'
+        + '<|open|>argument key="days" type="number"<|sep|>three<|close|>argument<|sep|>'
+        + "<|close|>call<|sep|>"
+        + K3_TOOLS_END,
+        False,
+        "auto",
+        False,
+        False,
+    )

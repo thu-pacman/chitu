@@ -13,13 +13,14 @@ from chitu.output_parser import (
     REASONING_OUTPUT_STATES,
     DELIMITER_STATES,
     make_output_parser,
+    make_raw_output_parser,
 )
 
 logger = getLogger(__name__)
 
 
 class AsyncDataStream:
-    def __init__(self, enable_thinking: bool):
+    def __init__(self, enable_thinking: bool, raw_output: bool = False):
         from chitu.backend import Backend
 
         self.tokenizer = Backend.tokenizer
@@ -56,9 +57,14 @@ class AsyncDataStream:
         self.data_event = asyncio.Event()
         self.top_logprobs_list = []
         self.top_tokens_list = []
-        self.output_parser = make_output_parser(enable_thinking)
+        if raw_output:
+            # Raw continuation (the text-completion APIs): no structural
+            # parsing — every token is plain text, markers included.
+            self.output_parser = make_raw_output_parser()
+        else:
+            self.output_parser = make_output_parser(enable_thinking)
         self.output_states: list[OutputState] = []
-        self.cached_output_state: OutputState = OutputState.OUTPUT
+        self.cached_output_state: OutputState = OutputState.OUTPUT_OR_TOOL
         self.callbacks_on_stop = []
         self.error_message: Optional[str] = None
         self.input_cached_tokens: Optional[int] = None

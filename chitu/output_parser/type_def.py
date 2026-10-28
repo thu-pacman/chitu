@@ -8,17 +8,30 @@ from typing import Literal
 
 
 class OutputState(IntEnum):
+    """Classification of one generated token by the output parser."""
+
+    OUTPUT_OR_TOOL = 0
+    """Mixed output text and tool calling for non-`separated_tool_calling`
+    models. Output text and tool calling will be separated in the text-level
+    tool parser."""
+
+    OUTPUT = 1
+    """Normal output text for `separated_tool_calling` models"""
+
+    CLOSING_OUTPUT = 2
+    """Delimiter that closes an `OUTPUT_OR_TOOL` or an `OUTPUT` region.
+
+    NOTE: Tokens in both `output_end_delimiter_ids` (closing the text output)
+    and `message_end_delimiter_ids` (closing the whole message turn) are
+    classified into this state.
+
+    Rules:
+    1. May be multiple tokens.
+    2. Not visible to users.
+    3. Counted as output tokens.
     """
-    Classification of one generated token by the output parser.
 
-    This class is deliberately compatible with legacy bool convension:
-    False (0) meaning the normal output text.
-    """
-
-    OUTPUT = 0
-    """Normal output text."""
-
-    OPENING_REASONING = 1
+    OPENING_REASONING = 3
     """Delimiter that starts reasoning. E.g. `<think>`.
 
     Rules:
@@ -27,10 +40,10 @@ class OutputState(IntEnum):
     3. Counted as reasoning tokens.
     """
 
-    REASONING = 2
+    REASONING = 4
     """Reasoning text."""
 
-    CLOSING_REASONING = 3
+    CLOSING_REASONING = 5
     """Delimiter that ends reasoning. E.g. `</think>`.
 
     Rules:
@@ -39,13 +52,21 @@ class OutputState(IntEnum):
     3. Counted as reasoning tokens.
     """
 
-    CLOSING_OUTPUT = 4
-    """Delimiter that ends normal output.
+    OPENING_TOOL = 6
+    """Delimiter that opens the tools channel. E.g. `<|open|>tools<|sep|>`.
 
-    This state is useful for multi-token output delimiters, e.g.,
-    `<|close|>response<|sep|><|close|>message<|sep|>`.
-    The final EOS token is usually not included in this state. EOS directly
-    ends a task.
+    Rules:
+    1. May be multiple tokens.
+    2. Not visible to users.
+    3. Counted as output tokens.
+    """
+
+    TOOL = 7
+    """Tool calling for `separated_tool_calling` models, which will be sent
+    to the text-level tool parser"""
+
+    CLOSING_TOOL = 8
+    """Delimiter that closes the tools channel. E.g. `<|close|>tools<|sep|>`.
 
     Rules:
     1. May be multiple tokens.
@@ -62,6 +83,8 @@ DELIMITER_STATES = frozenset(
         OutputState.OPENING_REASONING,
         OutputState.CLOSING_REASONING,
         OutputState.CLOSING_OUTPUT,
+        OutputState.OPENING_TOOL,
+        OutputState.CLOSING_TOOL,
     }
 )
 
@@ -84,16 +107,26 @@ class OutputParserParams:
     (there is no fault tolerance for incomplete delimiters; see
     `MarkerMatcher`). A single-token delimiter is the length-1 special case.
 
-    The three delimiter fields are independent markers (see `OutputParser`'s
+    The reasoning delimiters are independent markers (see `OutputParser`'s
     docstring for the region rules): the reasoning-start delimiter opens the
-    reasoning channel (OUTPUT → REASONING), the reasoning-end delimiter
-    closes it (REASONING → OUTPUT), and the output-end delimiter is the
-    message's sequence-ending marker (not a region transition). An empty
-    list means the model configures no such marker.
+    reasoning channel, the reasoning-end delimiter closes it. An empty list
+    means the model configures no such marker.
 
-    ``reasoning_start_token``/``reasoning_end_token`` keep the marker STRINGS
-    for consumers that build text-level constraints (e.g.
-    ``wrap_format_with_reasoning``).
+    The output-side delimiters depend on ``separated_tool_calling``:
+
+    - Without separated tool calling, ``output_end_delimiter_ids`` is the
+      message's SEQUENCE-ENDING marker (hidden from every user-visible
+      stream); the other three output-side fields are unused.
+    - With separated tool calling (the model emits tool calls in their own
+      channel, e.g. Kimi-K3's XTML tools channel), all four output-side
+      markers are REQUIRED: ``output_end_delimiter_ids`` closes the response
+      channel, ``tool_call_start/end_delimiter_ids`` open/close the tools
+      channel, and ``message_end_delimiter_ids`` closes the message. The
+      response close and the message close both classify as CLOSING_OUTPUT.
+
+    ``reasoning_start_token``/``reasoning_end_token`` carry the marker STRINGS
+    (decoded from the resolved delimiter ids) for consumers that build
+    text-level constraints (e.g. ``wrap_format_with_reasoning``).
     """
 
     enable_reasoning: bool
@@ -102,13 +135,22 @@ class OutputParserParams:
     reasoning_start_delimiter_ids: list[int] = field(default_factory=list)
     # The reasoning channel's CLOSING marker (REASONING → OUTPUT).
     reasoning_end_delimiter_ids: list[int] = field(default_factory=list)
-    # The message's SEQUENCE-ENDING marker — structural tail hidden from every
-    # user-visible stream; empty = the message ends on the plain EOS/stop
-    # token only.
+    # The output-side closing marker: the sequence-ending marker without
+    # separated tool calling; the RESPONSE-CHANNEL close with it.
     output_end_delimiter_ids: list[int] = field(default_factory=list)
+    # The MESSAGE close (separated tool calling only).
+    message_end_delimiter_ids: list[int] = field(default_factory=list)
+    # The tools channel's OPENING marker (separated tool calling only).
+    tool_call_start_delimiter_ids: list[int] = field(default_factory=list)
+    # The tools channel's CLOSING marker (separated tool calling only).
+    tool_call_end_delimiter_ids: list[int] = field(default_factory=list)
     reasoning_start_token: str = "<think>"
     reasoning_end_token: str = "</think>"
     initial_state: bool = False
+    # Whether the model emits tool calls in their own channel, demarcated by
+    # the tools-channel markers (tool-call SYNTAX is still parsed in the text
+    # layer; this only classifies/hides the structural channel markers).
+    separated_tool_calling: bool = False
     # The reasoning-start marker only starts a match within this many
     # generated tokens (the classic `count <= 2` workaround: some models emit
     # '\n' or ' ' before the start tag, and a start tag later in the content
