@@ -1683,6 +1683,8 @@ def _deepseek_v3_moe_quant_prefixes(
     experts_start_idx: int,
     experts_end_idx: int,
     projection_names: tuple[str, ...],
+    *,
+    fuse_shared_experts: bool,
 ) -> CheckpointPrefix:
     checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
     routed_end_idx = min(experts_end_idx, global_n_experts)
@@ -1691,7 +1693,7 @@ def _deepseek_v3_moe_quant_prefixes(
         for expert_id in range(experts_start_idx, routed_end_idx)
         for projection_name in projection_names
     ]
-    if experts_end_idx > global_n_experts:
+    if fuse_shared_experts and experts_end_idx > global_n_experts:
         prefixes.extend(
             checkpoint_prefix / "shared_experts" / projection_name
             for projection_name in projection_names
@@ -1723,6 +1725,7 @@ def MoeExpertsDeepSeekV3(
         experts_start_idx,
         experts_end_idx,
         ("gate_proj", "up_proj"),
+        fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
     )
     merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(gate_up_quant_prefix)
     if base_moe_experts_class is None:
