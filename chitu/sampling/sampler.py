@@ -100,6 +100,7 @@ class TaskSampleState:
     # the step that drafted it (_prepare pads back up at verify time).
     draft_probs: tuple[torch.Tensor, torch.Tensor] | None = None
     next_tokens_device: torch.Tensor | None = None
+    draft_tokens: list[int] | None = None
 
     @staticmethod
     def from_task(task: Task):
@@ -530,12 +531,12 @@ class Sampler:
     ) -> list[list[int]]:
         """The host mirror of the drafted rows, one row per state.
 
-        The rows are the ones `update_results` mirrored onto the tasks under this
-        verify's own launch, which is where the host-only consumers look.
+        Read the sampler's own mirror from `update_results`: task.next_tokens
+        can be replaced by response processing or incoming PP metadata.
         """
         rows = []
         for state in states:
-            nt = state.task.next_tokens
+            nt = state.draft_tokens
             if nt and len(nt) >= K:
                 rows.append(nt[1:K])  # d1, ..., d_{K-1}
             else:
@@ -1097,6 +1098,7 @@ class Sampler:
             rows = result.next_tokens.tolist()
             for i, task in enumerate(tasks.output_tasks):
                 task.next_tokens = rows[i]
+                states[i].draft_tokens = rows[i]
 
     def end_tasks(self, task_ids: list[str]):
         for task_id in task_ids:
