@@ -220,11 +220,12 @@ def causal_conv1d_update_gcu_b1_inplace_kernel(
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    """Exact 4-tap B=1 decode specialization for Enflame L600.
+    """Exact 4-tap (conv state width 4), B=1 (one sequence) decode kernel.
 
-    Each program owns one 256-channel row.  Keeping the reduction width at
-    four preserves the established BF16/FP32 boundary while eliminating the
-    generic kernel's unused 16-way batch lane and separate state allocation.
+    Qwen3-Next decode calls this op once per layer with one new token. The
+    generic kernel's 16-way batch lane and per-step state allocation are wasted
+    for that shape. This kernel updates the 4-token state in place and keeps
+    the generic kernel's BF16/FP32 reduction boundary.
     """
     h = tl.program_id(0) * BLOCK_H + tl.arange(0, BLOCK_H)
     taps = tl.arange(0, 4)

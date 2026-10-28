@@ -36,9 +36,8 @@ if _has_triton:
     )
 
 # Enflame's Triton backend is not compatible with these compressor kernels
-# (e.g. ``add_stages`` needs a platform-specific language argument), so keep
-# the Torch implementations as the correctness path on GCU.
-_triton_compressor_available = _has_triton and not is_enflame()
+# (e.g. ``add_stages`` needs a platform-specific language argument), so the
+# auto dispatchers below select the Torch implementations on GCU.
 
 
 def _to_int_list(tensor: torch.Tensor) -> list[int]:
@@ -183,9 +182,9 @@ def gather_pending_and_new(
 
 @gather_pending_and_new.register_auto
 def _auto_gather_pending_and_new():
-    if _triton_compressor_available:
-        return "triton"
-    return "torch"
+    if is_enflame() or not _has_triton:
+        return "torch"
+    return "triton"
 
 
 gather_pending_and_new.register_candidate("triton")
@@ -269,9 +268,9 @@ def compress_hca(
 
 @compress_hca.register_auto
 def _auto_compress_hca():
-    if _triton_compressor_available:
-        return "triton"
-    return "torch"
+    if is_enflame() or not _has_triton:
+        return "torch"
+    return "triton"
 
 
 compress_hca.register_candidate("triton")
@@ -345,9 +344,9 @@ def compress_csa(
 
 @compress_csa.register_auto
 def _auto_compress_csa():
-    if _triton_compressor_available:
-        return "triton"
-    return "torch"
+    if is_enflame() or not _has_triton:
+        return "torch"
+    return "triton"
 
 
 compress_csa.register_candidate("triton")
@@ -458,9 +457,9 @@ def writeback_pending(
 
 @writeback_pending.register_auto
 def _auto_writeback_pending():
-    if _triton_compressor_available:
-        return "triton"
-    return "torch"
+    if is_enflame() or not _has_triton:
+        return "torch"
+    return "triton"
 
 
 writeback_pending.register_candidate("triton")
@@ -541,9 +540,9 @@ def pack_prefill_kv(
 
 @pack_prefill_kv.register_auto
 def _auto_pack_prefill_kv():
-    if _triton_compressor_available:
-        return "triton"
-    return "torch"
+    if is_enflame() or not _has_triton:
+        return "torch"
+    return "triton"
 
 
 pack_prefill_kv.register_candidate("triton")
@@ -623,9 +622,9 @@ def masked_write_kv_cache(
 
 @masked_write_kv_cache.register_auto
 def _auto_masked_write_kv_cache():
-    if _triton_compressor_available:
-        return "triton"
-    return "torch"
+    if is_enflame() or not _has_triton:
+        return "torch"
+    return "triton"
 
 
 masked_write_kv_cache.register_candidate("triton")

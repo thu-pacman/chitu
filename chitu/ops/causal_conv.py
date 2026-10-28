@@ -117,6 +117,10 @@ def causal_conv1d_update_qwen3_next(
 ):
     """Qwen3-Next decode entry point with a fail-closed GCU fast path.
 
+    Qwen3-Next decode is B=1 with a fixed 4-token conv state. The dedicated
+    in-place kernel avoids the generic kernel's unused 16-way batch lane and
+    per-step state allocation, while keeping the same BF16/FP32 reduction.
+
     Keeping this separate from the public generic operator makes the in-place
     state contract explicit and preserves generic callers' aliasing semantics.
     """

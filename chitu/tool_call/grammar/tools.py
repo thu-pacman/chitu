@@ -2,14 +2,22 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 
-from xgrammar.structural_tag import (
-    Format,
-    TagsWithSeparatorFormat,
-    TriggeredTagsFormat,
-    TagFormat,
-)
+from chitu.utils import try_import_opt_dep
+
+xgrammar, has_xgrammar = try_import_opt_dep("xgrammar", "grammar")
+if has_xgrammar:
+    from xgrammar.structural_tag import (
+        Format,
+        TagsWithSeparatorFormat,
+        TriggeredTagsFormat,
+        TagFormat,
+    )
+else:
+    Format = TagsWithSeparatorFormat = TriggeredTagsFormat = TagFormat = None
 
 from .tool import AbstractToolGrammar
 from ..type_def import ConstraintParams

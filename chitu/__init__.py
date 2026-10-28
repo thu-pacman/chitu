@@ -2,26 +2,14 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib
 import os
 import sys
 
-# Enflame GCU early setup (no-op without torch_gcu / triton_gcu). MUST run before
-# any other chitu submodule import: device_type.get_device_name() caches its result,
-# and the stock `triton` package resolves its active driver at import time. The
-# torch_gcu shim maps ".cuda()"->".gcu()" and the "nccl" process-group backend->"eccl";
-# importing triton_gcu.triton activates the GCU backend for the stock `triton` package.
-try:
-    importlib.import_module("torch_gcu.transfer_to_gcu")
+from chitu.import_utils import try_import_and_setup_torch_gcu
 
-    try:
-        importlib.import_module("triton_gcu.triton")
-    except Exception:
-        # triton_gcu is optional; without it the stock Triton backend is used.
-        pass
-except Exception:
-    # torch_gcu is optional; without it this setup is a no-op.
-    pass
+# Enflame GCU early setup (no-op without torch_gcu / triton_gcu). MUST run before
+# any other chitu submodule import.
+try_import_and_setup_torch_gcu()
 
 # Package-level logging setup is for normal runtime imports. Boot-time and docs
 # generation imports avoid runtime dependencies such as torch.

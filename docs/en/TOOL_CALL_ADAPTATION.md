@@ -23,6 +23,8 @@ Three parts must be correct at the same time:
 - Grammar constraint: `xgrammar` must constrain generation to the valid tool-call format.
 - Parser: the server must parse generated text back into `ChoiceToolCall`.
 
+Grammar-constrained decoding is optional. Install it with `pip install chitu[grammar]`; without that extra, tool calls are still parsed, but generation is not grammar-constrained.
+
 ## One Complete Request Example
 
 The following is a minimal OpenAI Chat request. It forces the model to call `get_weather`, disables parallel tool calls, and disables thinking so you can validate the main tool-call path first:

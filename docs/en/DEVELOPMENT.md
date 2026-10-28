@@ -225,6 +225,7 @@ Currently supported optional dependencies are:
 - `deep_gemm`: Support using DeepGEMM for fp8 inference.
 - `deep_ep`: Support using DeepEP for MoE communication (requiring NVSHMEM installed on your system **before** installing chitu. NVSHMEM is included in `requirements-build-deep_ep-cu12.txt`).
 - `cpu`: Support hybrid CPU+GPU inference.
+- `grammar`: Support grammar-constrained decoding (tool calls and `response_format`) via `xgrammar`.
 - `muxi_layout_kernels`: Additional kernels for running on MetaX GPUs with `infer.op_impl=muxi_custom_kernel`, optimized for small batches.
 - `scipy`: Optional dependency for FP8 indexer KV cache in DeepSeek-V3.2-Exp.
 - `fast_hadamard_transform`: Optional dependency for FP8 indexer KV cache in DeepSeek-V3.2-Exp.

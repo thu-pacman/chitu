@@ -2,17 +2,34 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import copy
 import logging
 
-from xgrammar import Grammar, StructuralTag
-from xgrammar.structural_tag import (
-    Format,
-    AnyTextFormat,
-    SequenceFormat,
-    ConstStringFormat,
-    JSONSchemaFormat,
-)
+from chitu.utils import try_import_opt_dep
+
+xgrammar, has_xgrammar = try_import_opt_dep("xgrammar", "grammar")
+if has_xgrammar:
+    from xgrammar import Grammar, StructuralTag
+    from xgrammar.structural_tag import (
+        Format,
+        AnyTextFormat,
+        SequenceFormat,
+        ConstStringFormat,
+        JSONSchemaFormat,
+    )
+else:
+    (
+        Grammar,
+        StructuralTag,
+        Format,
+        AnyTextFormat,
+        SequenceFormat,
+        ConstStringFormat,
+        JSONSchemaFormat,
+    ) = (None,) * 7
+
 from .tools import AbstractToolsGrammar
 from ..type_def import ToolCallParams, ConstraintParams, ResponseFormatParams
 from chitu.output_parser.utils import get_output_parser_params
