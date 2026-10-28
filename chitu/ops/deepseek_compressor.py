@@ -2,12 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Torch fallback ops for the DeepSeek-V4 HCA/CSA compressor.
-
-The functions in this module intentionally mirror the Triton wrapper signatures
-in ``chitu.ops.triton_ops.deepseek_compressor``. Model code can therefore share
-one flat/ragged prefill flow and select only the backend implementation.
-"""
+"""Dispatched ops for the DeepSeek-V4 HCA/CSA compressor."""
 
 import itertools
 from typing import Optional
@@ -20,6 +15,23 @@ from chitu.ops.deepseek_v4_decode_plan import (
 )
 from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import try_import_platform_dep
+
+_, _has_triton = try_import_platform_dep("triton")
+if _has_triton:
+    from chitu.ops.triton_ops.deepseek_compressor import (
+        compress_csa_triton,
+        compress_hca_triton,
+        decode_hca as _decode_hca_triton,
+        decode_mtp_csa as _decode_mtp_csa_triton,
+        decode_mtp_hca as _decode_mtp_hca_triton,
+        gather_pending_and_new_triton,
+        masked_write_kv_cache_triton,
+        pack_prefill_kv_triton,
+        postprocess_write_flashmla as _postprocess_write_flashmla_triton,
+        postprocess_write_kv_cache as _postprocess_write_kv_cache_triton,
+        postprocess_write_kv_cache_hadamard as _postprocess_write_kv_cache_hadamard_triton,
+        writeback_pending_triton,
+    )
 
 
 def _to_int_list(tensor: torch.Tensor) -> list[int]:
@@ -138,6 +150,7 @@ def build_compress_metadata_from_tensors(
     )
 
 
+@make_op_dispatcher
 def gather_pending_and_new(
     kv_state: torch.Tensor,
     score_state: torch.Tensor,
@@ -154,8 +167,43 @@ def gather_pending_and_new(
     ratio: int,
     pending_offset: int = 0,
     max_eff: int | None = None,
+    *,
+    impl: str = "auto",
 ) -> None:
     """Gather each request's pending state and new tokens into flat ragged buffers."""
+    raise NotImplementedError
+
+
+@gather_pending_and_new.register_auto
+def _auto_gather_pending_and_new():
+    if _has_triton:
+        return "triton"
+    return "torch"
+
+
+gather_pending_and_new.register_candidate("triton")
+if _has_triton:
+    gather_pending_and_new.register("triton")(gather_pending_and_new_triton)
+
+
+@gather_pending_and_new.register("torch")
+def gather_pending_and_new_torch(
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    kv_cat: torch.Tensor,
+    score_cat: torch.Tensor,
+    ape: torch.Tensor,
+    flat_kv: torch.Tensor,
+    flat_score: torch.Tensor,
+    cu_eff: torch.Tensor,
+    cu_new: torch.Tensor,
+    pending_lens: torch.Tensor,
+    start_positions: torch.Tensor,
+    cache_slots: torch.Tensor,
+    ratio: int,
+    pending_offset: int = 0,
+    max_eff: int | None = None,
+) -> None:
     del pending_offset, max_eff
     n = int(pending_lens.numel())
     if n == 0 or flat_kv.numel() == 0:
@@ -195,6 +243,7 @@ def gather_pending_and_new(
             flat_score[dst] = score_cat[src]
 
 
+@make_op_dispatcher
 def compress_hca(
     flat_kv: torch.Tensor,
     flat_score: torch.Tensor,
@@ -204,8 +253,36 @@ def compress_hca(
     cu_groups: torch.Tensor,
     group_to_req: torch.Tensor,
     ratio: int,
+    *,
+    impl: str = "auto",
 ) -> None:
     """Compress HCA groups from flat ragged buffers into ``out_kv``."""
+    raise NotImplementedError
+
+
+@compress_hca.register_auto
+def _auto_compress_hca():
+    if _has_triton:
+        return "triton"
+    return "torch"
+
+
+compress_hca.register_candidate("triton")
+if _has_triton:
+    compress_hca.register("triton")(compress_hca_triton)
+
+
+@compress_hca.register("torch")
+def compress_hca_torch(
+    flat_kv: torch.Tensor,
+    flat_score: torch.Tensor,
+    ape: torch.Tensor,
+    out_kv: torch.Tensor,
+    cu_eff: torch.Tensor,
+    cu_groups: torch.Tensor,
+    group_to_req: torch.Tensor,
+    ratio: int,
+) -> None:
     del group_to_req
     total_groups = out_kv.shape[0]
     if total_groups == 0:
@@ -230,6 +307,7 @@ def compress_hca(
         out_kv[group_start:group_end] = (kv * score.softmax(dim=1)).sum(dim=1)
 
 
+@make_op_dispatcher
 def compress_csa(
     flat_kv: torch.Tensor,
     flat_score: torch.Tensor,
@@ -246,6 +324,8 @@ def compress_csa(
     n_groups_list_t: torch.Tensor,
     ratio: int,
     head_dim: int,
+    *,
+    impl: str = "auto",
 ) -> None:
     """Compress CSA groups and update the per-slot prev-group state in-place.
 
@@ -253,6 +333,39 @@ def compress_csa(
     pending state is a logical-position ring, so that reference is loaded from
     the previous group's absolute positions instead of a mutable compact prefix.
     """
+    raise NotImplementedError
+
+
+@compress_csa.register_auto
+def _auto_compress_csa():
+    if _has_triton:
+        return "triton"
+    return "torch"
+
+
+compress_csa.register_candidate("triton")
+if _has_triton:
+    compress_csa.register("triton")(compress_csa_triton)
+
+
+@compress_csa.register("torch")
+def compress_csa_torch(
+    flat_kv: torch.Tensor,
+    flat_score: torch.Tensor,
+    ape: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    out_kv: torch.Tensor,
+    cu_eff: torch.Tensor,
+    cu_groups: torch.Tensor,
+    group_to_req: torch.Tensor,
+    pending_lens: torch.Tensor,
+    start_positions: torch.Tensor,
+    cache_slots: torch.Tensor,
+    n_groups_list_t: torch.Tensor,
+    ratio: int,
+    head_dim: int,
+) -> None:
     del group_to_req
     n = int(pending_lens.numel())
     if n == 0:
@@ -316,6 +429,7 @@ def compress_csa(
             )
 
 
+@make_op_dispatcher
 def writeback_pending(
     flat_kv: torch.Tensor,
     flat_score: torch.Tensor,
@@ -328,8 +442,39 @@ def writeback_pending(
     cache_slots: torch.Tensor,
     pending_offset: int,
     ratio: int,
+    *,
+    impl: str = "auto",
 ) -> None:
     """Write the live suffix back to the logical-position pending-state ring."""
+    raise NotImplementedError
+
+
+@writeback_pending.register_auto
+def _auto_writeback_pending():
+    if _has_triton:
+        return "triton"
+    return "torch"
+
+
+writeback_pending.register_candidate("triton")
+if _has_triton:
+    writeback_pending.register("triton")(writeback_pending_triton)
+
+
+@writeback_pending.register("torch")
+def writeback_pending_torch(
+    flat_kv: torch.Tensor,
+    flat_score: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    ape: torch.Tensor,
+    cu_eff: torch.Tensor,
+    pending_lens: torch.Tensor,
+    start_positions: torch.Tensor,
+    cache_slots: torch.Tensor,
+    pending_offset: int,
+    ratio: int,
+) -> None:
     del pending_offset
     n = int(pending_lens.numel())
     if n == 0:
@@ -362,20 +507,149 @@ def writeback_pending(
         score_state[slot, rows] = flat_score[src] + ape[positions.remainder(ratio)]
 
 
-_, _has_triton = try_import_platform_dep("triton")
+@make_op_dispatcher
+def pack_prefill_kv(
+    history_kv: torch.Tensor,
+    current_kv: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    out_kv: torch.Tensor,
+    history_offsets: torch.Tensor,
+    current_offsets: torch.Tensor,
+    compressed_offsets: torch.Tensor,
+    out_offsets: torch.Tensor,
+    history_lens: torch.Tensor,
+    current_lens: torch.Tensor,
+    compressed_lens: torch.Tensor,
+    *,
+    impl: str = "auto",
+) -> None:
+    """Pack each request's [history | current | compressed] KV segments into ``out_kv``.
+
+    Segment `i` of the output holds the concatenation of `history_kv`,
+    `current_kv` and `compressed_kv` rows of request `i`; the `*_offsets` and
+    `*_lens` tensors describe the ragged layout of each input.
+    """
+    raise NotImplementedError
+
+
+@pack_prefill_kv.register_auto
+def _auto_pack_prefill_kv():
+    if _has_triton:
+        return "triton"
+    return "torch"
+
+
+pack_prefill_kv.register_candidate("triton")
 if _has_triton:
-    from chitu.ops.triton_ops.deepseek_compressor import (
-        decode_hca as _decode_hca_triton,
-        decode_mtp_hca as _decode_mtp_hca_triton,
-        decode_mtp_csa as _decode_mtp_csa_triton,
-        postprocess_write_flashmla as _postprocess_write_flashmla_triton,
-        postprocess_write_kv_cache as _postprocess_write_kv_cache_triton,
-        postprocess_write_kv_cache_hadamard as _postprocess_write_kv_cache_hadamard_triton,
+    pack_prefill_kv.register("triton")(pack_prefill_kv_triton)
+
+
+@pack_prefill_kv.register("torch")
+def pack_prefill_kv_torch(
+    history_kv: torch.Tensor,
+    current_kv: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    out_kv: torch.Tensor,
+    history_offsets: torch.Tensor,
+    current_offsets: torch.Tensor,
+    compressed_offsets: torch.Tensor,
+    out_offsets: torch.Tensor,
+    history_lens: torch.Tensor,
+    current_lens: torch.Tensor,
+    compressed_lens: torch.Tensor,
+) -> None:
+    n = history_lens.numel()
+    if n == 0 or out_kv.numel() == 0:
+        return
+    device = out_kv.device
+    req_range = torch.arange(n, device=device, dtype=torch.long)
+
+    def scatter(
+        src: torch.Tensor,
+        offsets: torch.Tensor,
+        lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ):
+        total = int(src.size(0))
+        if total == 0:
+            return
+        req_ids = torch.repeat_interleave(req_range, lens, output_size=total)
+        token_offsets = (
+            torch.arange(total, device=device, dtype=torch.long) - offsets[req_ids]
+        )
+        dst = out_offsets[req_ids] + prefix_lens[req_ids] + token_offsets
+        out_kv[dst] = src
+
+    zero_lens = torch.zeros_like(history_lens)
+    scatter(history_kv, history_offsets, history_lens, zero_lens)
+    scatter(current_kv, current_offsets, current_lens, history_lens)
+    scatter(
+        compressed_kv,
+        compressed_offsets,
+        compressed_lens,
+        history_lens + current_lens,
     )
 
-_HAS_TRITON_DECODE = _has_triton
-_HAS_TRITON_FLASHMLA_POSTPROCESS = _has_triton
-_HAS_TRITON_KV_CACHE_POSTPROCESS = _has_triton
+
+@make_op_dispatcher
+def masked_write_kv_cache(
+    values: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: Optional[torch.Tensor],
+    cache_slots: torch.Tensor,
+    positions: torch.Tensor,
+    cache_seq_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    impl: str = "auto",
+) -> None:
+    """Write the valid rows of ``values`` into a dense or paged KV cache.
+
+    A paged cache is selected by passing a non-None ``block_table``; then rows
+    are addressed by (``cache_seq_ids``, ``positions``) through the page table,
+    and ``cache_slots`` is ignored. A dense cache is addressed by
+    (``cache_slots``, ``positions``). Rows whose ``valid_mask`` entry is false
+    are not written.
+    """
+    raise NotImplementedError
+
+
+@masked_write_kv_cache.register_auto
+def _auto_masked_write_kv_cache():
+    if _has_triton:
+        return "triton"
+    return "torch"
+
+
+masked_write_kv_cache.register_candidate("triton")
+if _has_triton:
+    masked_write_kv_cache.register("triton")(masked_write_kv_cache_triton)
+
+
+@masked_write_kv_cache.register("torch")
+def masked_write_kv_cache_torch(
+    values: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: Optional[torch.Tensor],
+    cache_slots: torch.Tensor,
+    positions: torch.Tensor,
+    cache_seq_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> None:
+    valid = valid_mask.to(device=values.device, dtype=torch.bool)
+    values = values[valid]
+    if values.numel() == 0:
+        return
+    positions = positions.to(device=values.device, dtype=torch.long)[valid]
+    if block_table is None:
+        cache_slots = cache_slots.to(device=values.device, dtype=torch.long)[valid]
+        kv_cache[cache_slots, positions] = values
+        return
+
+    cache_seq_ids = cache_seq_ids.to(device=values.device, dtype=torch.long)[valid]
+    page_size = kv_cache.shape[1]
+    page_ids = block_table[cache_seq_ids, positions // page_size]
+    kv_cache[page_ids, positions % page_size] = values
 
 
 def _ensure_decode_compress_plan(
@@ -423,7 +697,7 @@ def supports_decode_fastpath(
     q_len: int,
     ratio: int,
 ) -> bool:
-    return q_len <= ratio and _HAS_TRITON_DECODE and kv.is_cuda
+    return q_len <= ratio and _has_triton and kv.is_cuda
 
 
 @make_op_dispatcher
@@ -469,7 +743,7 @@ def _auto_decode_compressor(
     row_is_valid: Optional[torch.Tensor] = None,
 ):
     del plan, request_rows, row_is_valid
-    if _HAS_TRITON_DECODE and kv.is_cuda:
+    if _has_triton and kv.is_cuda:
         return "triton"
     if q_len == 1:
         return "torch"
@@ -478,7 +752,7 @@ def _auto_decode_compressor(
     )
 
 
-@decode_compressor.register("triton", available=_HAS_TRITON_DECODE)
+@decode_compressor.register("triton", available=_has_triton)
 def _decode_compressor_triton(
     kv: torch.Tensor,
     score: torch.Tensor,
@@ -713,7 +987,7 @@ def _auto_try_fused_decode_postprocess_write_cache(
         return "skip"
 
     if (
-        _HAS_TRITON_FLASHMLA_POSTPROCESS
+        _has_triton
         and not use_hadamard
         and kv_cache_is_paged
         and block_table is not None
@@ -722,7 +996,7 @@ def _auto_try_fused_decode_postprocess_write_cache(
         return "flashmla"
 
     if (
-        _HAS_TRITON_KV_CACHE_POSTPROCESS
+        _has_triton
         and use_hadamard
         and kv_compress.shape[-1] == 128
         and kv_cache.ndim == 3
@@ -733,7 +1007,7 @@ def _auto_try_fused_decode_postprocess_write_cache(
         return "kv_cache_hadamard"
 
     if (
-        _HAS_TRITON_KV_CACHE_POSTPROCESS
+        _has_triton
         and not use_hadamard
         and kv_cache.ndim == 3
         and not _is_flashmla_packed_cache(kv_cache)
@@ -766,9 +1040,7 @@ def _try_fused_decode_postprocess_write_cache_skip(
     return False
 
 
-@try_fused_decode_postprocess_write_cache.register(
-    "flashmla", available=_HAS_TRITON_FLASHMLA_POSTPROCESS
-)
+@try_fused_decode_postprocess_write_cache.register("flashmla", available=_has_triton)
 def _try_fused_decode_postprocess_write_cache_flashmla_impl(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -838,9 +1110,7 @@ def _call_postprocess_kv_cache_writer(
     return True
 
 
-@try_fused_decode_postprocess_write_cache.register(
-    "kv_cache", available=_HAS_TRITON_KV_CACHE_POSTPROCESS
-)
+@try_fused_decode_postprocess_write_cache.register("kv_cache", available=_has_triton)
 def _try_fused_decode_postprocess_write_cache_kv_impl(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -878,7 +1148,7 @@ def _try_fused_decode_postprocess_write_cache_kv_impl(
 
 
 @try_fused_decode_postprocess_write_cache.register(
-    "kv_cache_hadamard", available=_HAS_TRITON_KV_CACHE_POSTPROCESS
+    "kv_cache_hadamard", available=_has_triton
 )
 def _try_fused_decode_postprocess_write_cache_kv_hadamard_impl(
     kv_compress: torch.Tensor,

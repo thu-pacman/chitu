@@ -20,10 +20,10 @@ from chitu.ops.triton_ops.kv_cache import (
     read_from_paged_indexer_kv_cache_deepgemm_triton,
 )
 from chitu.ops.triton_ops.deepseek_compressor import (
-    gather_pending_and_new,
-    compress_hca,
-    compress_csa,
-    writeback_pending,
+    gather_pending_and_new_triton,
+    compress_hca_triton,
+    compress_csa_triton,
+    writeback_pending_triton,
 )
 from chitu.ops.triton_ops.norm import (
     rms_norm_triton,

@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable, Optional
+from typing import Optional
 import abc
 import functools
 import packaging.version
@@ -24,6 +24,7 @@ from chitu.ops import (
     read_from_dense_kv_cache,
     read_from_paged_kv_cache,
 )
+from chitu.ops.deepseek_compressor import pack_prefill_kv
 from chitu.utils import try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
@@ -320,7 +321,6 @@ class AttnBackend(abc.ABC):
         compress_ratio: Optional[int] = None,
         seqlens: Optional[torch.Tensor] = None,
         compressed_lens: Optional[torch.Tensor] = None,
-        pack_prefill_kv: Optional[Callable] = None,
     ) -> torch.Tensor:
         if seqlens is not None:
             return self.csa_hca_prefill(
@@ -341,7 +341,6 @@ class AttnBackend(abc.ABC):
                 window_size=window_size,
                 physical_window_size=physical_window_size,
                 compressed_lens=compressed_lens,
-                pack_prefill_kv=pack_prefill_kv,
                 compress_ratio=compress_ratio,
             )
         if start_positions is None:
@@ -399,7 +398,6 @@ class AttnBackend(abc.ABC):
         window_size: Optional[int] = None,
         physical_window_size: Optional[int] = None,
         compressed_lens: Optional[torch.Tensor] = None,
-        pack_prefill_kv: Optional[Callable] = None,
         compress_ratio: Optional[int] = None,
     ) -> torch.Tensor:
         if isinstance(slidingwindow_kv_or_cache, KVCacheAccessor):
@@ -439,7 +437,6 @@ class AttnBackend(abc.ABC):
                 physical_window_size=physical_window_size,
                 compressed_cache=compressed_cache,
                 compressed_lens=compressed_lens,
-                pack_prefill_kv=pack_prefill_kv,
                 compress_ratio=compress_ratio,
             )
         if not isinstance(slidingwindow_kv_or_cache, torch.Tensor):
@@ -532,7 +529,6 @@ class AttnBackend(abc.ABC):
         physical_window_size: Optional[int] = None,
         compressed_cache: Optional[KVCacheAccessor] = None,
         compressed_lens: Optional[torch.Tensor] = None,
-        pack_prefill_kv: Optional[Callable] = None,
         compress_ratio: Optional[int] = None,
     ) -> torch.Tensor:
         if isinstance(slidingwindow_cache, DenseKVCacheAccessor):
@@ -551,7 +547,6 @@ class AttnBackend(abc.ABC):
                 physical_window_size=physical_window_size,
                 compressed_cache=compressed_cache,
                 compressed_lens=compressed_lens,
-                pack_prefill_kv=pack_prefill_kv,
                 compress_ratio=compress_ratio,
             )
         if isinstance(slidingwindow_cache, PagedKVCacheAccessor):
@@ -570,7 +565,6 @@ class AttnBackend(abc.ABC):
                 physical_window_size=physical_window_size,
                 compressed_cache=compressed_cache,
                 compressed_lens=compressed_lens,
-                pack_prefill_kv=pack_prefill_kv,
                 compress_ratio=compress_ratio,
             )
         raise NotImplementedError(
@@ -594,7 +588,6 @@ class AttnBackend(abc.ABC):
         physical_window_size: Optional[int] = None,
         compressed_cache: Optional[KVCacheAccessor] = None,
         compressed_lens: Optional[torch.Tensor] = None,
-        pack_prefill_kv: Optional[Callable] = None,
         compress_ratio: Optional[int] = None,
     ) -> torch.Tensor:
         return self._csa_hca_prefill_ragged_qo_kv_cache(
@@ -612,7 +605,6 @@ class AttnBackend(abc.ABC):
             physical_window_size=physical_window_size,
             compressed_cache=compressed_cache,
             compressed_lens=compressed_lens,
-            pack_prefill_kv=pack_prefill_kv,
             compress_ratio=compress_ratio,
         )
 
@@ -633,7 +625,6 @@ class AttnBackend(abc.ABC):
         physical_window_size: Optional[int] = None,
         compressed_cache: Optional[KVCacheAccessor] = None,
         compressed_lens: Optional[torch.Tensor] = None,
-        pack_prefill_kv: Optional[Callable] = None,
         compress_ratio: Optional[int] = None,
     ) -> torch.Tensor:
         return self._csa_hca_prefill_ragged_qo_kv_cache(
@@ -651,7 +642,6 @@ class AttnBackend(abc.ABC):
             physical_window_size=physical_window_size,
             compressed_cache=compressed_cache,
             compressed_lens=compressed_lens,
-            pack_prefill_kv=pack_prefill_kv,
             compress_ratio=compress_ratio,
         )
 
@@ -672,7 +662,6 @@ class AttnBackend(abc.ABC):
         physical_window_size: Optional[int],
         compressed_cache: Optional[KVCacheAccessor],
         compressed_lens: Optional[torch.Tensor],
-        pack_prefill_kv: Optional[Callable],
         compress_ratio: Optional[int],
     ) -> torch.Tensor:
         if q.dim() == 4 and q.size(0) == 1:
@@ -814,7 +803,7 @@ class AttnBackend(abc.ABC):
             history_kv = history_kv.to(dtype=attn_kv.dtype)
         if compressed_kv.dtype != attn_kv.dtype:
             compressed_kv = compressed_kv.to(dtype=attn_kv.dtype)
-        self._pack_dsv4_prefill_kv(
+        pack_prefill_kv(
             history_kv,
             kv,
             compressed_kv,
@@ -826,13 +815,6 @@ class AttnBackend(abc.ABC):
             history_lens,
             seqlens,
             compressed_lens,
-            history_req_ids,
-            history_token_offsets,
-            current_req_ids,
-            current_token_offsets,
-            compressed_req_ids,
-            compressed_token_offsets,
-            pack_prefill_kv=pack_prefill_kv,
         )
 
         if topk_idxs.dim() != 2 or topk_idxs.size(0) != total_q:
@@ -972,65 +954,6 @@ class AttnBackend(abc.ABC):
             current_kv,
             window_size=int(window_size),
         )
-
-    def _pack_dsv4_prefill_kv(
-        self,
-        history_kv: torch.Tensor,
-        current_kv: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        out_kv: torch.Tensor,
-        history_offsets: torch.Tensor,
-        current_offsets: torch.Tensor,
-        compressed_offsets: torch.Tensor,
-        out_offsets: torch.Tensor,
-        history_lens: torch.Tensor,
-        current_lens: torch.Tensor,
-        compressed_lens: torch.Tensor,
-        history_req_ids: torch.Tensor,
-        history_token_offsets: torch.Tensor,
-        current_req_ids: torch.Tensor,
-        current_token_offsets: torch.Tensor,
-        compressed_req_ids: torch.Tensor,
-        compressed_token_offsets: torch.Tensor,
-        *,
-        pack_prefill_kv: Optional[Callable] = None,
-    ):
-        if out_kv.numel() == 0:
-            return
-        if pack_prefill_kv is not None and out_kv.is_cuda:
-            pack_prefill_kv(
-                history_kv,
-                current_kv,
-                compressed_kv,
-                out_kv,
-                history_offsets,
-                current_offsets,
-                compressed_offsets,
-                out_offsets,
-                history_lens,
-                current_lens,
-                compressed_lens,
-            )
-            return
-
-        if history_kv.numel() > 0:
-            history_dst = out_offsets[history_req_ids] + history_token_offsets
-            out_kv[history_dst] = history_kv
-        if current_kv.numel() > 0:
-            current_dst = (
-                out_offsets[current_req_ids]
-                + history_lens[current_req_ids]
-                + current_token_offsets
-            )
-            out_kv[current_dst] = current_kv
-        if compressed_kv.numel() > 0:
-            sliding_lens = history_lens + current_lens
-            compressed_dst = (
-                out_offsets[compressed_req_ids]
-                + sliding_lens[compressed_req_ids]
-                + compressed_token_offsets
-            )
-            out_kv[compressed_dst] = compressed_kv
 
     def csa_hca_decode(
         self,
