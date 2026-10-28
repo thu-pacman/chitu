@@ -2,25 +2,34 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import functools
 import logging
 import contextlib
-from xgrammar import TokenizerInfo, GrammarCompiler, CompiledGrammar, Grammar
 import threading
 import json
 from collections import OrderedDict
 from concurrent.futures import Future
 
-from chitu.utils import DaemonThreadPoolExecutor
+from chitu.utils import DaemonThreadPoolExecutor, try_import_opt_dep
 from chitu.global_vars import get_global_args
 from chitu.tool_call.type_def import ToolCallParams, ResponseFormatParams
 from chitu.tool_call import build_grammar
 
 logger = logging.getLogger(__name__)
 
+xgrammar, has_xgrammar = try_import_opt_dep("xgrammar", "grammar")
+if has_xgrammar:
+    from xgrammar import TokenizerInfo, GrammarCompiler, CompiledGrammar, Grammar
+else:
+    TokenizerInfo = GrammarCompiler = CompiledGrammar = Grammar = None
+
 
 @functools.cache
 def get_tokenizer_info():
+    if not has_xgrammar:
+        return None
     from chitu.backend import Backend
 
     try:

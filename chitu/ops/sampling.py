@@ -5,15 +5,17 @@
 from typing import Optional
 
 import torch
-import xgrammar
 
 from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import (
     try_import_platform_dep,
     try_import_and_setup_torch_npu,
+    try_import_opt_dep,
     create_tensor,
 )
 from chitu.device_type import has_accelerator, is_muxi, is_ascend, is_ascend_950
+
+xgrammar, has_xgrammar = try_import_opt_dep("xgrammar", "grammar")
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -204,7 +206,7 @@ def apply_bitmask(logits: torch.Tensor, bitmask: torch.Tensor, indices: list[int
             if bitmask[idx, token // 32] & (1 << (token % 32)) == 0:
                 logits[idx, token] = -inf
     """
-    if is_ascend() or is_muxi():
+    if is_ascend() or is_muxi() or not has_xgrammar:
         return apply_bitmask_torch(logits, bitmask, indices)
     return xgrammar.apply_token_bitmask_inplace(logits, bitmask, indices=indices)
 

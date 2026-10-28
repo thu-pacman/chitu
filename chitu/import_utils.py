@@ -6,7 +6,6 @@ from typing import Any, Tuple
 import importlib
 import site
 import os
-import torch
 
 
 def try_import_platform_dep(pkg_name: str) -> Tuple[Any, bool]:
@@ -64,6 +63,7 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
     # Keep this sync with get_requires.py
     opt_deps = {
         "quant",
+        "grammar",
         "muxi_layout_kernels",
         "muxi_w8a8_kernels",
         "ascend_kernels",
@@ -127,6 +127,7 @@ def try_import_and_setup_torch_npu():
 
     if has_torch_npu and not _torch_npu_has_set_up:
         # Make "torch.cuda" point to NPU devices
+        import torch
         from torch_npu.contrib import transfer_to_npu
 
         torch.cuda.CUDAGraph = torch.npu.NPUGraph
@@ -141,6 +142,44 @@ def try_import_and_setup_torch_npu():
         _torch_npu_has_set_up = True
 
     return torch_npu, has_torch_npu
+
+
+_torch_gcu_has_set_up = False
+
+
+def try_import_and_setup_torch_gcu():
+    """
+    Try importing `torch_gcu`. If successful, install its torch and Triton shims.
+
+    This must run before any other chitu submodule is imported: `device_type`
+    caches its device name, and the stock `triton` package resolves its active
+    driver at import time.
+    """
+
+    global _torch_gcu_has_set_up
+
+    torch_gcu, has_torch_gcu = try_import_platform_dep("torch_gcu")
+
+    if has_torch_gcu and not _torch_gcu_has_set_up:
+        try:
+            # The shim maps ".cuda()" to ".gcu()" and the "nccl" process-group
+            # backend to "eccl".
+            importlib.import_module("torch_gcu.transfer_to_gcu")
+        except Exception:
+            # torch_gcu exists but its shim is unusable; leave the stock torch
+            # behavior intact.
+            return torch_gcu, has_torch_gcu
+
+        try:
+            # Activate the GCU backend for the stock `triton` package.
+            importlib.import_module("triton_gcu.triton")
+        except Exception:
+            # triton_gcu is optional; without it the stock Triton backend is used.
+            pass
+
+        _torch_gcu_has_set_up = True
+
+    return torch_gcu, has_torch_gcu
 
 
 _gcu_c_ops_loaded = False

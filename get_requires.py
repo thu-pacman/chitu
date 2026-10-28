@@ -101,7 +101,6 @@ install_requires = [
     "netifaces",
     "prometheus-client>=0.19.0",
     "prometheus-api-client>=0.7.0",
-    "xgrammar>=0.2",
     "openai",
     "anthropic",
     "build==1.4.0",
@@ -111,6 +110,9 @@ install_requires = [
 
 
 extras_require = {
+    "grammar": [
+        "xgrammar>=0.2",
+    ],
     "quant": [
         "optimum",
         "bitsandbytes",

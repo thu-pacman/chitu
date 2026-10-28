@@ -7,20 +7,6 @@ from typing import Optional
 from dataclasses import dataclass, field, replace
 import torch
 
-try:
-    from xgrammar import (
-        allocate_token_bitmask,
-        GrammarMatcher,
-        BatchGrammarMatcher,
-    )
-except ImportError:
-    # Grammar-constrained (guided) decoding is optional. The installed xgrammar may be
-    # older than chitu expects (e.g. lacks BatchGrammarMatcher). Disable it gracefully;
-    # normal (unconstrained) sampling does not require xgrammar.
-    allocate_token_bitmask = None
-    GrammarMatcher = None
-    BatchGrammarMatcher = None
-
 from chitu.global_vars import get_global_args, is_pd_prefill_only
 from chitu.task import Task, SampleParams, PackedTasks, PackedTasksResult, TaskType
 from chitu.ops.sampling import (
@@ -33,11 +19,30 @@ from chitu.ops.sampling import (
     resample_mtp_rejected,
     batch_append_tokens,
 )
-from chitu.utils import ceil_div, create_tensor, get_chitu_bool_env, step_timer
+from chitu.utils import (
+    ceil_div,
+    create_tensor,
+    get_chitu_bool_env,
+    step_timer,
+    try_import_opt_dep,
+)
 
 from .utils import get_tokenizer_info, get_op_device
 
 logger = logging.getLogger(__name__)
+
+xgrammar, has_xgrammar = try_import_opt_dep("xgrammar", "grammar")
+if has_xgrammar:
+    # The installed xgrammar may be older than chitu expects (e.g. lacks
+    # BatchGrammarMatcher). Disable the missing pieces gracefully; normal
+    # (unconstrained) sampling does not require xgrammar.
+    allocate_token_bitmask = getattr(xgrammar, "allocate_token_bitmask", None)
+    GrammarMatcher = getattr(xgrammar, "GrammarMatcher", None)
+    BatchGrammarMatcher = getattr(xgrammar, "BatchGrammarMatcher", None)
+else:
+    allocate_token_bitmask = None
+    GrammarMatcher = None
+    BatchGrammarMatcher = None
 
 TOKEN_BLOCK_SIZE = 256
 "token block size for frequency penalty"

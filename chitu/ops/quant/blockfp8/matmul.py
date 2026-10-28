@@ -9,6 +9,7 @@ import torch
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.native_layout import DeepGemmScale
 from chitu.device_type import is_enflame
+from chitu.import_utils import ensure_gcu_c_ops
 from chitu.global_vars import get_global_args
 from chitu.ops.utils import make_op_dispatcher
 from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
@@ -103,6 +104,45 @@ def blockfp8_gemm_deep_gemm(
 blockfp8_gemm.register_candidate("triton")
 if has_triton:
     blockfp8_gemm.register("triton")(blockfp8_gemm_triton)
+
+
+@blockfp8_gemm.register("gcu", available=is_enflame())
+@single_dispatch_lazy_tensor
+def _gcu_blockfp8_gemm(
+    a: torch.Tensor,
+    a_s: torch.Tensor | DeepGemmScale,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    *,
+    round_scale_to_pow2: bool = False,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+) -> torch.Tensor:
+    """Vendor block-FP8 GEMM over the already-quantized activation + scales."""
+    del round_scale_to_pow2, scale_block_shape
+    ensure_gcu_c_ops()
+    if isinstance(a_s, DeepGemmScale):
+        raise NotImplementedError("GCU blockfp8 gemm: unsupported DeepGemmScale a_s")
+    N = b.shape[0]
+    a2 = a.reshape(-1, a.shape[-1]).contiguous()
+    # Checkpoint FP8 payloads kept in uint8 params: reinterpret the same E4M3 bytes.
+    b_for_gemm = b.view(torch.float8_e4m3fn) if b.dtype == torch.uint8 else b
+    if isinstance(b_s, DeepGemmScale):
+        b_s = b_s.layout_tensor
+    c = torch.empty(
+        a2.shape[:-1] + (N,),
+        dtype=torch.get_default_dtype(),
+        device=a.device,
+    )
+    torch.ops._C.linear_quant(
+        c,
+        a2,
+        b_for_gemm,
+        None,
+        a_s,
+        b_s.to(torch.float32),
+        -1,
+    )
+    return c.reshape(*a.shape[:-1], N)
 
 
 @make_op_dispatcher

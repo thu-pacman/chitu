@@ -2,12 +2,21 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 from abc import ABC
-from xgrammar.structural_tag import (
-    Format,
-    JSONSchemaFormat,
-    AnyTextFormat,
-)
+
+from chitu.utils import try_import_opt_dep
+
+xgrammar, has_xgrammar = try_import_opt_dep("xgrammar", "grammar")
+if has_xgrammar:
+    from xgrammar.structural_tag import (
+        Format,
+        JSONSchemaFormat,
+        AnyTextFormat,
+    )
+else:
+    Format = JSONSchemaFormat = AnyTextFormat = None
 
 
 class AbstractArgValueGrammar(ABC):
