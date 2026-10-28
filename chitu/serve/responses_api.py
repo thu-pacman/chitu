@@ -29,11 +29,12 @@ DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
 if not DOC_GENERATION:
     from chitu.global_vars import get_global_args
     from chitu.task import UserRequest, RequestParams, PromptTooLongError
-    from chitu.output_parser import REASONING_OUTPUT_STATES
+    from chitu.output_parser import OutputState, REASONING_OUTPUT_STATES
     from chitu.tool_call import (
         get_tool_parser_cls,
         parse_stream_by_parser,
         InvalidToolCallArgumentsError,
+        warn_unparsed_tool_channel_text,
     )
     from chitu.serve.anthropic_api import resolve_requested_model_or_error
     from chitu.serve.common import (
@@ -764,7 +765,7 @@ def _stream_source_for_response(
 
     parser_cls = get_tool_parser_cls()
     parser = parser_cls(req.tool_call_params.tools)
-    return parse_stream_by_parser(req.async_stream, parser)
+    return parse_stream_by_parser(req.async_stream, parser, request_id=req.request_id)
 
 
 def _response_status_and_incomplete_details(
@@ -1001,6 +1002,8 @@ async def collect_response_output(
         async for data, state, _extra in req.async_stream:
             if not data or state in REASONING_OUTPUT_STATES:
                 continue
+            if state == OutputState.TOOL:
+                warn_unparsed_tool_channel_text(data, request_id=req.request_id)
             output_text_parts.append(data)
 
     output_items: list[dict[str, Any]] = []
@@ -1156,6 +1159,8 @@ async def responses_stream_from_async_stream(
 
         if state in REASONING_OUTPUT_STATES or not isinstance(data, str):
             continue
+        if state == OutputState.TOOL:
+            warn_unparsed_tool_channel_text(data, request_id=user_req.request_id)
         if not text_started:
             text_started = True
             for event in _build_message_item_started_event(

@@ -5,7 +5,7 @@
 import json
 import logging
 import re
-from typing import AsyncIterable, AsyncIterator
+from typing import AsyncIterable, AsyncIterator, Callable, Optional
 
 from .stream_parse import BufferedStream
 from .context import ParseContext, StreamParseContext, ChoiceDelta
@@ -206,12 +206,33 @@ class FunctionParser(AbstractParser):
             yield delta
 
 
-class NameParser(AbstractParser):
-    def parse(self, ctx, string: str):
-        ctx.as_name(string)
+async def _chunks(items: list[str]):
+    """A one-shot async stream of the given chunks — re-feeds assembled text
+    into a context method that consumes a stream."""
+    for item in items:
+        yield item
 
-    def stream_parse(self, ctx, stream):
-        return ctx.as_name(stream)
+
+class NameParser(AbstractParser):
+    """Feeds the tool name into the context.
+
+    ``unescape`` optionally transforms the assembled name — the inverse of
+    the grammar-side ``escape`` (e.g. an XTML attribute value's XML
+    escaping). The name is assembled before the transform either way: the
+    transform need not compose over chunk boundaries, and the context emits
+    one name delta regardless.
+    """
+
+    def __init__(self, unescape: Callable[[str], str] = lambda s: s):
+        self.unescape = unescape
+
+    def parse(self, ctx, string: str):
+        ctx.as_name(self.unescape(string))
+
+    async def stream_parse(self, ctx, stream):
+        string = self.unescape(await stream.to_string())
+        async for delta in ctx.as_name(_chunks([string])):
+            yield delta
 
 
 class TypeDispatchParser(AbstractParser):
@@ -237,11 +258,32 @@ class TypeDispatchParser(AbstractParser):
 
 
 class ArgNameParser(AbstractParser):
-    def parse(self, ctx, string):
-        ctx.as_arg_name(string)
+    """Feeds an argument key into the context.
 
-    def stream_parse(self, ctx, stream):
-        return ctx.as_arg_name(stream)
+    ``unescape`` optionally transforms the assembled key — the inverse of
+    the grammar-side ``escape`` (e.g. an XTML attribute value's XML
+    escaping). Without one the key streams incrementally (chunk-sized
+    deltas); a transform forces whole-key assembly, because the transform
+    need not compose over chunk boundaries.
+    """
+
+    def __init__(self, unescape: Optional[Callable[[str], str]] = None):
+        self.unescape = unescape
+
+    def parse(self, ctx, string):
+        if self.unescape is None:
+            ctx.as_arg_name(string)
+        else:
+            ctx.as_arg_name(self.unescape(string))
+
+    async def stream_parse(self, ctx, stream):
+        if self.unescape is None:
+            async for delta in ctx.as_arg_name(stream):
+                yield delta
+            return
+        string = self.unescape(await stream.to_string())
+        async for delta in ctx.as_arg_name(_chunks([string])):
+            yield delta
 
 
 class StringArgValueParser(AbstractParser):

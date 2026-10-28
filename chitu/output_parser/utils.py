@@ -95,6 +95,68 @@ def _resolve_reasoning_delimiter_ids() -> tuple[list[int] | None, list[int] | No
     return start_ids, end_ids
 
 
+def _configured_separated_tool_calling() -> bool:
+    """Read ``models.separated_tool_calling``; False when unset (the default
+    for every model whose tool calls are not a separate channel)."""
+    try:
+        args = get_global_args()
+        return bool(getattr(args.models, "separated_tool_calling", False))
+    except Exception:
+        return False
+
+
+def _decode_marker_string(ids: list[int] | None, fallback: str) -> str:
+    """Decode a delimiter's marker STRING from its resolved token ids.
+
+    The ids are the single source of truth for every delimiter; consumers
+    that build text-level constraints (``wrap_format_with_reasoning``) get
+    the marker as a string by DECODING the ids, so a multi-token delimiter
+    (e.g. Kimi-K3's channel switch) yields its verbatim text instead of a
+    wrong classic-tag default.
+
+    Falls back to the classic marker string when no ids are resolvable (no
+    reasoning markers, or a unit-test context without a tokenizer) or when
+    the decode is empty (a stop-token id — the plain-tiktoken ``Tokenizer``
+    decodes stop tokens to ""; an empty marker string would build a
+    degenerate grammar). Both fallbacks log a warning: they leave the
+    text-level constraint following the classic default instead of the
+    model's real marker.
+    """
+    if not ids:
+        return fallback
+    from chitu.backend import Backend
+
+    if Backend.tokenizer is None:
+        logger.warning(
+            "cannot decode the reasoning delimiter marker string before the "
+            "tokenizer is initialized; falling back to %r (only expected in "
+            "unit tests)",
+            fallback,
+        )
+        return fallback
+    try:
+        text = Backend.tokenizer.decode(ids, skip_special_tokens=False)
+    except Exception:
+        logger.warning(
+            "failed to decode the reasoning delimiter marker string from "
+            "ids %r; falling back to %r",
+            ids,
+            fallback,
+            exc_info=True,
+        )
+        return fallback
+    if not text:
+        logger.warning(
+            "decoding the reasoning delimiter marker ids %r yielded an empty "
+            "string (a stop-token id?); falling back to %r — an empty marker "
+            "string would build a degenerate grammar",
+            ids,
+            fallback,
+        )
+        return fallback
+    return text
+
+
 def _get_output_parser_params(enable_thinking: bool) -> OutputParserParams:
     try:
         args = get_global_args()
@@ -104,8 +166,12 @@ def _get_output_parser_params(enable_thinking: bool) -> OutputParserParams:
         logger.info('fallback to "auto" output parser type')
         parser_type = "auto"
 
+    separated = _configured_separated_tool_calling()
     reasoning_start_ids, reasoning_end_ids = _resolve_reasoning_delimiter_ids()
     output_end_ids = _configured_delimiter("output_end_delimiter_ids")
+    message_end_ids = _configured_delimiter("message_end_delimiter_ids")
+    tool_call_start_ids = _configured_delimiter("tool_call_start_delimiter_ids")
+    tool_call_end_ids = _configured_delimiter("tool_call_end_delimiter_ids")
 
     if parser_type == "auto":
         # Reasoning-capable iff both reasoning markers are available.
@@ -123,10 +189,17 @@ def _get_output_parser_params(enable_thinking: bool) -> OutputParserParams:
         parser_type = "disabled"
 
     if parser_type == "disabled":
-        # No reasoning channel — but the sequence-ending marker still applies
-        # (e.g. Kimi-K3 with thinking off still ends its message with the
-        # multi-token XTML marker).
-        return OutputParserParams(False, output_end_delimiter_ids=output_end_ids or [])
+        # No reasoning channel — but the output-side markers still apply
+        # (e.g. Kimi-K3 with thinking off still closes its response channel,
+        # tools channel and message with the XTML markers).
+        return OutputParserParams(
+            False,
+            output_end_delimiter_ids=output_end_ids or [],
+            message_end_delimiter_ids=message_end_ids or [],
+            tool_call_start_delimiter_ids=tool_call_start_ids or [],
+            tool_call_end_delimiter_ids=tool_call_end_ids or [],
+            separated_tool_calling=separated,
+        )
 
     # Enabled types: "forced" (the prompt ends inside the reasoning channel,
     # thinking cannot be turned off) and "triggered" (the model emits the
@@ -141,7 +214,19 @@ def _get_output_parser_params(enable_thinking: bool) -> OutputParserParams:
         reasoning_start_delimiter_ids=reasoning_start_ids or [],
         reasoning_end_delimiter_ids=reasoning_end_ids,
         output_end_delimiter_ids=output_end_ids or [],
+        message_end_delimiter_ids=message_end_ids or [],
+        tool_call_start_delimiter_ids=tool_call_start_ids or [],
+        tool_call_end_delimiter_ids=tool_call_end_ids or [],
+        # The classic marker strings (the OutputParserParams defaults) are the
+        # fallbacks when the ids cannot be decoded.
+        reasoning_start_token=_decode_marker_string(
+            reasoning_start_ids, OutputParserParams.reasoning_start_token
+        ),
+        reasoning_end_token=_decode_marker_string(
+            reasoning_end_ids, OutputParserParams.reasoning_end_token
+        ),
         initial_state=(parser_type == "forced"),
+        separated_tool_calling=separated,
     )
 
 

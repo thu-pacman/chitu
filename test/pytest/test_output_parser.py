@@ -6,15 +6,15 @@
 Output-parser pipeline tests, organized by what they verify.
 
 1. Parser tests — how generated tokens are classified into the OutputState
-   lifecycle (OPENING_REASONING / REASONING / CLOSING_REASONING / OUTPUT /
-   CLOSING_OUTPUT): the unified parser at the unit level (exact contiguous
+   lifecycle (OPENING_REASONING / REASONING / CLOSING_REASONING /
+   OUTPUT_OR_TOOL / OUTPUT / TOOL / CLOSING_OUTPUT / OPENING_TOOL /
+   CLOSING_TOOL): the unified parser at the unit level (exact contiguous
    multi-token matching with the bounded holdback buffer; single-token
-   delimiters are the length-1 special case; the output-end delimiter that
-   hides the multi-token sequence-ending marker), the model-config →
-   params resolution (reasoning type × delimiter source, orthogonal), and
-   flows through AsyncDataStream (delimiter tokens must never surface as
-   text, in both thinking modes; the partial-UTF-8 holdback at delimiter
-   boundaries).
+   delimiters are the length-1 special case; the separated-tool-calling
+   region machine), the model-config → params resolution (reasoning type ×
+   delimiter source, orthogonal), and flows through AsyncDataStream
+   (delimiter tokens must never surface as text, in both thinking modes;
+   the partial-UTF-8 holdback at delimiter boundaries).
 2. API response tests — the reasoning/content split as clients receive it:
    chat-completions JSON + SSE, and Anthropic thinking-block signatures.
 3. Accounting tests — reasoning token counting: stream-level counters
@@ -26,6 +26,7 @@ never as section names.
 """
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,7 @@ from omegaconf import OmegaConf
 import chitu.output_parser.impl as output_parser_impl
 import chitu.async_stream as stream_module
 import chitu.dp_token_router as router_module
+import chitu.logging_utils as logging_utils
 import chitu.serve.anthropic_api as anthropic
 import chitu.serve.openai_api as chat
 import chitu.serve.responses_api as responses
@@ -111,16 +113,19 @@ def new_glm53_stream(monkeypatch, *, forced=True):
 # markers are NOT special tokens for it — decode yields their literal text).
 _OPEN, _CLOSE, _SEP = 163587, 163588, 163589
 _RESPONSE, _MESSAGE, _EOM = 12092, 2778, 163586
-_THINK = 39964
+_THINK, _TOOLS = 39964, 25385
 # Reasoning-end delimiter configured in Kimi-K3.yaml, verbatim:
 #   <|close|>think<|sep|><|open|>response<|sep|>   (the think→response switch)
 _K3_REASONING_END = [_CLOSE, _THINK, _SEP, _OPEN, _RESPONSE, _SEP]
-# Sequence-ending delimiter configured in Kimi-K3.yaml, verbatim:
-#   <|close|>response<|sep|><|close|>message<|sep|>
-# The final <|end_of_msg|> is NOT part of it: the task layer intercepts that
-# stop token before the parser ever sees it, so a delimiter containing it
-# would never complete on the normal path.
-_K3_OUTPUT_END = [_CLOSE, _RESPONSE, _SEP, _CLOSE, _MESSAGE, _SEP]
+# Kimi-K3 configures `test/pytest/test_output_parser.py`, which separates
+# text output and tool calling. After the text output's end, it first close
+# the output, and then maybe open and close the tool calling, and finally
+# close the whole message (turn). There will also be a final `<|end_of_msg|>`,
+# but it is not part of any delimiter. The task layer handles it.
+_K3_RESPONSE_CLOSE = [_CLOSE, _RESPONSE, _SEP]  # <|close|>response<|sep|>
+_K3_TOOLS_OPEN = [_OPEN, _TOOLS, _SEP]  # <|open|>tools<|sep|>
+_K3_TOOLS_CLOSE = [_CLOSE, _TOOLS, _SEP]  # <|close|>tools<|sep|>
+_K3_MESSAGE_CLOSE = [_CLOSE, _MESSAGE, _SEP]  # <|close|>message<|sep|>
 
 
 def _classify(parser, tokens):
@@ -149,6 +154,10 @@ class K3Tokenizer:
 
     force_full_seq_decode = False
 
+    # The real K3 eos ids (models.eos_token_id); read by UserRequest.add_data
+    # under stop_with_eos.
+    stop_tokens = {163585, 163586}
+
     PIECES = {
         _OPEN: "<|open|>",
         _CLOSE: "<|close|>",
@@ -156,33 +165,54 @@ class K3Tokenizer:
         _RESPONSE: "response",
         _MESSAGE: "message",
         _THINK: "think",
+        _TOOLS: "tools",
         _EOM: "<|end_of_msg|>",
         500: "Let",
         501: " me",
         42: "answer",
         43: "!",
+        # One tool call as the tools channel's text (the token ids are
+        # arbitrary; the decoded text is what the text-level tool parser
+        # consumes).
+        700: '<|open|>call tool="get_weather" index="1"<|sep|>',
+        701: '<|open|>argument key="location" type="string"<|sep|>',
+        702: "beijing",
+        703: "<|close|>argument<|sep|>",
+        704: "<|close|>call<|sep|>",
+        # A complete call as one token: lets a test place call-looking text
+        # in the RESPONSE region (the token id is arbitrary; no marker
+        # matches it).
+        705: (
+            '<|open|>call tool="get_weather" index="1"<|sep|>'
+            '<|open|>argument key="location" type="string"<|sep|>'
+            "beijing<|close|>argument<|sep|><|close|>call<|sep|>"
+        ),
     }
 
     def decode(self, ids, skip_special_tokens=None):
         return "".join(self.PIECES.get(i, f"<{i}>") for i in ids)
 
 
+def _k3_separated_params(enable_thinking: bool) -> OutputParserParams:
+    """The Kimi-K3 output-parser params (separated tool calling): the
+    channel switch plus the four atomic output-side markers."""
+    return OutputParserParams(
+        enable_thinking,
+        reasoning_end_delimiter_ids=list(_K3_REASONING_END),
+        output_end_delimiter_ids=list(_K3_RESPONSE_CLOSE),
+        message_end_delimiter_ids=list(_K3_MESSAGE_CLOSE),
+        tool_call_start_delimiter_ids=list(_K3_TOOLS_OPEN),
+        tool_call_end_delimiter_ids=list(_K3_TOOLS_CLOSE),
+        initial_state=enable_thinking,
+        separated_tool_calling=True,
+    )
+
+
 def new_k3_stream(monkeypatch, *, enable_thinking=True):
     """AsyncDataStream configured like a Kimi-K3 request (switchable: thinking
     on → initial reasoning region; thinking off → response-only prompt, the
-    parser watches only the ending marker)."""
-    if enable_thinking:
-        params = OutputParserParams(
-            True,
-            reasoning_end_delimiter_ids=list(_K3_REASONING_END),
-            output_end_delimiter_ids=list(_K3_OUTPUT_END),
-            initial_state=True,
-        )
-    else:
-        params = OutputParserParams(
-            False,
-            output_end_delimiter_ids=list(_K3_OUTPUT_END),
-        )
+    initial region is the response channel)."""
+    params = _k3_separated_params(enable_thinking)
     monkeypatch.setattr(
         output_parser_impl, "get_output_parser_params", lambda _: params
     )
@@ -195,18 +225,29 @@ def _make_parser(
     enable_thinking: bool,
     *,
     reasoning_end=_K3_REASONING_END,
-    output_end=_K3_OUTPUT_END,
+    output_end=_K3_RESPONSE_CLOSE,
+    message_end=_K3_MESSAGE_CLOSE,
+    tool_start=_K3_TOOLS_OPEN,
+    tool_end=_K3_TOOLS_CLOSE,
     type="switchable",
+    separated=True,
 ):
     """Parser from model-config-shaped global args (the Kimi-K3 shape by
-    default). `output_end=None` leaves the field unset (no ending marker)."""
+    default: separated tool calling with the atomic channel markers).
+    `output_end=None` leaves the field unset (only valid without separated
+    tool calling — a separated model requires every channel marker)."""
     output_parser_utils._output_parser_params_cache.clear()
     models = {
         "reasoning_type": type,
         "reasoning_end_delimiter_ids": list(reasoning_end),
+        "separated_tool_calling": separated,
     }
     if output_end is not None:
         models["output_end_delimiter_ids"] = list(output_end)
+    if separated:
+        models["message_end_delimiter_ids"] = list(message_end)
+        models["tool_call_start_delimiter_ids"] = list(tool_start)
+        models["tool_call_end_delimiter_ids"] = list(tool_end)
     set_global_args(
         OmegaConf.create({"models": models}),
         need_ensure=False,
@@ -329,24 +370,28 @@ def test_inflight_match_buffers_tokens():
     assert out == [(t, OutputState.CLOSING_REASONING) for t in _K3_REASONING_END]
     assert parser.update(42) == [(42, OutputState.OUTPUT)]
     # Now an aborted match in the output region: the buffer flushes as text.
-    assert parser.update(_CLOSE) == []  # anchors output-end AND reasoning-end
+    assert (
+        parser.update(_CLOSE) == []
+    )  # anchors both output-side closes AND the stray reasoning-end
     out = parser.update(43)  # breaks both matches
     assert out == [(_CLOSE, OutputState.OUTPUT), (43, OutputState.OUTPUT)]
     assert parser.flush() == []
 
 
 def test_parallel_matchers_first_completion_wins():
-    """In the output region the output-end and (stray) reasoning-end markers
-    share the <|close|> anchor: both match in parallel, disambiguated at the
-    second token; whichever completes wins."""
-    # The output-end marker completes -> CLOSING_OUTPUT, no region change.
+    """In the response region the response-close and (stray) reasoning-end
+    markers share the <|close|> anchor: both match in parallel,
+    disambiguated at the second token; whichever completes wins."""
+    # The response close completes -> CLOSING_OUTPUT: an output-side close
+    # never leaves the output side.
     parser = _make_parser(True)
     states = _classify(
-        parser, [500] + list(_K3_REASONING_END) + [42] + list(_K3_OUTPUT_END) + [43]
+        parser,
+        [500] + list(_K3_REASONING_END) + [42] + list(_K3_RESPONSE_CLOSE) + [43],
     )
-    assert states[-7:-1] == [OutputState.CLOSING_OUTPUT] * 6
-    assert states[-1] == OutputState.OUTPUT
-    # The reasoning-end marker completes in the output region -> a STRAY
+    assert states[-4:-1] == [OutputState.CLOSING_OUTPUT] * 3
+    assert states[-1] == OutputState.OUTPUT  # text after the close stays output-side
+    # The reasoning-end marker completes in the response region -> a STRAY
     # closing delimiter: hidden as CLOSING_REASONING, no region change.
     parser = _make_parser(True)
     states = _classify(
@@ -386,12 +431,12 @@ def test_multi_token_start_marker_opens_reasoning_within_window():
     parser = _make_triggered_parser_with_multi_token_start()
     states = _classify(parser, [7, 101, 102, 8, 103, 9])
     assert states == [
-        OutputState.OUTPUT,
+        OutputState.OUTPUT_OR_TOOL,
         OutputState.OPENING_REASONING,
         OutputState.OPENING_REASONING,
         OutputState.REASONING,
         OutputState.CLOSING_REASONING,
-        OutputState.OUTPUT,
+        OutputState.OUTPUT_OR_TOOL,
     ]
 
 
@@ -399,7 +444,7 @@ def test_multi_token_start_marker_beyond_window_is_text():
     """The same marker anchored beyond the re-entry window is plain text."""
     parser = _make_triggered_parser_with_multi_token_start()
     states = _classify(parser, [7, 8, 9, 101, 102])
-    assert states == [OutputState.OUTPUT] * 5
+    assert states == [OutputState.OUTPUT_OR_TOOL] * 5
 
 
 def test_stray_opening_marker_in_reasoning_region():
@@ -413,28 +458,33 @@ def test_stray_opening_marker_in_reasoning_region():
         OutputState.OPENING_REASONING,
         OutputState.REASONING,
         OutputState.CLOSING_REASONING,
-        OutputState.OUTPUT,
+        OutputState.OUTPUT_OR_TOOL,
     ]
 
 
 # ---------------------------------------------------------------------------
-# 1b. OutputParser unit level: the output-end delimiter — the
-# multi-token sequence-ending marker (the K3 XTML tail as the test-case
-# setting)
+# 1b. OutputParser unit level: the output-side delimiters — the atomic
+# 3-token channel markers of separated tool calling (the K3 XTML channels
+# as the test-case setting)
 # ---------------------------------------------------------------------------
 
 
+# The no-tools tail: the response close then the message close, both
+# classified CLOSING_OUTPUT (the "closing an output-side region" role).
+_K3_NO_TOOLS_TAIL = _K3_RESPONSE_CLOSE + _K3_MESSAGE_CLOSE
+
+
 def test_k3_ending_marker_hidden_after_content():
-    """The full ending marker `<|close|>response<|sep|><|close|>message<|sep|>`
-    is CLOSING_OUTPUT from its anchor to its last token; the matcher returns
-    to idle afterwards (tokens after a completed marker are plain output
-    again — only reachable on stop_with_eos=False paths)."""
+    """The no-tools tail `<|close|>response<|sep|><|close|>message<|sep|>` is
+    CLOSING_OUTPUT from each marker's anchor to its last token; the matchers
+    return to idle afterwards (tokens after the message close would only be
+    generated past the stop token — stop_with_eos=False paths)."""
     parser = _make_parser(True)
     tokens = (
         [500]
         + list(_K3_REASONING_END)  # channel switch
         + [42, 43]  # answer
-        + list(_K3_OUTPUT_END)
+        + list(_K3_NO_TOOLS_TAIL)
         + [55]  # would only be generated past the stop token
     )
     states = _classify(parser, tokens)
@@ -442,16 +492,17 @@ def test_k3_ending_marker_hidden_after_content():
     assert states[1:7] == [OutputState.CLOSING_REASONING] * 6
     assert states[7:9] == [OutputState.OUTPUT] * 2
     assert states[9:15] == [OutputState.CLOSING_OUTPUT] * 6
+    # Text after the tail (degenerate here) stays output-side.
     assert states[15] == OutputState.OUTPUT
 
 
 def test_k3_ending_marker_hidden_when_thinking_disabled():
     """THE leak scenario: switchable + thinking off renders a response-only
-    prompt; the parser is reasoning-disabled but must still hide the ending
-    marker (with no parser watching, the literal marker text leaks into the
-    output because the K3 tokenizer strips none of it)."""
+    prompt; the parser is reasoning-disabled but must still hide the tail
+    (with no parser watching, the literal marker text leaks into the output
+    because the K3 tokenizer strips none of it)."""
     parser = _make_parser(False)
-    tokens = [42, 43] + list(_K3_OUTPUT_END)
+    tokens = [42, 43] + list(_K3_NO_TOOLS_TAIL)
     states = _classify(parser, tokens)
     assert states[:2] == [OutputState.OUTPUT] * 2
     assert states[2:] == [OutputState.CLOSING_OUTPUT] * 6
@@ -459,12 +510,12 @@ def test_k3_ending_marker_hidden_when_thinking_disabled():
 
 def test_k3_ending_marker_completes_without_eom():
     """The real request flow: the EOS token (<|end_of_msg|>) is intercepted by
-    the task layer and never reaches the parser, so the delimiter must
-    complete WITHOUT it (a delimiter containing it would never complete on
-    the normal path, and the whole tail would surface as text). The parser
-    never controls the task's termination."""
+    the task layer and never reaches the parser, so both markers complete
+    WITHOUT it (a delimiter containing it would never complete on the normal
+    path, and the whole tail would surface as text). The parser never
+    controls the task's termination."""
     parser = _make_parser(True)
-    tokens = [500] + list(_K3_REASONING_END) + [42] + list(_K3_OUTPUT_END)
+    tokens = [500] + list(_K3_REASONING_END) + [42] + list(_K3_NO_TOOLS_TAIL)
     states = _classify(parser, tokens)
     assert states[-6:] == [OutputState.CLOSING_OUTPUT] * 6
 
@@ -472,16 +523,16 @@ def test_k3_ending_marker_completes_without_eom():
 def test_k3_delivered_eom_surfaces_as_text():
     """On stop_with_eos=False paths the EOM token DOES reach the parser: it
     is part of no configured delimiter, so it surfaces as (cosmetic) literal
-    text."""
+    text of the output side."""
     parser = _make_parser(True)
-    tokens = [500] + list(_K3_REASONING_END) + [42] + list(_K3_OUTPUT_END) + [_EOM]
+    tokens = [500] + list(_K3_REASONING_END) + [42] + list(_K3_NO_TOOLS_TAIL) + [_EOM]
     states = _classify(parser, tokens)
     assert states[-7:-1] == [OutputState.CLOSING_OUTPUT] * 6
     assert states[-1] == OutputState.OUTPUT
 
 
 def test_k3_truncated_mid_marker_flushes_as_text():
-    """max_new_tokens hit inside the marker: the in-flight tokens stay
+    """max_new_tokens hit inside the message close: the in-flight tokens stay
     buffered (nothing is emitted for them), and at task stop the dangling
     partial marker flushes as ordinary text — only complete delimiters are
     structural (vLLM strips only complete markers too; finish_reason would
@@ -491,48 +542,197 @@ def test_k3_truncated_mid_marker_flushes_as_text():
         [500]
         + list(_K3_REASONING_END)
         + [42]
-        + [_CLOSE, _RESPONSE, _SEP]  # truncated 3 tokens into the marker
+        + list(_K3_RESPONSE_CLOSE)
+        + [_CLOSE, _MESSAGE]  # truncated 2 tokens into the message close
     )
     states = _classify(parser, tokens)
-    assert states[-3:] == [OutputState.OUTPUT] * 3
-    assert states[-4] == OutputState.OUTPUT
+    assert states[-5:-2] == [OutputState.CLOSING_OUTPUT] * 3  # response close
+    assert states[-2:] == [OutputState.OUTPUT] * 2  # the dangling partial
 
 
-def test_k3_tools_channel_breaks_the_marker():
-    """v1 has no K3 tool parser (tool calling stays in the output text): a
-    tools channel between the response close and the message close breaks
-    the exact ending-marker match, so the whole tail surfaces as output
-    text — accepted for v1; the marker config is revisited when the
-    text-level K3 tool parser lands."""
+def test_k3_tools_channel_flow():
+    """The separated tools flow: think, switch, response text, response
+    close, tools open, call text, tools close, message close. Every
+    structural marker is hidden; the call text is the TOOL region (the
+    text-level tool parser's input)."""
     parser = _make_parser(True)
-    tools_channel = [
-        _OPEN,
-        999,
-        _SEP,  # <|open|>tools<|sep|> (999: the word `tools`)
-        _OPEN,
-        998,
-        _SEP,
-        997,
-        _CLOSE,
-        998,
-        _SEP,  # one call + argument
-        _CLOSE,
-        999,
-        _SEP,  # <|close|>tools<|sep|>
-    ]
+    call = [700, 701, 702, 703, 704]
+    tokens = (
+        [500, 501]
+        + list(_K3_REASONING_END)
+        + [42, 43]
+        + list(_K3_RESPONSE_CLOSE)
+        + list(_K3_TOOLS_OPEN)
+        + call
+        + list(_K3_TOOLS_CLOSE)
+        + list(_K3_MESSAGE_CLOSE)
+    )
+    states = _classify(parser, tokens)
+    assert states[:2] == [OutputState.REASONING] * 2
+    assert states[2:8] == [OutputState.CLOSING_REASONING] * 6
+    assert states[8:10] == [OutputState.OUTPUT] * 2
+    assert states[10:13] == [OutputState.CLOSING_OUTPUT] * 3
+    assert states[13:16] == [OutputState.OPENING_TOOL] * 3
+    assert states[16:21] == [OutputState.TOOL] * 5
+    assert states[21:24] == [OutputState.CLOSING_TOOL] * 3
+    assert states[24:27] == [OutputState.CLOSING_OUTPUT] * 3
+
+
+def test_k3_tools_channel_when_thinking_disabled():
+    """The response-only prompt variant: the initial region is the response
+    channel and the same region machine runs (reasoning off does not disable
+    channel demarcation)."""
+    parser = _make_parser(False)
+    call = [700, 701, 702, 703, 704]
+    tokens = (
+        [42]
+        + list(_K3_RESPONSE_CLOSE)
+        + list(_K3_TOOLS_OPEN)
+        + call
+        + list(_K3_TOOLS_CLOSE)
+        + list(_K3_MESSAGE_CLOSE)
+    )
+    states = _classify(parser, tokens)
+    assert states[0] == OutputState.OUTPUT
+    assert states[1:4] == [OutputState.CLOSING_OUTPUT] * 3
+    assert states[4:7] == [OutputState.OPENING_TOOL] * 3
+    assert states[7:12] == [OutputState.TOOL] * 5
+    assert states[12:15] == [OutputState.CLOSING_TOOL] * 3
+    assert states[15:18] == [OutputState.CLOSING_OUTPUT] * 3
+
+
+def test_k3_tools_channel_without_response_close():
+    """Degenerate tolerance (vLLM parity): a tools channel may open without
+    the response close — the opener is watched in the response region too."""
+    parser = _make_parser(True)
+    call = [700, 704]
     tokens = (
         [500]
         + list(_K3_REASONING_END)
         + [42]
-        + [_CLOSE, _RESPONSE, _SEP]  # the response close opens the match...
-        + tools_channel  # ...which the tools channel breaks
-        + [_CLOSE, _MESSAGE, _SEP]
+        + list(_K3_TOOLS_OPEN)
+        + call
+        + list(_K3_TOOLS_CLOSE)
+        + list(_K3_MESSAGE_CLOSE)
     )
     states = _classify(parser, tokens)
-    # Everything from the response close on is plain OUTPUT text.
-    first_tail = 1 + 6 + 1
-    assert states[first_tail - 1] == OutputState.OUTPUT
-    assert states[first_tail:] == [OutputState.OUTPUT] * (len(tokens) - first_tail)
+    assert states[7] == OutputState.OUTPUT
+    assert states[8:11] == [OutputState.OPENING_TOOL] * 3
+    assert states[11:13] == [OutputState.TOOL] * 2
+
+
+def test_k3_consecutive_tools_channels():
+    """A second tools channel may follow the first: the output side keeps
+    watching the tools opener, and the text-level parser sees both channels'
+    calls."""
+    parser = _make_parser(True)
+    call = [700, 704]
+    tokens = (
+        [500]
+        + list(_K3_REASONING_END)
+        + [42]
+        + list(_K3_RESPONSE_CLOSE)
+        + list(_K3_TOOLS_OPEN)
+        + call
+        + list(_K3_TOOLS_CLOSE)
+        + list(_K3_TOOLS_OPEN)
+        + call
+        + list(_K3_TOOLS_CLOSE)
+        + list(_K3_MESSAGE_CLOSE)
+    )
+    states = _classify(parser, tokens)
+    assert states.count(OutputState.OPENING_TOOL) == 6
+    assert states.count(OutputState.CLOSING_TOOL) == 6
+    assert states.count(OutputState.TOOL) == 4
+
+
+def test_k3_eos_right_after_response_close():
+    """A degenerate early EOS (no message close): the response close still
+    completes — the motivating case for ATOMIC markers (a 6-token
+    response+message pair would abort here and leak the response close as
+    text)."""
+    parser = _make_parser(True)
+    tokens = [500] + list(_K3_REASONING_END) + [42] + list(_K3_RESPONSE_CLOSE)
+    states = _classify(parser, tokens)
+    assert states[-3:] == [OutputState.CLOSING_OUTPUT] * 3
+
+
+def test_k3_message_close_in_response_body_is_hidden():
+    """A completed output-side close is structural wherever it appears on
+    the output side: a (degenerate) message close inside the response body
+    is hidden as CLOSING_OUTPUT without a region change. Only the
+    tools-channel closer is region-scoped (see
+    test_k3_tools_close_outside_the_channel_is_honest_text)."""
+    parser = _make_parser(True)
+    tokens = [500] + list(_K3_REASONING_END) + [42] + list(_K3_MESSAGE_CLOSE) + [43]
+    states = _classify(parser, tokens)
+    assert states[7] == OutputState.OUTPUT
+    assert states[8:11] == [OutputState.CLOSING_OUTPUT] * 3
+    assert states[11] == OutputState.OUTPUT
+
+
+def test_k3_tools_close_outside_the_channel_is_honest_text():
+    """The tools-channel closer is region-scoped: outside the tools channel
+    it is NOT watched — a (degenerate) `<|close|>tools<|sep|>` in the
+    response body is honest text, not a hidden delimiter."""
+    parser = _make_parser(True)
+    tokens = [500] + list(_K3_REASONING_END) + [42] + list(_K3_TOOLS_CLOSE) + [43]
+    states = _classify(parser, tokens)
+    assert states[7:] == [OutputState.OUTPUT] * 5
+
+
+def test_k3_truncated_mid_tools_channel_flushes_as_tool_text():
+    """max_new_tokens hit inside the tools channel: the dangling partial
+    tools-close flushes as TOOL text — the text-level parser handles the
+    partial call."""
+    parser = _make_parser(True)
+    tokens = (
+        [500]
+        + list(_K3_REASONING_END)
+        + [42]
+        + list(_K3_RESPONSE_CLOSE)
+        + list(_K3_TOOLS_OPEN)
+        + [700, _CLOSE]
+    )
+    states = _classify(parser, tokens)
+    assert states[-2:] == [OutputState.TOOL, OutputState.TOOL]
+
+
+@pytest.mark.parametrize(
+    ("missing", "match"),
+    [
+        # The three tools-side markers fail fast in MarkerMatcher
+        # construction.
+        ("message_end_delimiter_ids", "non-empty token_ids"),
+        ("tool_call_start_delimiter_ids", "non-empty token_ids"),
+        ("tool_call_end_delimiter_ids", "non-empty token_ids"),
+        # The response close goes through the optional-matcher path and has
+        # its own assert.
+        ("output_end_delimiter_ids", "output_end_delimiter_ids"),
+    ],
+)
+def test_separated_model_requires_every_channel_marker(missing, match):
+    """A separated model missing a channel marker is a config error: the
+    marker would leak as text and/or make a region unreachable, so parser
+    construction fails fast instead of silently mis-parsing."""
+    output_parser_utils._output_parser_params_cache.clear()
+    models = {
+        "reasoning_type": "switchable",
+        "reasoning_end_delimiter_ids": list(_K3_REASONING_END),
+        "separated_tool_calling": True,
+        "output_end_delimiter_ids": list(_K3_RESPONSE_CLOSE),
+        "tool_call_start_delimiter_ids": list(_K3_TOOLS_OPEN),
+        "tool_call_end_delimiter_ids": list(_K3_TOOLS_CLOSE),
+        "message_end_delimiter_ids": list(_K3_MESSAGE_CLOSE),
+    }
+    del models[missing]
+    set_global_args(
+        OmegaConf.create({"models": models}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    with pytest.raises(AssertionError, match=match):
+        make_output_parser(True)
 
 
 def test_k3_false_anchor_surfaces_as_text():
@@ -556,14 +756,16 @@ def test_single_token_output_end_delimiter():
 
 
 def test_no_output_end_delimiter_configured_changes_nothing():
-    """Without output_end_delimiter_ids the parser behaves exactly like the
-    pre-marker design (the field is optional and model-local)."""
-    parser = _make_parser(True, output_end=None)
+    """Without output_end_delimiter_ids a NON-separated model behaves exactly
+    like the pre-marker design (the field is optional and model-local; a
+    separated model requires it — see test_separated_model_requires_every_
+    channel_marker)."""
+    parser = _make_parser(True, output_end=None, separated=False)
     tokens = [500] + list(_K3_REASONING_END) + [42, 43]
     states = _classify(parser, tokens)
     assert states == [OutputState.REASONING] + [OutputState.CLOSING_REASONING] * 6 + [
-        OutputState.OUTPUT,
-        OutputState.OUTPUT,
+        OutputState.OUTPUT_OR_TOOL,
+        OutputState.OUTPUT_OR_TOOL,
     ]
 
 
@@ -633,7 +835,7 @@ def test_auto_with_configured_delimiters_resolves_triggered():
     """Orthogonality (single- vs multi-token vs the reasoning type): `auto`
     decides triggered-vs-disabled from the RESOLVED delimiters, so
     configured ids — not only tokenizer-derived markers — make a model
-    reasoning-capable (the Kimi-K2-Instruct shape)."""
+    reasoning-capable (the Kimi-K2.5 shape)."""
     output_parser_utils._output_parser_params_cache.clear()
     set_global_args(
         OmegaConf.create(
@@ -770,15 +972,111 @@ def test_reasoning_flag_values_follow_the_effective_state():
     assert kwargs == {}
 
 
+def test_marker_strings_decoded_from_delimiter_ids(monkeypatch):
+    """The marker STRINGS for text-level constraints (wrap_format_with_
+    reasoning) are decoded from the resolved delimiter IDS — the single
+    source of truth — so a multi-token delimiter yields its verbatim text
+    instead of the classic-tag default (the K3 tools+thinking grammar used
+    to expect a literal `</think>`)."""
+    output_parser_utils._output_parser_params_cache.clear()
+    set_global_args(
+        OmegaConf.create(
+            {
+                "models": {
+                    "reasoning_type": "switchable",
+                    "reasoning_end_delimiter_ids": list(_K3_REASONING_END),
+                }
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    monkeypatch.setattr(Backend, "tokenizer", K3Tokenizer())
+    params = get_output_parser_params(True)
+    assert params.reasoning_end_token == "<|close|>think<|sep|><|open|>response<|sep|>"
+    # No configured start delimiter and no tokenizer-derived one: the start
+    # string keeps the classic default (never used — initial_state=True).
+    assert params.reasoning_start_token == OutputParserParams.reasoning_start_token
+
+
+def test_marker_strings_classic_roundtrip(monkeypatch):
+    """Classic models: decoding the tokenizer-derived single-tag ids
+    round-trips to the same marker strings the defaults carry."""
+    output_parser_utils._output_parser_params_cache.clear()
+    output_parser_utils.get_output_parser_marker_token_ids.cache_clear()
+    set_global_args(
+        OmegaConf.create({"models": {"reasoning_type": "triggered"}}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    monkeypatch.setattr(Backend, "tokenizer", GLM53Tokenizer())
+    params = get_output_parser_params(True)
+    assert params.reasoning_start_token == OutputParserParams.reasoning_start_token
+    assert params.reasoning_end_token == OutputParserParams.reasoning_end_token
+
+
+def test_marker_strings_fall_back_without_tokenizer(monkeypatch):
+    """Unit-test contexts without a tokenizer keep the classic defaults
+    (with a warning) instead of failing."""
+    output_parser_utils._output_parser_params_cache.clear()
+    set_global_args(
+        OmegaConf.create(
+            {
+                "models": {
+                    "reasoning_type": "switchable",
+                    "reasoning_end_delimiter_ids": list(_K3_REASONING_END),
+                }
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    monkeypatch.setattr(Backend, "tokenizer", None)
+    params = get_output_parser_params(True)
+    assert params.reasoning_end_token == OutputParserParams.reasoning_end_token
+
+
+def test_marker_strings_empty_decode_falls_back(monkeypatch):
+    """A decode that yields an empty string (a stop-token id — the plain
+    tiktoken Tokenizer decodes stop tokens to "") falls back to the classic
+    default: an empty marker string would build a degenerate grammar."""
+
+    class StopTokenTokenizer:
+        force_full_seq_decode = False
+
+        def decode(self, ids, skip_special_tokens=None):
+            return ""
+
+    output_parser_utils._output_parser_params_cache.clear()
+    set_global_args(
+        OmegaConf.create(
+            {
+                "models": {
+                    "reasoning_type": "switchable",
+                    "reasoning_end_delimiter_ids": [163585],
+                }
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    monkeypatch.setattr(Backend, "tokenizer", StopTokenTokenizer())
+    params = get_output_parser_params(True)
+    assert params.reasoning_end_token == OutputParserParams.reasoning_end_token
+
+
 def test_state_set_memberships():
     """The load-bearing semantics of the state sets: structural states are
     hidden from the decode buffer; reasoning states additionally count toward
-    reasoning_tokens. The ending marker is structural but NOT reasoning."""
+    reasoning_tokens. The channel markers are structural but NOT
+    reasoning."""
     assert DELIMITER_STATES == frozenset(
         {
             OutputState.OPENING_REASONING,
             OutputState.CLOSING_REASONING,
             OutputState.CLOSING_OUTPUT,
+            OutputState.OPENING_TOOL,
+            OutputState.CLOSING_TOOL,
         }
     )
     assert REASONING_OUTPUT_STATES == frozenset(
@@ -789,7 +1087,12 @@ def test_state_set_memberships():
         }
     )
     assert OutputState.OUTPUT not in DELIMITER_STATES
+    assert OutputState.TOOL not in DELIMITER_STATES
     assert OutputState.CLOSING_OUTPUT not in REASONING_OUTPUT_STATES
+    # The reasoning delimiters are both structural and reasoning-counted.
+    assert DELIMITER_STATES & REASONING_OUTPUT_STATES == frozenset(
+        {OutputState.OPENING_REASONING, OutputState.CLOSING_REASONING}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -907,9 +1210,9 @@ def test_start_tag_beyond_window_is_content(monkeypatch):
 
 
 def _k3_tokens(*, with_eom=False):
-    """think content + channel switch + answer + ending marker (the EOM token
-    normally never reaches the parser: the task layer intercepts it)."""
-    tokens = [500, 501] + list(_K3_REASONING_END) + [42, 43] + list(_K3_OUTPUT_END)
+    """think content + channel switch + answer + the no-tools tail (the EOM
+    token normally never reaches the parser: the task layer intercepts it)."""
+    tokens = [500, 501] + list(_K3_REASONING_END) + [42, 43] + list(_K3_NO_TOOLS_TAIL)
     if with_eom:
         tokens.append(_EOM)
     return tokens
@@ -927,7 +1230,7 @@ def test_k3_stream_hides_ending_marker(monkeypatch):
         assert marker not in text, f"{marker} leaked into the output"
     # Only think + answer text remains.
     assert text == "Let meanswer!"
-    # The ending marker tokens are generated (counted) but not reasoning.
+    # The tail tokens are generated (counted) but not reasoning.
     assert stream.tokens_len == 16
     assert stream.reasoning_tokens == 8  # 2 think + 6 channel-switch tokens
     # The whole marker is confirmed in one chunk when its last token arrives
@@ -936,11 +1239,126 @@ def test_k3_stream_hides_ending_marker(monkeypatch):
     assert stream.seqs[-1] == ""
 
 
+def test_k3_stream_tools_flow(monkeypatch):
+    """The tools flow through AsyncDataStream: every channel marker is
+    hidden; the response text and the call text both surface, under their
+    own states (OUTPUT / TOOL) — the call text is the text-level tool
+    parser's input."""
+    stream = new_k3_stream(monkeypatch, enable_thinking=True)
+    tokens = (
+        [500, 501]
+        + list(_K3_REASONING_END)
+        + [42]
+        + list(_K3_RESPONSE_CLOSE)
+        + list(_K3_TOOLS_OPEN)
+        + [700, 701, 702, 703, 704]
+        + list(_K3_TOOLS_CLOSE)
+        + list(_K3_MESSAGE_CLOSE)
+    )
+    for token in tokens:
+        stream.add_data(token, notify_server=False)
+    stream.send_stop_signal()
+
+    text = "".join(stream.seqs)
+    # Only the CHANNEL markers are hidden; the call syntax (argument/call
+    # tags) is the tools channel's TEXT and legitimately contains the XTML
+    # delimiters.
+    for channel_marker in (
+        "<|close|>response<|sep|>",
+        "<|open|>tools<|sep|>",
+        "<|close|>tools<|sep|>",
+        "<|close|>message<|sep|>",
+    ):
+        assert channel_marker not in text, f"{channel_marker} leaked into the output"
+    assert text == (
+        "Let meanswer"
+        '<|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="location" type="string"<|sep|>'
+        "beijing<|close|>argument<|sep|><|close|>call<|sep|>"
+    )
+    chunks = list(zip(stream.seqs, stream.output_states))
+    tool_text = "".join(s for s, r in chunks if r == OutputState.TOOL)
+    assert tool_text.endswith("<|close|>call<|sep|>")
+    assert stream.reasoning_tokens == 8  # 2 think + 6 switch; the rest is not
+
+
+def _set_k3_model_args():
+    """Set the full Kimi-K3 model config as global args, so a config-driven
+    parser would hide the markers and split the channels (making raw-output
+    assertions meaningful)."""
+    output_parser_utils._output_parser_params_cache.clear()
+    set_global_args(
+        OmegaConf.create(
+            {
+                "models": {
+                    "reasoning_type": "switchable",
+                    "separated_tool_calling": True,
+                    "reasoning_end_delimiter_ids": list(_K3_REASONING_END),
+                    "output_end_delimiter_ids": list(_K3_RESPONSE_CLOSE),
+                    "message_end_delimiter_ids": list(_K3_MESSAGE_CLOSE),
+                    "tool_call_start_delimiter_ids": list(_K3_TOOLS_OPEN),
+                    "tool_call_end_delimiter_ids": list(_K3_TOOLS_CLOSE),
+                },
+                "infer": {"max_seq_len": 4096},
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+
+
+def test_raw_prompt_request_outputs_unparsed_text(monkeypatch):
+    """The text-completion APIs (``UserRequest.from_prompt_text``) request a
+    RAW continuation: the output parser is a no-op, so every generated token
+    is plain text — the structural markers surface verbatim and nothing
+    counts as reasoning. (Contrast the chat APIs, which hide the markers and
+    split the channels by the same model config.)"""
+    from chitu.task import UserRequest
+
+    _set_k3_model_args()
+    monkeypatch.setattr(Backend, "tokenizer", K3Tokenizer())
+    monkeypatch.setattr(stream_module, "get_server_event_loop", lambda: None)
+
+    # A token-id prompt avoids the tokenizer's encode (the fake only
+    # decodes); the prompt content is irrelevant to the output parsing.
+    req = UserRequest.from_prompt_text([1, 2, 3], "req-raw")
+    tokens = (
+        [500]
+        + list(_K3_REASONING_END)
+        + [42]
+        + list(_K3_RESPONSE_CLOSE)
+        + list(_K3_TOOLS_OPEN)
+        + [700, 701, 702, 703, 704]
+        + list(_K3_TOOLS_CLOSE)
+        + list(_K3_MESSAGE_CLOSE)
+    )
+    for token in tokens:
+        req.async_stream.add_data(token, notify_server=False)
+    req.async_stream.send_stop_signal()
+
+    text = "".join(req.async_stream.seqs)
+    assert text == (
+        "Let"
+        "<|close|>think<|sep|><|open|>response<|sep|>"
+        "answer"
+        "<|close|>response<|sep|>"
+        "<|open|>tools<|sep|>"
+        '<|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="location" type="string"<|sep|>'
+        "beijing<|close|>argument<|sep|><|close|>call<|sep|>"
+        "<|close|>tools<|sep|>"
+        "<|close|>message<|sep|>"
+    )
+    # Every chunk is plain text; nothing is reasoning.
+    assert set(req.async_stream.output_states) == {OutputState.OUTPUT_OR_TOOL}
+    assert req.async_stream.reasoning_tokens == 0
+
+
 def test_k3_stream_thinking_disabled_is_clean(monkeypatch):
     """The response-only prompt variant: no reasoning channel at all, and the
-    ending marker still hidden (the leak this work fixes)."""
+    tail still hidden (the leak this work fixes)."""
     stream = new_k3_stream(monkeypatch, enable_thinking=False)
-    tokens = [42, 43] + list(_K3_OUTPUT_END)
+    tokens = [42, 43] + list(_K3_NO_TOOLS_TAIL)
     for token in tokens:
         stream.add_data(token, notify_server=False)
     stream.send_stop_signal()
@@ -970,12 +1388,7 @@ def test_holdback_flush_attributes_reasoning_tail(monkeypatch):
     its own (REASONING) state when the channel switch arrives — not ride along
     with the first answer token and leak into content (the pre-existing bug
     the flush fixes)."""
-    params = OutputParserParams(
-        True,
-        reasoning_end_delimiter_ids=list(_K3_REASONING_END),
-        output_end_delimiter_ids=list(_K3_OUTPUT_END),
-        initial_state=True,
-    )
+    params = _k3_separated_params(True)
     monkeypatch.setattr(
         output_parser_impl, "get_output_parser_params", lambda _: params
     )
@@ -1013,7 +1426,7 @@ def test_holdback_flush_attributes_content_tail_before_marker(monkeypatch):
         [500]
         + list(_K3_REASONING_END)
         + [42, 6]  # answer + unresolved partial char
-        + list(_K3_OUTPUT_END)
+        + list(_K3_RESPONSE_CLOSE)
     )
     for token in tokens:
         stream.add_data(token, notify_server=False)
@@ -1160,15 +1573,31 @@ def test_nonempty_reasoning_chat_completion(monkeypatch, streaming):
     ],
 )
 def test_empty_signature_per_thinking_block(monkeypatch, kinds):
-    req = request(items=tuple((k, k == "thinking", (None, None)) for k in kinds))
+    req = request(
+        items=tuple(
+            (
+                k,
+                (
+                    OutputState.REASONING
+                    if k == "thinking"
+                    else OutputState.OUTPUT_OR_TOOL
+                ),
+                (None, None),
+            )
+            for k in kinds
+        )
+    )
     if "tool" in kinds:
         req.tool_call_params = SimpleNamespace(tools=[])
         monkeypatch.setattr(
             anthropic, "get_tool_parser_cls", lambda: lambda _: object()
         )
 
-        async def parsed(*args):
-            yield ChoiceDelta(reasoning_content="think"), True, (None, None)
+        async def parsed(*args, **kwargs):
+            yield ChoiceDelta(reasoning_content="think"), OutputState.REASONING, (
+                None,
+                None,
+            )
             yield ChoiceDelta(
                 tool_calls=[
                     {
@@ -1211,7 +1640,10 @@ def test_empty_signature_per_thinking_block(monkeypatch, kinds):
 def test_messages_json_empty_signature_can_be_passed_back(monkeypatch):
     client = create_client(monkeypatch)
     req = request(
-        items=(("thought", True, (None, None)), ("answer", False, (None, None)))
+        items=(
+            ("thought", OutputState.REASONING, (None, None)),
+            ("answer", OutputState.OUTPUT_OR_TOOL, (None, None)),
+        )
     )
     monkeypatch.setattr(
         anthropic, "resolve_requested_model_or_error", lambda _: "test-model"
@@ -1290,9 +1722,553 @@ def test_k3_chat_completion_clean(monkeypatch, streaming):
     for marker in ("<|close|>", "<|sep|>", "<|end_of_msg|>"):
         assert marker not in content and marker not in reasoning
     # 2 think tokens + 6 channel-switch tokens are reasoning; the 6 delivered
-    # ending-marker tokens are not.
+    # tail tokens are not.
     assert usage["completion_tokens_details"]["reasoning_tokens"] == 8
     assert usage["completion_tokens"] == 16
+
+
+K3_TEST_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+
+def _k3_tools_tokens():
+    """think + switch + response text + the tools channel + the tail."""
+    return (
+        [500, 501]
+        + list(_K3_REASONING_END)
+        + [42]
+        + list(_K3_RESPONSE_CLOSE)
+        + list(_K3_TOOLS_OPEN)
+        + [700, 701, 702, 703, 704]
+        + list(_K3_TOOLS_CLOSE)
+        + list(_K3_MESSAGE_CLOSE)
+    )
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_k3_chat_completion_tool_calls(monkeypatch, streaming):
+    """End-to-end through the serve layer with the real KimiK3ToolParser: the
+    channel markers never surface, the response text is the content, the
+    tools-channel text becomes tool_calls, and the finish reason follows."""
+    from chitu.tool_call.kimi_k3_parser import KimiK3ToolParser
+
+    req = SimpleNamespace(
+        request_id="req-k3-tools",
+        prompt_len=10,
+        finish_reason="stop",
+        tool_call_params=SimpleNamespace(tools=K3_TEST_TOOLS),
+        response_format_params=None,
+        logprobs=False,
+        top_logprobs=None,
+        output="",
+        num_hit_tokens=0,
+    )
+    req.async_stream = new_k3_stream(monkeypatch, enable_thinking=True)
+    _feed(req, _k3_tools_tokens())
+    monkeypatch.setattr(chat, "get_tool_parser_cls", lambda: KimiK3ToolParser)
+
+    response = _post_chat(monkeypatch, req, streaming)
+    assert response.status_code == 200, response.text
+    if streaming:
+        deltas = [
+            c["choices"][0]["delta"]
+            for c in events([response.text])
+            if c.get("choices")
+        ]
+        reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
+        content = "".join(d.get("content", "") for d in deltas)
+        calls = []
+        for d in deltas:
+            for tc in d.get("tool_calls") or []:
+                if tc["index"] >= len(calls):
+                    calls.append({"name": "", "arguments": ""})
+                calls[tc["index"]]["name"] += tc["function"].get("name", "")
+                calls[tc["index"]]["arguments"] += tc["function"].get("arguments", "")
+        finish = [
+            c["choices"][0]["finish_reason"]
+            for c in events([response.text])
+            if c.get("choices")
+        ][-1]
+    else:
+        message = response.json()["choices"][0]["message"]
+        reasoning = message.get("reasoning_content", "")
+        content = message["content"]
+        calls = [
+            {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
+            for tc in message["tool_calls"]
+        ]
+        finish = response.json()["choices"][0]["finish_reason"]
+
+    assert reasoning == "Let me"
+    assert content == "answer"
+    for marker in ("<|close|>", "<|sep|>", "<|open|>"):
+        assert marker not in content and marker not in reasoning
+    assert calls == [{"name": "get_weather", "arguments": '{"location": "beijing"}'}]
+    assert finish == "tool_calls"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_k3_call_looking_text_in_response_is_content(monkeypatch, streaming):
+    """The regions are already split at token level, so the separation must
+    survive the serve layer: tool-call-looking text in the RESPONSE region
+    is printed as content — only the tools channel's text ever reaches the
+    text-level tool parser."""
+    from chitu.tool_call.kimi_k3_parser import KimiK3ToolParser
+
+    req = SimpleNamespace(
+        request_id="req-k3-quote",
+        prompt_len=10,
+        finish_reason="stop",
+        tool_call_params=SimpleNamespace(tools=K3_TEST_TOOLS),
+        response_format_params=None,
+        logprobs=False,
+        top_logprobs=None,
+        output="",
+        num_hit_tokens=0,
+    )
+    req.async_stream = new_k3_stream(monkeypatch, enable_thinking=True)
+    # The response body quotes a complete call verbatim; no tools channel
+    # ever opens.
+    tokens = (
+        [500]
+        + list(_K3_REASONING_END)
+        + [42, 705]
+        + list(_K3_RESPONSE_CLOSE)
+        + list(_K3_MESSAGE_CLOSE)
+    )
+    _feed(req, tokens)
+    monkeypatch.setattr(chat, "get_tool_parser_cls", lambda: KimiK3ToolParser)
+
+    response = _post_chat(monkeypatch, req, streaming)
+    assert response.status_code == 200, response.text
+    if streaming:
+        deltas = [
+            c["choices"][0]["delta"]
+            for c in events([response.text])
+            if c.get("choices")
+        ]
+        content = "".join(d.get("content", "") for d in deltas)
+        calls = [{"name": "", "arguments": ""} for d in deltas if d.get("tool_calls")]
+        finish = [
+            c["choices"][0]["finish_reason"]
+            for c in events([response.text])
+            if c.get("choices")
+        ][-1]
+    else:
+        message = response.json()["choices"][0]["message"]
+        content = message["content"]
+        calls = message["tool_calls"]
+        finish = response.json()["choices"][0]["finish_reason"]
+
+    # The quoted call is text, and nothing became a tool call.
+    assert content == (
+        "answer"
+        '<|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="location" type="string"<|sep|>'
+        "beijing<|close|>argument<|sep|><|close|>call<|sep|>"
+    )
+    assert calls == []
+    assert finish == "stop"
+
+
+# ---------------------------------------------------------------------------
+# 2b. Tools-channel corner cases: text in the tools channel that is not
+# tool calling must surface as content with a warning, on every chat API
+# and in both response modes:
+# - (A) the request activates no tool parser, so the channel text stays
+#   raw (here: a complete call the model emits although the request carries
+#   no tools);
+# - (B) the tool parser found plain text besides the tool calls.
+#
+# The warnings go through the repo's `logging.warning_once` (once per
+# process); `_k3_serve_req` resets its dedup set so every test observes its
+# own warning, and each test asserts exactly one record (the per-chunk call
+# sites must not spam).
+# ---------------------------------------------------------------------------
+
+
+# The logger every tools-channel warning goes through (the shared warn
+# helpers live in chitu.tool_call.utils).
+_TOOL_CHANNEL_LOGGER = "chitu.tool_call.utils"
+
+
+def _k3_serve_req(monkeypatch, *, request_id, tools, tokens):
+    """A finished Kimi-K3 request as the serve layer sees it: the real
+    token-level classification (separated tool calling), optional tool
+    params, and the generated tokens already fed."""
+    # `warning_once` dedupes per process (call site + message); reset it so
+    # each test observes its own warning.
+    logging_utils._logged_once_messages.clear()
+    req = SimpleNamespace(
+        request_id=request_id,
+        prompt_len=10,
+        finish_reason="stop",
+        tool_call_params=SimpleNamespace(tools=tools) if tools else None,
+        response_format_params=None,
+        logprobs=False,
+        top_logprobs=None,
+        output="",
+        num_hit_tokens=0,
+    )
+    req.async_stream = new_k3_stream(monkeypatch, enable_thinking=True)
+    _feed(req, tokens)
+    return req
+
+
+def _k3_tokens_with_channel_text(channel_tokens):
+    """think + switch + "answer" + a tools channel carrying the given text
+    + the closing tail."""
+    return (
+        [500, 501]
+        + list(_K3_REASONING_END)
+        + [42]
+        + list(_K3_RESPONSE_CLOSE)
+        + list(_K3_TOOLS_OPEN)
+        + list(channel_tokens)
+        + list(_K3_TOOLS_CLOSE)
+        + list(_K3_MESSAGE_CLOSE)
+    )
+
+
+# A complete call as the tools channel's text (case A: the model emits it
+# although the request carries no tools, so it cannot become tool calls).
+_K3_CHANNEL_CALL_TOKENS = [700, 701, 702, 703, 704]
+# Plain text ("!!") before the call: case B's shape — the parser finds both
+# the plain text and a well-formed call.
+_K3_CHANNEL_JUNK_AND_CALL_TOKENS = [43, 43] + _K3_CHANNEL_CALL_TOKENS
+
+
+def _tool_channel_warnings(caplog, subject):
+    """The WARNING records whose message mentions `subject`."""
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and subject in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_k3_tool_channel_without_parser_is_content_and_warns(
+    monkeypatch, streaming, caplog
+):
+    """Case A on chat completions: the raw channel text joins the content
+    (never becomes tool calls), with exactly one warning naming the request
+    — once, not once per streamed chunk."""
+    req = _k3_serve_req(
+        monkeypatch,
+        request_id="req-k3-no-tools",
+        tools=None,
+        tokens=_k3_tokens_with_channel_text(_K3_CHANNEL_CALL_TOKENS),
+    )
+    with caplog.at_level(logging.WARNING, logger=_TOOL_CHANNEL_LOGGER):
+        response = _post_chat(monkeypatch, req, streaming)
+    assert response.status_code == 200, response.text
+    if streaming:
+        deltas = [
+            c["choices"][0]["delta"]
+            for c in events([response.text])
+            if c.get("choices")
+        ]
+        content = "".join(d.get("content", "") for d in deltas)
+        calls = [d for d in deltas if d.get("tool_calls")]
+    else:
+        message = response.json()["choices"][0]["message"]
+        content = message["content"]
+        calls = message.get("tool_calls")
+    assert content == (
+        "answer"
+        '<|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="location" type="string"<|sep|>'
+        "beijing<|close|>argument<|sep|><|close|>call<|sep|>"
+    )
+    assert not calls
+    warnings = _tool_channel_warnings(caplog, "no tool parser is active")
+    assert len(warnings) == 1
+    assert "req-k3-no-tools" in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_k3_plain_text_in_tool_channel_is_content_and_warns(
+    monkeypatch, streaming, caplog
+):
+    """Case B on chat completions: the plain text joins the content while
+    the call survives as tool_calls, with exactly one warning naming the
+    request — once, not once per streamed content delta."""
+    from chitu.tool_call.kimi_k3_parser import KimiK3ToolParser
+
+    req = _k3_serve_req(
+        monkeypatch,
+        request_id="req-k3-plain",
+        tools=K3_TEST_TOOLS,
+        tokens=_k3_tokens_with_channel_text(_K3_CHANNEL_JUNK_AND_CALL_TOKENS),
+    )
+    monkeypatch.setattr(chat, "get_tool_parser_cls", lambda: KimiK3ToolParser)
+    with caplog.at_level(logging.WARNING, logger=_TOOL_CHANNEL_LOGGER):
+        response = _post_chat(monkeypatch, req, streaming)
+    assert response.status_code == 200, response.text
+    if streaming:
+        deltas = [
+            c["choices"][0]["delta"]
+            for c in events([response.text])
+            if c.get("choices")
+        ]
+        content = "".join(d.get("content", "") for d in deltas)
+        calls = []
+        for d in deltas:
+            for tc in d.get("tool_calls") or []:
+                if tc["index"] >= len(calls):
+                    calls.append({"name": "", "arguments": ""})
+                calls[tc["index"]]["name"] += tc["function"].get("name", "")
+                calls[tc["index"]]["arguments"] += tc["function"].get("arguments", "")
+        finish = [
+            c["choices"][0]["finish_reason"]
+            for c in events([response.text])
+            if c.get("choices")
+        ][-1]
+    else:
+        message = response.json()["choices"][0]["message"]
+        content = message["content"]
+        calls = [
+            {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
+            for tc in message["tool_calls"]
+        ]
+        finish = response.json()["choices"][0]["finish_reason"]
+    assert content == "answer!!"
+    assert calls == [{"name": "get_weather", "arguments": '{"location": "beijing"}'}]
+    assert finish == "tool_calls"
+    warnings = _tool_channel_warnings(caplog, "plain text outside tool calls")
+    assert len(warnings) == 1
+    assert "req-k3-plain" in warnings[0].getMessage()
+
+
+def _post_messages(monkeypatch, req, streaming):
+    client = create_client(monkeypatch)
+    monkeypatch.setattr(
+        anthropic, "resolve_requested_model_or_error", lambda _: "test-model"
+    )
+    monkeypatch.setattr(
+        anthropic,
+        "get_global_args",
+        lambda: SimpleNamespace(
+            infer=SimpleNamespace(max_seq_len=100),
+            debug=SimpleNamespace(save_trace_dir=None),
+        ),
+    )
+    monkeypatch.setattr(anthropic.UserRequest, "from_request_params", lambda _: req)
+
+    async def submit(_req):
+        pass
+
+    monkeypatch.setattr(anthropic, "submit_request", submit)
+    return client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": streaming,
+        },
+    )
+
+
+def _anthropic_text_and_tool_blocks(response, streaming):
+    """The joined text output and the tool_use blocks as the client sees
+    them, for either response mode."""
+    if streaming:
+        data = events([response.text])
+        text = "".join(
+            e["delta"]["text"]
+            for e in data
+            if e.get("delta", {}).get("type") == "text_delta"
+        )
+        tool_blocks = [
+            e["content_block"]
+            for e in data
+            if e.get("type") == "content_block_start"
+            and e.get("content_block", {}).get("type") == "tool_use"
+        ]
+    else:
+        content = response.json()["content"]
+        text = "".join(b["text"] for b in content if b["type"] == "text")
+        tool_blocks = [b for b in content if b["type"] == "tool_use"]
+    return text, tool_blocks
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_k3_messages_tool_channel_without_parser_is_content_and_warns(
+    monkeypatch, streaming, caplog
+):
+    """Case A on Anthropic messages: the raw channel text joins the text
+    output, with exactly one warning naming the request."""
+    req = _k3_serve_req(
+        monkeypatch,
+        request_id="req-k3-msg-no-tools",
+        tools=None,
+        tokens=_k3_tokens_with_channel_text(_K3_CHANNEL_CALL_TOKENS),
+    )
+    with caplog.at_level(logging.WARNING, logger=_TOOL_CHANNEL_LOGGER):
+        response = _post_messages(monkeypatch, req, streaming)
+    assert response.status_code == 200, response.text
+    text, tool_blocks = _anthropic_text_and_tool_blocks(response, streaming)
+    assert text == (
+        "answer"
+        '<|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="location" type="string"<|sep|>'
+        "beijing<|close|>argument<|sep|><|close|>call<|sep|>"
+    )
+    assert tool_blocks == []
+    warnings = _tool_channel_warnings(caplog, "no tool parser is active")
+    assert len(warnings) == 1
+    assert "req-k3-msg-no-tools" in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_k3_messages_plain_text_in_tool_channel_is_content_and_warns(
+    monkeypatch, streaming, caplog
+):
+    """Case B on Anthropic messages: the plain text joins the text output
+    while the call survives as a tool_use block, with exactly one warning
+    naming the request."""
+    from chitu.tool_call.kimi_k3_parser import KimiK3ToolParser
+
+    req = _k3_serve_req(
+        monkeypatch,
+        request_id="req-k3-msg-plain",
+        tools=K3_TEST_TOOLS,
+        tokens=_k3_tokens_with_channel_text(_K3_CHANNEL_JUNK_AND_CALL_TOKENS),
+    )
+    monkeypatch.setattr(anthropic, "get_tool_parser_cls", lambda: KimiK3ToolParser)
+    with caplog.at_level(logging.WARNING, logger=_TOOL_CHANNEL_LOGGER):
+        response = _post_messages(monkeypatch, req, streaming)
+    assert response.status_code == 200, response.text
+    text, tool_blocks = _anthropic_text_and_tool_blocks(response, streaming)
+    assert text == "answer!!"
+    assert [(b["name"], b["input"]) for b in tool_blocks] == [
+        ("get_weather", {"location": "beijing"})
+    ]
+    warnings = _tool_channel_warnings(caplog, "plain text outside tool calls")
+    assert len(warnings) == 1
+    assert "req-k3-msg-plain" in warnings[0].getMessage()
+
+
+def _post_responses(monkeypatch, req, streaming, tools=None):
+    client = create_client(monkeypatch)
+    monkeypatch.setattr(
+        responses.UserRequest, "from_request_params", lambda params: req
+    )
+
+    async def submit(_req):
+        pass
+
+    monkeypatch.setattr(responses, "submit_request", submit)
+    payload = {"model": "test-model", "input": "hello", "stream": streaming}
+    if tools is not None:
+        payload["tools"] = tools
+    return client.post("/v1/responses", json=payload)
+
+
+def _responses_text_and_calls(response, streaming):
+    """The joined output text and the function_call items as the client
+    sees them, for either response mode."""
+    if streaming:
+        data = events([response.text])
+        text = "".join(
+            e["delta"] for e in data if e.get("type") == "response.output_text.delta"
+        )
+        calls = [
+            e["item"]
+            for e in data
+            if e.get("type") == "response.output_item.done"
+            and e.get("item", {}).get("type") == "function_call"
+        ]
+    else:
+        body = response.json()
+        text = body["output_text"]
+        calls = [item for item in body["output"] if item["type"] == "function_call"]
+    return text, calls
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_k3_responses_tool_channel_without_parser_is_content_and_warns(
+    monkeypatch, streaming, caplog
+):
+    """Case A on the Responses API: the raw channel text joins the output
+    text, with exactly one warning naming the request."""
+    req = _k3_serve_req(
+        monkeypatch,
+        request_id="req-k3-resp-no-tools",
+        tools=None,
+        tokens=_k3_tokens_with_channel_text(_K3_CHANNEL_CALL_TOKENS),
+    )
+    with caplog.at_level(logging.WARNING, logger=_TOOL_CHANNEL_LOGGER):
+        response = _post_responses(monkeypatch, req, streaming)
+    assert response.status_code == 200, response.text
+    text, calls = _responses_text_and_calls(response, streaming)
+    assert text == (
+        "answer"
+        '<|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="location" type="string"<|sep|>'
+        "beijing<|close|>argument<|sep|><|close|>call<|sep|>"
+    )
+    assert calls == []
+    warnings = _tool_channel_warnings(caplog, "no tool parser is active")
+    assert len(warnings) == 1
+    assert "req-k3-resp-no-tools" in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_k3_responses_plain_text_in_tool_channel_is_content_and_warns(
+    monkeypatch, streaming, caplog
+):
+    """Case B on the Responses API: the plain text joins the output text
+    while the call survives as a function_call item, with exactly one
+    warning naming the request."""
+    from chitu.tool_call.kimi_k3_parser import KimiK3ToolParser
+
+    req = _k3_serve_req(
+        monkeypatch,
+        request_id="req-k3-resp-plain",
+        tools=K3_TEST_TOOLS,
+        tokens=_k3_tokens_with_channel_text(_K3_CHANNEL_JUNK_AND_CALL_TOKENS),
+    )
+    monkeypatch.setattr(responses, "get_tool_parser_cls", lambda: KimiK3ToolParser)
+    with caplog.at_level(logging.WARNING, logger=_TOOL_CHANNEL_LOGGER):
+        response = _post_responses(
+            monkeypatch,
+            req,
+            streaming,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                    },
+                }
+            ],
+        )
+    assert response.status_code == 200, response.text
+    text, calls = _responses_text_and_calls(response, streaming)
+    assert text == "answer!!"
+    assert [(c["name"], c["arguments"]) for c in calls] == [
+        ("get_weather", '{"location": "beijing"}')
+    ]
+    warnings = _tool_channel_warnings(caplog, "plain text outside tool calls")
+    assert len(warnings) == 1
+    assert "req-k3-resp-plain" in warnings[0].getMessage()
 
 
 # ===========================================================================
@@ -1464,5 +2440,105 @@ def test_dp_token_replay_counts_reasoning_once(monkeypatch):
         assert receiver.finished
         assert receiver.async_stream.reasoning_tokens == 3
         assert receiver.async_stream.tokens_len == 4
+    finally:
+        router.context.term()
+
+
+def test_dp_wrap_task_keeps_raw_output(monkeypatch):
+    """``DPTokenManager.wrap_task`` must propagate the request's
+    ``raw_output`` to the worker's sender stream. The worker-side parser is
+    inert (``DPAsyncDataStream`` forwards raw ids and the RECEIVER-side
+    stream classifies), but the stream must match its request — a future
+    reader of worker-side classification would otherwise silently mis-parse
+    raw completions."""
+    from chitu.dp_token_sender import DPTokenManager
+    from chitu.task import UserRequest
+
+    _set_k3_model_args()
+    monkeypatch.setattr(Backend, "tokenizer", K3Tokenizer())
+    monkeypatch.setattr(stream_module, "get_server_event_loop", lambda: None)
+
+    req = UserRequest.from_prompt_text([1, 2, 3], "req-raw-wrap")
+    task = SimpleNamespace(req=req)
+    manager = DPTokenManager(0, "tcp://localhost:29700")
+    manager.wrap_task(task)
+
+    assert isinstance(task.req.async_stream, DPAsyncDataStream)
+    # The raw parser has no matchers at all; a config-driven parser under
+    # the K3 model args would watch every channel marker.
+    assert task.req.async_stream.output_parser.output_end_match is None
+    assert task.req.async_stream.output_parser.tool_call_start_match is None
+
+
+def test_dp_token_replay_raw_output(monkeypatch):
+    """Multi-instance raw completions end-to-end: the worker (rebuilt from
+    the serialized request, its stream wrapped by the token manager) merely
+    forwards the generated ids; the receiver — the ORIGINAL request object
+    the HTTP handler registered with the token router — classifies with the
+    raw parser, so the replayed structural markers surface verbatim."""
+    from chitu.task import UserRequest
+
+    _set_k3_model_args()
+    monkeypatch.setattr(Backend, "tokenizer", K3Tokenizer())
+    monkeypatch.setattr(stream_module, "get_server_event_loop", lambda: None)
+
+    # The HTTP-handler side creates the raw-prompt request (the RECEIVER).
+    receiver = UserRequest.from_prompt_text([1, 2, 3], "req-raw-dp")
+    # The worker rebuilds it from the serialized form (the RequestRouter
+    # path) and wraps its stream for token sending.
+    worker = UserRequest.from_dict(receiver.to_dict())
+    sender = DPTokenSender()
+    frames = []
+    sender._send_data = frames.append
+    worker.async_stream = DPAsyncDataStream.build(
+        worker.enable_thinking,
+        task=SimpleNamespace(req=worker),
+        token_sender=sender,
+        raw_output=worker.raw_output,
+    )
+    tokens = (
+        [500]
+        + list(_K3_REASONING_END)
+        + [42]
+        + list(_K3_RESPONSE_CLOSE)
+        + list(_K3_TOOLS_OPEN)
+        + [700, 701, 702, 703, 704]
+        + list(_K3_TOOLS_CLOSE)
+        + list(_K3_MESSAGE_CLOSE)
+    )
+    for token in tokens:
+        worker.add_data(token)
+    worker.stop_stream()
+
+    router = router_module.TokenRouter(SimpleNamespace())
+    router.active_requests[receiver.request_id] = receiver
+    monkeypatch.setattr(
+        router_module, "get_request_router", lambda check_exist=True: None
+    )
+    monkeypatch.setattr(router_module, "remove_request_everywhere", lambda *args: None)
+
+    async def replay():
+        for frame in frames:
+            await router._process_token_data(frame)
+
+    try:
+        asyncio.run(replay())
+        assert receiver.finished
+        assert receiver.finish_reason == "stop"
+        text = "".join(receiver.async_stream.seqs)
+        assert text == (
+            "Let"
+            "<|close|>think<|sep|><|open|>response<|sep|>"
+            "answer"
+            "<|close|>response<|sep|>"
+            "<|open|>tools<|sep|>"
+            '<|open|>call tool="get_weather" index="1"<|sep|>'
+            '<|open|>argument key="location" type="string"<|sep|>'
+            "beijing<|close|>argument<|sep|><|close|>call<|sep|>"
+            "<|close|>tools<|sep|>"
+            "<|close|>message<|sep|>"
+        )
+        assert receiver.async_stream.reasoning_tokens == 0
+        assert receiver.async_stream.tokens_len == len(tokens)
     finally:
         router.context.term()

@@ -21,5 +21,18 @@ class JsonArgValueGrammar(AbstractArgValueGrammar):
 
 
 class PlainTextArgValueGrammar(AbstractArgValueGrammar):
+    """A free-text argument value.
+
+    ``excludes`` forbids the listed substrings in the value, e.g. a tag
+    close marker the value must not swallow (``AnyTextFormat(excludes=...)``;
+    None keeps the unconstrained default — ``AnyTextFormat`` rejects a None
+    excludes list).
+    """
+
+    def __init__(self, *, excludes: list[str] | None = None):
+        self.excludes = excludes
+
     def build(self, arg_schema: dict) -> Format:
-        return AnyTextFormat()
+        if self.excludes is None:
+            return AnyTextFormat()
+        return AnyTextFormat(excludes=self.excludes)

@@ -1412,7 +1412,8 @@ class Executor:
         keeping the
         verify input on GPU avoids the blocking D2H + H2D round trip that
         otherwise idles the GPU between the draft and verify graph replays.
-        Returns None to fall back to the CPU task.next_tokens path.
+        Missing rows are reconstructed per task so a newly admitted request
+        cannot replace another task's device draft with accepted tokens.
         """
         if self.mtp_size <= 1 or self.sampler is None:
             return None
@@ -1423,11 +1424,23 @@ class Executor:
             row = state.next_tokens_device if state is not None else None
             if row is None:
                 if task.has_output():
-                    # Active task missing its draft row: fall back to CPU.
-                    return None
-                if zero_row is None:
-                    zero_row = torch.zeros(K, dtype=torch.int64, device=self.device)
-                row = zero_row
+                    # The private host mirror has the same draft semantics as
+                    # the device row; Task.next_tokens may hold accepted tokens.
+                    host_row = state.draft_tokens if state is not None else None
+                    if host_row is None:
+                        # PD admission supplies one Prefill output in next_tokens.
+                        # Once this worker has accepted output, its history gives
+                        # the last accepted token, not the first of a padded row.
+                        if task.num_new_tokens > 0:
+                            anchor = task.prefix_tokens[-1]
+                        else:
+                            anchor = task.next_tokens[0]
+                        host_row = [anchor] + [0] * (K - 1)
+                    row = create_tensor(host_row, device=self.device, dtype=torch.int64)
+                else:
+                    if zero_row is None:
+                        zero_row = torch.zeros(K, dtype=torch.int64, device=self.device)
+                    row = zero_row
             rows.append(row)
         return torch.stack(rows, dim=0).reshape(-1)
 

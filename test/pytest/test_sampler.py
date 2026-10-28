@@ -2277,7 +2277,7 @@ class TestDraftBatchRows:
         for i, (state, top_k) in enumerate(zip(states, (3, 5))):
             # The per-task form: the row at the task's own top-k width.
             state.draft_probs = (probs[i, :, :top_k], token_ids[i, :, :top_k])
-            state.task.next_tokens = next_tokens[i].tolist()
+            state.draft_tokens = next_tokens[i].tolist()
 
         per_task = sampler._rebuild_mtp_draft_inputs(states, torch.device("cpu"))
 
@@ -2323,7 +2323,7 @@ class TestDraftBatchRows:
         _, _, next_tokens = self._step_rows(states)
         for i, state in enumerate(states):
             state.draft_probs = None
-            state.task.next_tokens = next_tokens[i].tolist()
+            state.draft_tokens = next_tokens[i].tolist()
 
         per_task = sampler._rebuild_mtp_draft_inputs(states, torch.device("cpu"))
         sampler._draft_batch = DraftBatch(

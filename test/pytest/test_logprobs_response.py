@@ -71,11 +71,11 @@ def make_data_stream():
     stream.top_logprobs_list = []
     stream.top_tokens_list = []
     stream.output_parser = SimpleNamespace(
-        update=lambda token_id: [(token_id, OutputState.OUTPUT)],
+        update=lambda token_id: [(token_id, OutputState.OUTPUT_OR_TOOL)],
         flush=lambda: [],
     )
     stream.output_states = []
-    stream.cached_output_state = OutputState.OUTPUT
+    stream.cached_output_state = OutputState.OUTPUT_OR_TOOL
     stream._text_pending = False
     stream.callbacks_on_stop = []
     stream.error_message = None

@@ -15,7 +15,7 @@
 3. `UserRequest.from_request_params()` 会把 `tools` 注入 `chat_template_kwargs`，并创建 `ToolCallParams`。
 4. `Task` 根据 `ToolCallParams` 调用 `chitu.tool_call.build_grammar()`，再用 `chitu.sampling.utils.compile_grammar()` 编译成 `xgrammar.CompiledGrammar`。
 5. `Sampler` 在每个 decode step 使用 `GrammarMatcher` / `BatchGrammarMatcher` 生成 token bitmask，并把不符合工具格式的 token 屏蔽掉。
-6. 响应层用当前模型配置中的 `tool_parser` 把模型输出文本解析成结构化工具调用，再转换成对应 API 的返回格式。
+6. 响应层用当前模型配置中的 `tool_parser` 把模型输出文本解析成结构化工具调用，再转换成对应 API 的返回格式。配置了 `separated_tool_calling` 的模型只有 tools 通道的文本会进入 parser（见下文“分离式工具调用”一节）。
 
 这条链路里有三个必须同时正确的点：
 
@@ -99,7 +99,7 @@ curl localhost:21002/v1/chat/completions \
 | `utils.py` | 提供 `@register`、`get_tool_parser_cls()`、`build_grammar()`、流式解析适配等公共入口。 |
 | `grammar/` | 用结构化组件构造 `xgrammar` grammar。 |
 | `parse/` | 用可组合 parser 把字符串或流式文本解析成工具调用。 |
-| `*_parser.py` | 已支持模型的参考实现，例如 DeepSeek、Qwen、GLM。 |
+| `*_parser.py` | 已支持模型的参考实现，例如 DeepSeek、Qwen、GLM、Kimi K3。 |
 
 现有 parser 的基本形态是“grammar 实现 + parse 实现 + 注册类”。例如 `DeepSeekV32ToolParser` 复用了 `grammar/` 和 `parse/` 下的组件，描述 DSML 风格的 `<｜DSML｜function_calls>`、`invoke` 和 `parameter` 格式。
 
@@ -114,6 +114,7 @@ curl localhost:21002/v1/chat/completions \
 - 函数名、参数名、参数值分别用什么标签或 JSON 包起来。
 - 字符串参数和 JSON 参数是否需要区分。
 - thinking/reasoning 内容能否和工具调用同时出现。
+- 工具调用是混在正文里，还是用结构化 marker 单独划分一个通道（见下文“分离式工具调用”一节）。
 
 如果新模型的输出格式和已有 parser 完全一致，优先复用已有 parser；否则新增一个专用 parser，避免把相似但不等价的格式硬塞进旧实现。
 
@@ -148,6 +149,8 @@ class MyModelToolParser(AbstractToolParser):
 - `ToolParserImplBase`：把 `root_parser` 用于非流式和流式解析。
 - `ToolGrammar`、`ArgumentsGrammar`、`TriggeredMultipleToolsGrammar`：描述工具调用整体格式。
 - `SequenceParser`、`TriggeredParser`、`FunctionParser`、`JsonArgumentsParser`：解析模型输出。
+- `ToolGrammar` / `ArgumentGrammar` 提供 `escape` 钩子，`NameParser` / `ArgNameParser` 提供对应的 `unescape` 钩子，用于名字和 key 内特殊字符需要转义的格式（参考 `kimi_k3_parser.py` 的 XTML 属性转义）。
+- `PlainTextArgValueGrammar(excludes=[...])` 防止原始字符串值吞掉标签关闭符；`IgnoreParser` 用于跳过 parser 不需要的片段。
 
 如果模型的 HF chat template 本身缺少工具说明，可以实现 `PatchTemplateToolParserMixin.patch_chat_template()`。如果 chat template 中历史 `assistant.tool_calls` 需要 JSON 对象而不是 JSON 字符串，可以使用 `JsonMessageToolParserMixin`。
 
@@ -362,6 +365,41 @@ tool_parser: ExistingCompatibleToolParser
 
 还要注意，模型专用 encoding 文件里的解析函数通常服务于该 chatformat 自身的消息转换；在线服务返回 OpenAI、Responses、Anthropic tool calls 时，实际调用的是 `chitu.tool_call` 注册的 parser。
 
+## 分离式工具调用（separated tool calling）
+
+Kimi-K3 这类模型不把工具调用混在正文里。和 reasoning 一样，工具调用拥有自己的通道，由结构化 marker 划分：
+
+```text
+<|open|>think<|sep|> ... <|close|>think<|sep|><|open|>response<|sep|>
+...正文... <|close|>response<|sep|>
+<|open|>tools<|sep|>
+  ...工具调用...
+<|close|>tools<|sep|>
+<|close|>message<|sep|>
+```
+
+适配这类模型时，两层都要和模型实际生成的 marker 对齐：
+
+1. token 层（`chitu/output_parser/`）。模型 yaml 设置 `separated_tool_calling: true` 和四个输出侧 delimiter id 列表。输出 parser 把每个列表当作精确连续 token 序列匹配，让所有 marker 不进入解码文本，并把其余 token 分类到正文区（`OUTPUT`）和 tools 通道（`TOOL`）：
+
+   ```yaml
+   tool_parser: KimiK3ToolParser
+   separated_tool_calling: true
+   # 正文通道关闭符： <|close|>response<|sep|>
+   output_end_delimiter_ids: [163588, 12092, 163589]
+   # tools 通道开/关符： <|open|>tools<|sep|> / <|close|>tools<|sep|>
+   tool_call_start_delimiter_ids: [163587, 25385, 163589]
+   tool_call_end_delimiter_ids: [163588, 25385, 163589]
+   # 整条消息的关闭符： <|close|>message<|sep|>
+   message_end_delimiter_ids: [163588, 2778, 163589]
+   ```
+
+   四个列表全部必填，且每个 id 必须是 marker 各 token 在 tokenizer 里的真实 id。
+
+2. 文本层（`chitu/tool_call/`）。服务层只把 tools 通道的文本送给 `tool_parser`，正文原样作为 content，因此正文里长得像工具调用的文本仍然是文本。`root_parser` 匹配的是通道内部语法（Kimi-K3 即原始 XTML 调用标签），而不是通道 marker。
+
+grammar 约束的是原始生成流，所以 trigger 必须匹配正文和 tools 通道之间实际生成的 marker 序列。Kimi-K3 把正文关闭符折叠进 trigger（`<|close|>response<|sep|><|open|>tools<|sep|>`）：`TriggeredTagsFormat` 的 `at_least_one=True` 禁止 trigger 之前出现文本，如果只用裸的 tools 开启符做 trigger，会迫使通道在 reasoning 切换后立刻开启，正文通道悬空。同理，tag 结尾折叠了消息关闭符：有效工具不超过一个时，grammar 会在 tag 结束后立即停止。完整参考实现是 `chitu/tool_call/kimi_k3_parser.py` 和 `chitu/config/models/Kimi-K3.yaml`。
+
 ## Grammar 和 schema 注意事项
 
 - `ToolConfig.choice == "required"` 时，grammar 至少要求生成一个工具调用。
@@ -383,10 +421,12 @@ tool_parser: ExistingCompatibleToolParser
 4. 配置语义测试：覆盖 `tool_choice="auto"`、`"required"`、`"none"`、命名工具、`parallel_tool_calls=True/False`。
 5. thinking 测试：覆盖目标模型是否允许 thinking 和工具调用共存。
 6. API 端到端测试：覆盖 Chat Completions、Responses、Anthropic 的非流式和流式工具调用。
+7. 分离式工具调用：覆盖 marker 隐藏、通道路由（正文中长得像工具调用的文本仍是文本），以及 corner case（无激活 tool parser 时的通道文本、工具调用之外的纯文本）。
 
 仓库里当前可参考：
 
 - `test/pytest/test_tool_parser.py`：parser、grammar、流式解析和 reasoning 组合测试。
+- `test/pytest/test_output_parser.py`：分离式工具调用的 token 级通道分类、marker 隐藏和服务层 corner case 测试。
 - `test/test_tool_call.py`：OpenAI Chat、Responses、Anthropic 的端到端工具调用测试。
 
 下面是一个紧凑的 parser 正确性验证例子，可以放进 pytest 里再按目标模型格式调整。这里显式使用 `enable_thinking=False`，并用 `required + at_most_one=True`，避免普通文本分支或 reasoning grammar 干扰最小验证：
@@ -484,5 +524,6 @@ def test_my_model_tool_parser_minimal():
 | 日志显示使用 `DummyToolParser` | 模型 yaml 的 `tool_parser` 是否写对；parser 类名是否和 yaml 值一致；新 parser 是否已在 `chitu/tool_call/__init__.py` import。 |
 | 响应 `content` 里出现完整工具标签，但 `tool_calls` 为空 | 模型输出格式和 `root_parser` 不匹配，或响应层实际加载的 parser 不是预期 parser。 |
 | DSV4 prompt 要求 `<｜DSML｜tool_calls>`，但 grammar 接受 `<｜DSML｜function_calls>` | prompt 格式和 grammar/parser 格式不一致，需要统一块名和标签。 |
+| 分离式模型的结构化 marker（如 `<|open|>tools<|sep|>`）泄漏进 `content` | 模型 yaml 的四个 delimiter id 列表：`separated_tool_calling` 要求全部配置，且每个 id 必须是 marker 各 token 在 tokenizer 里的真实 id。 |
 | parser 抛出 `KeyError` 或参数类型读取失败 | 工具 schema 可能缺少 `function.parameters.properties`，或参数名不在 `properties` 中。 |
 | `tool_choice="required"` 时合法样例被拒绝 | 检查 `enable_thinking` 和 reasoning 配置；最小 grammar 测试先设置 `enable_thinking=False`。 |

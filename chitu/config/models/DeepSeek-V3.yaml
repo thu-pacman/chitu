@@ -32,8 +32,6 @@ qk_rope_head_dim: 64
 v_head_dim: 128
 rope_theta: 10000.0
 rope_factor: 40
-reasoning_start_delimiter_ids: [151648]
-reasoning_end_delimiter_ids: [151649]
 main_weight_dtype: float8_e4m3fn
 tool_parser: DeepSeekV3ToolParser
 reasoning_type: disabled

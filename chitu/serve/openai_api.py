@@ -35,11 +35,13 @@ if not DOC_GENERATION:
         run_with_client_abort,
         stream_with_client_abort,
     )
-    from chitu.output_parser import REASONING_OUTPUT_STATES
+    from chitu.output_parser import OutputState, REASONING_OUTPUT_STATES
     from chitu.tool_call import (
         parse_stream_by_parser,
         get_tool_parser_cls,
         InvalidToolCallArgumentsError,
+        warn_unparsed_tool_channel_text,
+        warn_plain_tool_channel_text,
     )
 
 logger = getLogger(__name__)
@@ -413,7 +415,9 @@ class AsyncResponse:
 
     def stream_generator(self, *, include_usage: bool):
         if self.tool_parser:
-            stream = parse_stream_by_parser(self.async_stream, self.tool_parser)
+            stream = parse_stream_by_parser(
+                self.async_stream, self.tool_parser, request_id=self.id
+            )
         else:
             stream = self.async_stream
 
@@ -423,6 +427,8 @@ class AsyncResponse:
                 first_delta = True
                 async for data, state, (top_logprobs, top_tokens) in stream:
                     if data:
+                        if self.tool_parser is None and state == OutputState.TOOL:
+                            warn_unparsed_tool_channel_text(data, request_id=self.id)
                         if isinstance(data, ChoiceDelta) and data.tool_calls:
                             has_tool_calls = True
                         if isinstance(data, ChoiceDelta):
@@ -518,9 +524,12 @@ class AsyncResponse:
         top_tokens_list = []
         chunks = []
         rchunks = []
+        tchunks = []
         async for data, state, (top_logprobs, top_tokens) in self.async_stream:
             if state in REASONING_OUTPUT_STATES:
                 rchunks.append(data)
+            elif state == OutputState.TOOL:
+                tchunks.append(data)
             else:
                 chunks.append(data)
             if self.req.logprobs:
@@ -540,9 +549,19 @@ class AsyncResponse:
             message["reasoning_content"] = reasoning_content
 
         content = "".join(chunks)
+        tool_text = "".join(tchunks)
         if self.tool_parser:
-            content, tools = self.tool_parser.parse_string(content)
+            if self.async_stream.output_parser.params.separated_tool_calling:
+                tool_content, tools = self.tool_parser.parse_string(tool_text)
+                if tool_content:
+                    warn_plain_tool_channel_text(tool_content, request_id=self.id)
+                content += tool_content
+            else:
+                content, tools = self.tool_parser.parse_string(content)
             message["tool_calls"] = tools
+        elif tool_text:
+            warn_unparsed_tool_channel_text(tool_text, request_id=self.id)
+            content += tool_text
         message["content"] = content
 
         if self.req.logprobs:
@@ -855,12 +874,14 @@ class CompletionResponse(BaseModel):
 class CompletionAsyncResponse:
     """Response builder for /v1/completions.
 
-    Emits decoded text in ``choices[].text``. No tool parser and no reasoning
-    splitting: completions are plain text. Streaming chunks follow the OpenAI
-    text-completion shape; the final chunk carries ``finish_reason`` and (when
-    ``include_usage``) ``usage`` together, so clients that index
-    ``choices[0]`` unconditionally (e.g. sglang's bench client) do not hit an
-    empty-choices chunk.
+    Emits decoded text in ``choices[].text``: the RAW continuation — no tool
+    parser, no reasoning splitting, and no delimiter parsing at all (the
+    request's stream classifies every token as plain text, so the model's
+    structural markers surface verbatim; see ``UserRequest.from_prompt_text``).
+    Streaming chunks follow the OpenAI text-completion shape; the final chunk
+    carries ``finish_reason`` and (when ``include_usage``) ``usage`` together,
+    so clients that index ``choices[0]`` unconditionally (e.g. sglang's bench
+    client) do not hit an empty-choices chunk.
     """
 
     def __init__(self, req: UserRequest, *, response_model: str):

@@ -10,4 +10,8 @@ defaults:
 # Access info
 name: DeepSeek-R1
 source: "https://huggingface.co/deepseek-ai/DeepSeek-R1" # Just for displaying. No automatic download.
+
+# Overrides
 reasoning_type: triggered
+reasoning_start_delimiter_ids: [128798]
+reasoning_end_delimiter_ids: [128799]

@@ -209,6 +209,42 @@ class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
 
     expected_n_tokens_per_expert: int  # = bs * topk / num_global_experts
 
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls, old: "PerExpertDenseBatchedRoutedActivationMinimal"
+    ) -> "IndexedBatchedRoutedActivation":
+        """Represent a fixed-capacity expert buffer as local indexed rows."""
+        if isinstance(old, PerExpertDenseBatchedRoutedActivationWithScaleMinimal):
+            raise NotImplementedError(
+                "Scaled per-expert activations require a scale-preserving conversion"
+            )
+        activation = eval_lazy(old.activation_per_expert)
+        counts = eval_lazy(old.n_tokens_per_expert)
+        if activation.ndim != 3:
+            raise ValueError("Expected [expert, capacity, hidden] activations")
+        n_experts, capacity, hidden = activation.shape
+        if not old.expert_ids_are_local:
+            raise ValueError("Per-expert activations must use local expert IDs")
+        if (
+            counts.shape != (n_experts,)
+            or counts.device != activation.device
+            or counts.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("Counts must be one device-local integer per expert")
+        # Counts stay on the device. The existing indexed route compaction skips
+        # sentinel rows, including empty experts, on each Graph replay.
+        rows = torch.arange(capacity, device=activation.device).view(1, capacity)
+        experts = torch.arange(n_experts, device=activation.device).view(n_experts, 1)
+        ids = torch.where(rows < counts.view(n_experts, 1), experts, n_experts)
+        return cls(
+            activation=activation.reshape(n_experts * capacity, hidden),
+            token_to_expert_indices=ids.reshape(n_experts * capacity, 1),
+            expected_n_tokens_per_expert=old.expected_n_tokens_per_expert,
+            expert_ids_are_local=True,
+        )
+
     @override
     def get_chunks_no_larger_than(
         self,

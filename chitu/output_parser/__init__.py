@@ -13,6 +13,7 @@ from .impl import (
     MarkerMatcher,
     OutputParser,
     make_output_parser,
+    make_raw_output_parser,
 )
 from .utils import (
     get_output_parser_marker_token_ids,
