@@ -127,12 +127,13 @@ def test_tokenize_messages_use_chat_template(monkeypatch, payload, expected_kwar
     ]
 
 
-def test_invalid_tool_call_arguments_returns_bad_request_in_tokenize_api(monkeypatch):
+def test_broken_tool_call_arguments_are_replayed_in_tokenize_api(monkeypatch):
     """
-    A bad tool-call argument in a replayed history is a bad request (HTTP 400)
-    instead of a server error (HTTP 500).
+    A replayed history whose tool-call arguments are not valid JSON is still
+    tokenized, and the formatter sees the same repaired message the inference
+    endpoints use.
 
-    This test is for the /v1/responses endpoint.
+    This test is for the /tokenize endpoint.
     """
 
     formatter = DummyFormatter()
@@ -167,7 +168,9 @@ def test_invalid_tool_call_arguments_returns_bad_request_in_tokenize_api(monkeyp
         },
     )
 
-    assert response.status_code == 400
-    assert "messages[0].tool_calls[0]" in response.json()["detail"]
-    # Rejected before the chat template is applied.
-    assert formatter.calls == []
+    assert response.status_code == 200
+    assert response.json() == {"tokens": [21, 22, 23]}
+    messages = formatter.calls[0][0]
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {
+        "_raw": '{"newText": "unterminated'
+    }

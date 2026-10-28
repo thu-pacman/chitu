@@ -18,6 +18,40 @@ class DummyFormatter:
         return [1, 2, 3, 4, 5]
 
 
+class RecordingFormatter(DummyFormatter):
+    def __init__(self):
+        self.calls = []
+
+    def encode_dialog_prompt(self, messages, chat_template_kwargs):
+        self.calls.append(messages)
+        return [1, 2, 3, 4, 5]
+
+
+class StaticAsyncStream:
+    """A finished stream for endpoint tests that must not reach the scheduler."""
+
+    def __init__(self, items):
+        self.items = list(items)
+        self.tokens_len = len(self.items)
+        self.reasoning_tokens = 0
+        self.input_cached_tokens = 0
+        self.output_parser = SimpleNamespace(
+            params=SimpleNamespace(enable_reasoning=False)
+        )
+        self._index = 0
+
+    def __aiter__(self):
+        self._index = 0
+        return self
+
+    async def __anext__(self):
+        if self._index >= len(self.items):
+            raise StopAsyncIteration
+        item = self.items[self._index]
+        self._index += 1
+        return item
+
+
 class _DummyInnerTokenizer:
     """Stands in for the HF tokenizer behind Backend.tokenizer.model.
 
@@ -46,14 +80,14 @@ async def unexpected_submit_request(_request):
     raise AssertionError("oversized request reached submit_request")
 
 
-def create_client(monkeypatch):
+def create_client(monkeypatch, *, max_seq_len=4, formatter=None):
     args = SimpleNamespace(
-        infer=SimpleNamespace(max_seq_len=4, max_concurrent_requests=None),
+        infer=SimpleNamespace(max_seq_len=max_seq_len, max_concurrent_requests=None),
         debug=SimpleNamespace(save_trace_dir=None),
         models=SimpleNamespace(name="test-model"),
         serve=SimpleNamespace(api_keys=[], validate_api_key=False),
     )
-    monkeypatch.setattr(api_server.Backend, "formatter", DummyFormatter())
+    monkeypatch.setattr(api_server.Backend, "formatter", formatter or DummyFormatter())
     monkeypatch.setattr(api_server.Backend, "tokenizer", DummyTokenizer())
     monkeypatch.setattr(task, "get_global_args", lambda: args)
     monkeypatch.setattr(openai_api, "get_global_args", lambda: args)
@@ -129,23 +163,39 @@ def test_internal_value_error_remains_server_error(monkeypatch):
     assert response.json() == {"detail": "internal failure"}
 
 
-def test_invalid_tool_call_arguments_returns_bad_request_in_completions_api(
-    monkeypatch,
-):
+def test_broken_tool_call_history_is_replayed_in_completions_api(monkeypatch):
     """
-    A bad tool-call argument in a replayed history is a bad request (HTTP 400)
-    instead of a server error (HTTP 500).
+    A replayed history whose tool-call arguments are not valid JSON is served
+    instead of rejected, so one broken turn does not end the conversation.
 
     This test is for the /v1/chat/completions endpoint.
     """
 
-    client = create_client(monkeypatch)
+    formatter = RecordingFormatter()
+    client = create_client(monkeypatch, max_seq_len=4096, formatter=formatter)
     # Test with GLM parser
     monkeypatch.setattr(
         tool_call_utils,
         "get_tool_parser_cls",
         lambda: tool_call_utils._registere_parsers["GLM47ToolParser"],
     )
+
+    real_build_user_request = openai_api.build_user_request
+
+    def build_with_static_stream(request, priority):
+        # Run the real build so the repaired history reaches the formatter, then
+        # give the handler a finished stream instead of a scheduled request.
+        user_req = real_build_user_request(request, priority)
+        user_req.async_stream = StaticAsyncStream([("ok", False, (None, None))])
+        user_req.finish_reason = "stop"
+        return user_req
+
+    monkeypatch.setattr(openai_api, "build_user_request", build_with_static_stream)
+
+    async def submit(_request):
+        return None
+
+    monkeypatch.setattr(openai_api, "submit_request", submit)
 
     response = client.post(
         "/v1/chat/completions",
@@ -162,7 +212,7 @@ def test_invalid_tool_call_arguments_returns_bad_request_in_completions_api(
                             "type": "function",
                             "function": {
                                 "name": "my_func_1",
-                                "arguments": '{"newText": "unterminated',  # bad: trancated
+                                "arguments": '{"newText": "unterminated',  # bad: truncated
                             },
                         }
                     ],
@@ -176,28 +226,50 @@ def test_invalid_tool_call_arguments_returns_bad_request_in_completions_api(
         },
     )
 
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert "messages[0].tool_calls[0]" in detail
-    assert "my_func_1" in detail
-    assert "JSON object" in detail
+    assert response.status_code == 200
+    messages = formatter.calls[0]
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {
+        "_raw": '{"newText": "unterminated'
+    }
+    # The tool result stays paired with the call it answers.
+    assert messages[1]["tool_call_id"] == "call_1"
 
 
-def test_invalid_tool_call_arguments_returns_bad_request_in_responses_api(monkeypatch):
+def test_broken_tool_call_history_is_replayed_in_responses_api(monkeypatch):
     """
-    A bad tool-call argument in a replayed history is a bad request (HTTP 400)
-    instead of a server error (HTTP 500).
+    A replayed history whose tool-call arguments are not valid JSON is served
+    instead of rejected, so one broken turn does not end the conversation.
 
     This test is for the /v1/responses endpoint.
     """
 
-    client = create_client(monkeypatch)
+    formatter = RecordingFormatter()
+    client = create_client(monkeypatch, max_seq_len=4096, formatter=formatter)
     # Test with GLM parser
     monkeypatch.setattr(
         tool_call_utils,
         "get_tool_parser_cls",
         lambda: tool_call_utils._registere_parsers["GLM47ToolParser"],
     )
+
+    real_from_request_params = responses_api.UserRequest.from_request_params
+
+    def from_params_with_static_stream(params):
+        user_req = real_from_request_params(params)
+        user_req.async_stream = StaticAsyncStream([("ok", False, (None, None))])
+        user_req.finish_reason = "stop"
+        return user_req
+
+    monkeypatch.setattr(
+        responses_api.UserRequest,
+        "from_request_params",
+        from_params_with_static_stream,
+    )
+
+    async def submit(_request):
+        return None
+
+    monkeypatch.setattr(responses_api, "submit_request", submit)
 
     response = client.post(
         "/v1/responses",
@@ -215,10 +287,11 @@ def test_invalid_tool_call_arguments_returns_bad_request_in_responses_api(monkey
         },
     )
 
-    assert response.status_code == 400
-    error = response.json()["error"]
-    assert error["type"] == "invalid_request_error"
-    assert "messages[0].tool_calls[0]" in error["message"]
+    assert response.status_code == 200
+    messages = formatter.calls[0]
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {
+        "_raw": '{"newText": "unterminated'
+    }
 
 
 def post_completion(client):

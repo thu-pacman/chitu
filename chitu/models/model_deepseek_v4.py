@@ -36,7 +36,6 @@ from chitu.models.model import (
     get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
-from chitu.import_utils import try_import_platform_dep
 from chitu.ops import (
     add_shared_experts,
     apply_rotary_pos_emb_partial,
@@ -56,47 +55,19 @@ from chitu.ops.hadamard import hadamard_transform
 from chitu.ops.deepseek_compressor import (
     build_compress_metadata,
     build_compress_metadata_from_tensors,
-    gather_pending_and_new as _gather_pending_and_new_torch,
-    compress_hca as _compress_hca_torch,
-    compress_csa as _compress_csa_torch,
-    writeback_pending as _writeback_pending_torch,
+    compress_csa,
+    compress_hca,
     decode_compressor,
+    gather_pending_and_new,
+    masked_write_kv_cache,
     supports_decode_fastpath,
     try_fused_decode_postprocess_write_cache,
+    writeback_pending,
 )
 from chitu.ops.deepseek_v4_decode_plan import (
     DeepSeekV4DecodeCompressPlan,
     build_decode_compress_plan,
 )
-
-_, _has_triton = try_import_platform_dep("triton")
-
-if _has_triton:
-    from chitu.ops.triton_ops.deepseek_compressor import (
-        gather_pending_and_new as _gather_pending_and_new_triton,
-        compress_hca as _compress_hca_triton,
-        compress_csa as _compress_csa_triton,
-        writeback_pending as _writeback_pending_triton,
-        pack_prefill_kv as _pack_prefill_kv_triton,
-        masked_write_kv_cache as _masked_write_kv_cache_triton,
-    )
-
-    _TRITON_COMPRESS_AVAILABLE = True
-else:
-    _pack_prefill_kv_triton = None
-    _masked_write_kv_cache_triton = None
-    _TRITON_COMPRESS_AVAILABLE = False
-
-if _TRITON_COMPRESS_AVAILABLE:
-    _gather_pending_and_new_backend = _gather_pending_and_new_triton
-    _compress_hca_backend = _compress_hca_triton
-    _compress_csa_backend = _compress_csa_triton
-    _writeback_pending_backend = _writeback_pending_triton
-else:
-    _gather_pending_and_new_backend = _gather_pending_and_new_torch
-    _compress_hca_backend = _compress_hca_torch
-    _compress_csa_backend = _compress_csa_torch
-    _writeback_pending_backend = _writeback_pending_torch
 
 from chitu.ops.mhc import mhc_pre, mhc_post
 from chitu.ops.quant import (
@@ -711,8 +682,7 @@ class CompressorDeepSeekV4(nn.Module):
             )
             return
         if valid_mask is not None:
-            assert _masked_write_kv_cache_triton is not None
-            _masked_write_kv_cache_triton(
+            masked_write_kv_cache(
                 values,
                 self.kv_cache,
                 self.kv_block_table if self.kv_cache_is_paged else None,
@@ -908,7 +878,7 @@ class CompressorDeepSeekV4(nn.Module):
         # ---- backend op 1: gather pending + new tokens into flat buffer ----
         flat_kv = torch.empty(total_eff, D, device=device, dtype=torch.float32)
         flat_score = torch.empty(total_eff, D, device=device, dtype=torch.float32)
-        _gather_pending_and_new_backend(
+        gather_pending_and_new(
             self.kv_state,
             self.score_state,
             kv_cat,
@@ -931,7 +901,7 @@ class CompressorDeepSeekV4(nn.Module):
         # CSA: out_kv is [total_groups, head_dim] (only first head output)
         out_kv = torch.empty(total_groups, head_dim, device=device, dtype=torch.float32)
         if not is_csa:
-            _compress_hca_backend(
+            compress_hca(
                 flat_kv,
                 flat_score,
                 self.ape,
@@ -943,7 +913,7 @@ class CompressorDeepSeekV4(nn.Module):
             )
         else:
             n_groups_list_t = meta["cu_groups"][1:] - meta["cu_groups"][:-1]
-            _compress_csa_backend(
+            compress_csa(
                 flat_kv,
                 flat_score,
                 self.ape,
@@ -962,7 +932,7 @@ class CompressorDeepSeekV4(nn.Module):
             )
 
         # ---- backend op 3: writeback remainder to kv_state ----
-        _writeback_pending_backend(
+        writeback_pending(
             flat_kv,
             flat_score,
             self.kv_state,
@@ -2411,7 +2381,6 @@ class AttentionDeepSeekV4(Attention):
             physical_window_size=physical_win,
             compressed_cache=self.compressed_cache_accessor if ratio else None,
             compressed_lens=compressed_lens,
-            pack_prefill_kv=_pack_prefill_kv_triton,
             compress_ratio=ratio or None,
         )
 

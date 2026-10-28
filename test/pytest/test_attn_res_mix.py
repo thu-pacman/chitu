@@ -64,9 +64,15 @@ def test_attn_res_mix(num_tokens, num_blocks, hidden, dtype):
     expected = _attn_res_reference(
         prefix_sum, block_residual, norm_weight, proj_weight, eps
     )
-    # fp32 reduction-order noise (see the reference docstring) dominates the
-    # fp32 cases; bf16 output rounding dominates the bf16 cases.
-    tol = {torch.float32: dict(rtol=1e-4, atol=1e-4), torch.bfloat16: dict()}[dtype]
+    # Both dtypes share the same absolute floor, which covers the fp32
+    # reduction-order noise documented above (~5e-5) at an output element close to
+    # zero. The relative tolerance has to follow each dtype's own precision: bf16
+    # rounds its output to 8 mantissa bits (~2^-7 relative), so 1e-4 would reject a
+    # single-ulp difference, while fp32 can use the fp64 reference's accuracy.
+    tol = {
+        torch.float32: dict(rtol=1e-4, atol=1e-4),
+        torch.bfloat16: dict(rtol=1.6e-2, atol=1e-4),
+    }[dtype]
     assert_close(out, expected, **tol)
 
 

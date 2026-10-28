@@ -47,7 +47,12 @@ def _masked_write_kv_cache_kernel(
     token_id = tl.program_id(0)
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
-    valid = tl.load(valid_mask_ptr + token_id)
+    # Loading from a bool pointer dereferences as int8 (triton rewrites
+    # `pointer_type<int1>` as `pointer_type<int8>`), so `valid & d_mask` would
+    # promote to int8. Upstream triton implicitly casts store masks back to
+    # bool, but the MACA (MetaX) fork rejects non-bool masks, hence the
+    # explicit cast.
+    valid = tl.load(valid_mask_ptr + token_id).to(tl.int1)
 
     position = tl.load(positions_ptr + token_id).to(tl.int64)
     if PAGED:
@@ -72,7 +77,7 @@ def _masked_write_kv_cache_kernel(
 
 
 @auto_retry_triton_compilation
-def masked_write_kv_cache(
+def masked_write_kv_cache_triton(
     values: torch.Tensor,
     kv_cache: torch.Tensor,
     block_table: torch.Tensor | None,
@@ -224,7 +229,7 @@ def _gather_kernel(
 
 
 @auto_retry_triton_compilation
-def gather_pending_and_new(
+def gather_pending_and_new_triton(
     kv_state: torch.Tensor,  # [max_batch, max_pending_rows, D]
     score_state: torch.Tensor,
     kv_cat: torch.Tensor,  # [total_new_tokens, D]
@@ -340,7 +345,7 @@ def _compress_hca_kernel(
 
 
 @auto_retry_triton_compilation
-def compress_hca(
+def compress_hca_triton(
     flat_kv: torch.Tensor,  # [total_eff, D]
     flat_score: torch.Tensor,  # [total_eff, D]
     ape: torch.Tensor,  # [ratio, D]
@@ -511,7 +516,7 @@ def _compress_csa_kernel(
 
 
 @auto_retry_triton_compilation
-def compress_csa(
+def compress_csa_triton(
     flat_kv: torch.Tensor,  # [total_eff, 2*head_dim]
     flat_score: torch.Tensor,
     ape: torch.Tensor,  # [ratio, full_d]
@@ -635,7 +640,7 @@ def _writeback_pending_kernel(
 
 
 @auto_retry_triton_compilation
-def writeback_pending(
+def writeback_pending_triton(
     flat_kv: torch.Tensor,
     flat_score: torch.Tensor,
     kv_state: torch.Tensor,
@@ -1702,7 +1707,7 @@ def _pack_prefill_kv_kernel(
 
 
 @auto_retry_triton_compilation
-def pack_prefill_kv(
+def pack_prefill_kv_triton(
     history_kv: torch.Tensor,
     current_kv: torch.Tensor,
     compressed_kv: torch.Tensor,

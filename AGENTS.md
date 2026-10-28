@@ -55,6 +55,24 @@ Bad comment:
 
 Use the same name for the same thing. Use different names for different things.
 
+## User-facing configs should be worth tuning by users
+
+When you want to add a new item in a config file, or a new environment variable, or a new command-line option, please consider the following.
+
+You can add a user-facing config in the following cases:
+1. You know sometimes one option is better and sometime another option is better, but you don't know eactly when, so you want the users to decide. Example: what kind of parallelism to use.
+2. There is no better or worse on this config, but it depends on user preferences. Example: verbose level of logging.
+
+Do NOT add a user-facing config in the following case:
+1. You know exactly when to set the config to what value, or you know it is always better to set to a specific value. In this case, you should decide it in a programmatic way instead.
+2. The config is only for a temporary probe or experiment, but not for production. In this case, drop the config.
+3. The config is only for a permanent test, but not for production. In this case, you should implement a mock in the test instead.
+
+After checking the rules above, if you still think the config is needed, please consider its form:
+1. A new item in an existing Hydra config file is preferred, because we have established tooling around Hydra config files.
+2. Otherwise, if you are editing a standalone test or installation script, a command line argument is preferred.
+3. Environment variables are last resort, for special cases like options handled before Hydra initialization. If you really need to add an environment variable, please also update the environment variable sections in related documents.
+
 ## Fold redundant code
 
 Bad example (redundant variable passing):
