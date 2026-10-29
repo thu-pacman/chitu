@@ -31,8 +31,6 @@ support_indexer_deepgemm = (
 def _validate_deepgemm_indexer_config(args):
     if not support_indexer_deepgemm:
         raise ValueError("indexer_type=deepgemm is not supported ")
-    if args.infer.mtp_size > 2:
-        raise ValueError("indexer_type=deepgemm does not support mtp_size > 2")
     if args.infer.cache_type != "paged":
         raise ValueError(
             f"indexer_type=deepgemm only supports cache_type=paged, but got {args.infer.cache_type}"
@@ -53,11 +51,21 @@ class DeepGEMMIndexer(NvidiaTopKMixin, DSAIndexer):
         )
         return ((max_seqlen_k + 255) // 256) * 256
 
+    def _decode_expand_rows(self, seq_len_delta) -> bool:
+        # The paged kernel supports next_n in {1, 2}. Score larger MTP batches
+        # as individual rows, each with its own causal context length.
+        return self.mtp_size > 2 and not seq_len_delta.is_classic_decoding
+
+    def _decode_context_lens(self, seq_len_delta):
+        if self._decode_expand_rows(seq_len_delta):
+            return (seq_len_delta.delta_position_ids_tensor_device + 1).to(torch.int32)
+        return seq_len_delta.new.lens_tensor_device.to(torch.int32)
+
     def prepare_metadata_for_decode(self, seq_len_delta):
         if not seq_len_delta.batch_size:
             return
         metadata = deep_gemm.get_paged_mqa_logits_metadata(
-            seq_len_delta.new.lens_tensor_device.to(torch.int32), 64, self.num_sms
+            self._decode_context_lens(seq_len_delta), 64, self.num_sms
         )
         if self.metadata is None:
             self.metadata = StaticTensor(metadata)
@@ -154,15 +162,19 @@ class DeepGEMMIndexer(NvidiaTopKMixin, DSAIndexer):
         Indexer score by deep_gemm.fp8_paged_mqa_logits() for ragged_q_paged_k in decode stage
         """
         s_q, h, d = q.shape
-        seq_len = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
-        batch_size = s_q // seq_len
-        assert batch_size == seq_len_delta.batch_size
+        if self._decode_expand_rows(seq_len_delta):
+            batch_size, seq_len = s_q, 1
+            k_page_table = k_page_table[seq_len_delta.delta_seq_ids_tensor_device]
+        else:
+            seq_len = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
+            batch_size = s_q // seq_len
+            assert batch_size == seq_len_delta.batch_size
 
         # reshape as batch view
         q = q.view(batch_size, seq_len, h, d)
         weights = weights.view(s_q, h)
         k_ks = k_ks.unsqueeze(2).view(torch.uint8)
-        context_lens = seq_len_delta.new.lens_tensor_device.to(torch.int32)
+        context_lens = self._decode_context_lens(seq_len_delta)
 
         index_score = deep_gemm.fp8_paged_mqa_logits(
             q,
@@ -189,8 +201,6 @@ class DeepGEMMIndexer(NvidiaTopKMixin, DSAIndexer):
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
 
         if seq_len_delta.is_decode_stage:  # decode
-            if self.mtp_size > 2:
-                raise NotImplementedError()
             index_score = self.blockfp8_index_score_ragged_q_paged_k_dsv32_deepgemm(
                 q_fp8,
                 weights,

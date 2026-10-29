@@ -28,6 +28,7 @@ never as section names.
 import asyncio
 import logging
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from omegaconf import OmegaConf
@@ -1467,7 +1468,7 @@ def _make_req(monkeypatch, reason="stop"):
 
 def _post_chat(monkeypatch, req, streaming):
     client = create_client(monkeypatch)
-    monkeypatch.setattr(chat, "build_user_request", lambda *args: req)
+    monkeypatch.setattr(chat, "build_user_request", AsyncMock(return_value=req))
     monkeypatch.setattr(chat, "set_min_batch_size", lambda *args: None)
     monkeypatch.setattr(
         chat,
@@ -2374,7 +2375,7 @@ def test_reasoning_usage_http_json_and_sse(
         pass
 
     if api == "chat":
-        monkeypatch.setattr(chat, "build_user_request", lambda *args: req)
+        monkeypatch.setattr(chat, "build_user_request", AsyncMock(return_value=req))
         monkeypatch.setattr(chat, "set_min_batch_size", lambda *args: None)
         monkeypatch.setattr(
             chat,

@@ -245,13 +245,8 @@ class UserRequest:
         self.ttft_timeout_s: Optional[float] = None
 
     @staticmethod
-    def from_request_params(params: RequestParams, max_prompt_len: int | None = None):
-        sample_params = SampleParams(
-            temperature=params.temperature,
-            top_p=params.top_p,
-            top_k=params.top_k,
-            frequency_penalty=params.frequency_penalty,
-        )
+    def _chat_template_state(params: RequestParams):
+        """Resolve the template and output constraints for both build paths."""
         chat_template_kwargs = params.chat_template_kwargs.copy()
         update_chat_template_kwargs_reasoning(
             chat_template_kwargs, params.enable_thinking
@@ -279,15 +274,36 @@ class UserRequest:
             )
         else:
             tool_call_params = None
+        return chat_template_kwargs, tool_call_params, response_format_params
 
+    @staticmethod
+    def encode_request_params(params: RequestParams):
+        """Tokenize without constructing the event-loop-owned UserRequest."""
+        chat_template_kwargs, _, _ = UserRequest._chat_template_state(params)
         messages = adjust_message_for_tool_calls(params.messages)
         encoded = Backend.formatter.encode_dialog_prompt(
             messages, chat_template_kwargs=chat_template_kwargs
         )
         if isinstance(encoded, tuple):
-            prompt_tokens, pixel_values, grid_thw = encoded
-        else:
-            prompt_tokens, pixel_values, grid_thw = encoded, None, None
+            return encoded
+        return encoded, None, None
+
+    @staticmethod
+    def from_request_params(
+        params: RequestParams, max_prompt_len: int | None = None, encoded=None
+    ):
+        sample_params = SampleParams(
+            temperature=params.temperature,
+            top_p=params.top_p,
+            top_k=params.top_k,
+            frequency_penalty=params.frequency_penalty,
+        )
+        _, tool_call_params, response_format_params = UserRequest._chat_template_state(
+            params
+        )
+        if encoded is None:
+            encoded = UserRequest.encode_request_params(params)
+        prompt_tokens, pixel_values, grid_thw = encoded
         prompt_len = len(prompt_tokens)
         if max_prompt_len is not None and prompt_len > max_prompt_len:
             prompt_tokens = prompt_tokens[:max_prompt_len]
@@ -328,6 +344,13 @@ class UserRequest:
         return max_new_tokens
 
     @staticmethod
+    def encode_prompt_text(prompt: Union[str, list[int]]) -> list[int]:
+        """Tokenize a raw completion prompt without adding special tokens."""
+        if isinstance(prompt, list):
+            return list(prompt)
+        return Backend.tokenizer.encode(prompt, bos=False, eos=False)
+
+    @staticmethod
     def from_prompt_text(
         prompt: Union[str, list[int]],
         request_id: str,
@@ -343,6 +366,7 @@ class UserRequest:
         priority: int = 1,
         save_trace_dir: Optional[str] = None,
         ttft_timeout_s: Optional[float] = None,
+        encoded: Optional[list[int]] = None,
     ):
         """Build a UserRequest from a raw prompt, bypassing the chat template.
         Unlike ``from_request_params``, this does NOT call ``encode_dialog_prompt``
@@ -360,13 +384,9 @@ class UserRequest:
         ids (used verbatim, giving exact length control with no decode/encode
         round-trip drift).
         """
-        if isinstance(prompt, list):
-            prompt_tokens = list(prompt)
-        else:
-            # bos=False, eos=False: no special tokens injected. This differs
-            # from sglang's /v1/completions default (which adds special tokens)
-            # by design, for clean prompt-length control during benchmarking.
-            prompt_tokens = Backend.tokenizer.encode(prompt, bos=False, eos=False)
+        prompt_tokens = (
+            encoded if encoded is not None else UserRequest.encode_prompt_text(prompt)
+        )
         prompt_len = len(prompt_tokens)
 
         max_new_tokens = UserRequest.cap_max_new_tokens(max_new_tokens, prompt_len)

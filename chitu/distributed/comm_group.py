@@ -421,6 +421,23 @@ class CommGroup:
         # Bypass the function if we are using only 1 GPU.
         if self.group_size == 1:
             return input
+        # Equal per-rank sizes (the common CP/DP prefill case): gather straight
+        # into one contiguous buffer instead of a tensor list plus a full copy.
+        if (
+            input_size_per_rank is not None
+            and not isinstance(input_size_per_rank, torch.Tensor)
+            and all(int(n) == input.size(0) for n in input_size_per_rank)
+            and input.dim() == 2
+        ):
+            output = torch.empty(
+                (self.group_size * input.size(0), input.size(-1)),
+                dtype=input.dtype,
+                device=input.device,
+            )
+            torch.distributed.all_gather_into_tensor(
+                output, input.contiguous(), group=self.gpu_group
+            )
+            return output
         if input_size_per_rank is not None:
             output_tensor_list = [
                 torch.empty(

@@ -7,6 +7,8 @@ Unit tests for OpenAI-compatible API request parameter validation.
 Tests ChatRequest, TokenizeRequest, DetokenizeRequest models.
 """
 
+import asyncio
+
 import pytest
 from pydantic import ValidationError
 
@@ -495,18 +497,24 @@ class TestBuildUserRequestReasoningEffort:
         # Capture the RequestParams instead of constructing a real UserRequest.
         captured = {}
 
-        def _capture(params):
+        def _capture(params, **kwargs):
             captured["params"] = params
             return params
 
         monkeypatch.setattr(
             openai_api.UserRequest, "from_request_params", staticmethod(_capture)
         )
+        # Keep this parameter-wiring test independent of a real tokenizer.
+        monkeypatch.setattr(
+            openai_api.UserRequest,
+            "encode_request_params",
+            staticmethod(lambda params: ([1, 2, 3], None, None)),
+        )
 
         req = openai_api.ChatRequest(
             messages=[{"role": "user", "content": "hi"}], **chat_request_fields
         )
-        openai_api.build_user_request(req)
+        asyncio.run(openai_api.build_user_request(req))
         return captured["params"].chat_template_kwargs
 
     def test_no_reasoning_effort_absent_from_kwargs(self, monkeypatch):

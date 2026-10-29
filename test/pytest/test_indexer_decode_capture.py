@@ -73,6 +73,12 @@ def _delta(lens: torch.Tensor, mtp_size: int):
         is_classic_decoding=mtp_size == 1,
         batch_size=lens.shape[0],
         new=SimpleNamespace(lens_tensor_device=lens),
+        delta_seq_ids_tensor_device=torch.arange(
+            lens.shape[0], device=lens.device
+        ).repeat_interleave(mtp_size),
+        delta_position_ids_tensor_device=(
+            lens[:, None] - mtp_size + torch.arange(mtp_size, device=lens.device)
+        ).flatten(),
     )
 
 
@@ -84,11 +90,12 @@ def _indexer_kv(device, generator) -> torch.Tensor:
         .to(torch.float8_e4m3fn)
     )
     scales = torch.full((NUM_PAGES, BLOCK_KV), 0.5, dtype=torch.float32, device=device)
-    # `view(dtype)` only resizes the last dimension, so the scale bytes need
-    # their trailing dimension spelled out to line up with each K row.
-    scale_bytes = scales.view(torch.uint8).reshape(NUM_PAGES, BLOCK_KV, 4)
-    packed = torch.cat([data.view(torch.uint8), scale_bytes], dim=-1)
-    return packed.view(torch.float8_e4m3fn)
+    # Each page stores all K rows followed by all scales, matching the cache
+    # writer and DeepGEMM's paged kernel (not interleaved per-token records).
+    packed = torch.cat(
+        [data.view(torch.uint8).flatten(1), scales.view(torch.uint8)], dim=-1
+    )
+    return packed.view(torch.float8_e4m3fn).view(NUM_PAGES, BLOCK_KV, ROW_BYTES)
 
 
 def _one_step(indexer, tensors, lens: torch.Tensor):
@@ -127,12 +134,13 @@ def _set_lens(lens: torch.Tensor, values):
 def _assert_scores_match(actual, expected, lens, next_n):
     """Compare the columns the score kernel fills, i.e. below each context.
 
-    The score rows are one per (sequence, pending token), so a row's context
-    length is its sequence's, not the row's own index.
+    MTP > 2 expands each query into a separate sequence with its causal length.
     """
     for row in range(actual.shape[0]):
         sequence = row // next_n
         length = int(lens[sequence])
+        if next_n > 2:
+            length -= next_n - 1 - row % next_n
         assert torch.equal(actual[row, :length], expected[row, :length]), (
             f"query row {row} of sequence {sequence} differs below its context "
             f"length {length}"
@@ -140,7 +148,7 @@ def _assert_scores_match(actual, expected, lens, next_n):
 
 
 @gpu
-@pytest.mark.parametrize("mtp_size", [1, 2])
+@pytest.mark.parametrize("mtp_size", [1, 2, 4])
 def test_deepgemm_decode_prepare_survives_capture(mtp_size):
     pytest.importorskip("deep_gemm")
     if not deepgemm_backend.support_indexer_deepgemm:

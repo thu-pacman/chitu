@@ -1,5 +1,8 @@
+import asyncio
+import threading
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 import chitu.serve.anthropic_api as anthropic_api
@@ -149,15 +152,65 @@ def test_oversized_chat_prompt_returns_bad_request(monkeypatch):
     assert serve_common.min_batch_size == 1
 
 
-def test_internal_value_error_remains_server_error(monkeypatch):
+@pytest.mark.parametrize("completion", [False, True])
+def test_request_builder_offloads_tokenization(monkeypatch, completion):
+    create_client(monkeypatch, max_seq_len=64)
+    if completion:
+        request = openai_api.CompletionsRequest(
+            prompt="hello", max_tokens=16, ttft_timeout_s=2
+        )
+        builder = openai_api.build_completion_user_request
+        owner, method = api_server.Backend.tokenizer, "encode"
+    else:
+        request = openai_api.ChatRequest(
+            messages=[{"role": "user", "content": "hello"}],
+            max_completion_tokens=16,
+            ttft_timeout_s=2,
+        )
+        builder = openai_api.build_user_request
+        owner, method = api_server.Backend.formatter, "encode_dialog_prompt"
+
+    encode = getattr(owner, method)
+    event_loop_thread = threading.get_ident()
+
+    def encode_off_event_loop(*args, **kwargs):
+        assert threading.get_ident() != event_loop_thread
+        return encode(*args, **kwargs)
+
+    monkeypatch.setattr(owner, method, encode_off_event_loop)
+    construct = task.UserRequest.__post_init__
+
+    def construct_on_event_loop(user_req):
+        assert threading.get_ident() == event_loop_thread
+        construct(user_req)
+
+    monkeypatch.setattr(task.UserRequest, "__post_init__", construct_on_event_loop)
+    arrival_ts = 1.0
+    actual = asyncio.run(builder(request, arrival_ts=arrival_ts))
+    assert actual.prompt_tokens == [1, 2, 3, 4, 5]
+    assert actual.prompt_len == 5
+    assert actual.max_new_tokens == 16
+    assert actual.ttft_timeout_s == 2
+    assert actual.router_arrival_ts == arrival_ts
+
+
+@pytest.mark.parametrize("completion", [False, True])
+def test_internal_value_error_remains_server_error(monkeypatch, completion):
     client = create_client(monkeypatch)
 
-    def raise_internal_error(request, priority):
+    def raise_internal_error(*args):
         raise ValueError("internal failure")
 
-    monkeypatch.setattr(openai_api, "build_user_request", raise_internal_error)
-
-    response = post_chat_completion(client)
+    monkeypatch.setattr(
+        task.UserRequest,
+        "encode_prompt_text" if completion else "encode_request_params",
+        staticmethod(raise_internal_error),
+    )
+    response = (
+        client.post("/v1/completions", json={"prompt": "hello", "model": "test-model"})
+        if completion
+        else post_chat_completion(client)
+    )
 
     assert response.status_code == 500
     assert response.json() == {"detail": "internal failure"}
@@ -182,10 +235,10 @@ def test_broken_tool_call_history_is_replayed_in_completions_api(monkeypatch):
 
     real_build_user_request = openai_api.build_user_request
 
-    def build_with_static_stream(request, priority):
+    async def build_with_static_stream(request, priority, arrival_ts=None):
         # Run the real build so the repaired history reaches the formatter, then
         # give the handler a finished stream instead of a scheduled request.
-        user_req = real_build_user_request(request, priority)
+        user_req = await real_build_user_request(request, priority, arrival_ts)
         user_req.async_stream = StaticAsyncStream([("ok", False, (None, None))])
         user_req.finish_reason = "stop"
         return user_req
@@ -316,20 +369,6 @@ def test_oversized_completion_prompt_returns_bad_request(monkeypatch):
         "detail": "prompt length(5) cannot be greater than max_seq_len(4)"
     }
 
-
-def test_rejected_completion_does_not_change_min_batch_size(monkeypatch):
-    """A request rejected for length must not mutate the global.
-
-    set_min_batch_size() used to run before build_completion_user_request(),
-    so a request that was about to be rejected had already written to the
-    module-level serve_common.min_batch_size. handle_chat_completion builds
-    first; this asserts the same contract for the completions endpoint.
-    """
-    client = create_client(monkeypatch)
-
-    response = post_completion(client)
-
-    assert response.status_code == 400
     assert serve_common.min_batch_size == 1
 
 

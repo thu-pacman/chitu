@@ -313,11 +313,8 @@ def resolve_full_default_args(args):
 
         if args.infer.indexer_type == "auto":
             if use_fp8_dsa_indexer_kv(args):
-                if (
-                    support_indexer_deepgemm
-                    and args.infer.cache_type == "paged"
-                    and args.infer.mtp_size < 3
-                ):
+                if support_indexer_deepgemm and args.infer.cache_type == "paged":
+                    # DeepGEMMIndexer expands query rows for mtp_size > 2.
                     args.infer.indexer_type = "deepgemm"
                 elif has_native_fp8() and has_triton:
                     args.infer.indexer_type = "triton"
