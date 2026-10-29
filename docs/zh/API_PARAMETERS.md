@@ -187,7 +187,7 @@ OpenAI Responses API 的最小可用子集，用于文本生成、流式返回�
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `model` | `string` \| `null` | `null` | 模型标识符。省略时默认使用已加载模型，并支持配置的模型别名。 |
-| `input` | `string` \| `list[ResponsesMessageInputItem \| ResponsesFunctionCallInputItem \| ResponsesFunctionCallOutputInputItem \| ResponsesReasoningInputItem \| object]` \| `null` | `null` | 输入文本或 input item 列表。支持 message、function_call 和 function_call_output 等 item 类型。 |
+| `input` | `string` \| `list[ResponsesMessageInputItem \| ResponsesFunctionCallInputItem \| ResponsesFunctionCallOutputInputItem \| ResponsesCustomToolCallInputItem \| ResponsesCustomToolCallOutputInputItem \| ResponsesReasoningInputItem \| object]` \| `null` | `null` | 输入文本或 input item 列表。支持 message、function_call、function_call_output、custom_tool_call 和 custom_tool_call_output 等 item 类型。 |
 | `instructions` | `string` \| `null` | `null` | 插入到请求前的系统或开发者指令。 |
 | `max_output_tokens` | `integer` \| `null` | `null` | 最大生成 token 数。省略时使用服务端默认值。 |
 | `stream` | `boolean` | `false` | 是否使用 Responses 风格的 SSE 事件流返回响应。 |
@@ -196,8 +196,8 @@ OpenAI Responses API 的最小可用子集，用于文本生成、流式返回�
 | `top_p` | `number` \| `null` | `null` | 核采样阈值。省略时使用服务端默认值。 |
 | `text` | `ResponsesTextConfig` \| `null` | `null` | 文本输出配置，包括 text.format。 |
 | `reasoning` | `ResponsesReasoningConfig` \| `null` | `null` | 推理配置。reasoning.effort='none' 会关闭 thinking；其他值会视为开启。 |
-| `tools` | `list[object]` | `[]` | 函数工具，可按 namespace 分组。既支持 Responses 风格的扁平 function tool，也支持 Chat Completions 风格的嵌套 function tool。 |
-| `tool_choice` | `none` \| `auto` \| `required` \| `ToolChoiceNamedTool` | `"auto"` | 工具选择行为："auto"、"none"、"required"，或指定一个命名 function tool。 |
+| `tools` | `list[object]` | `[]` | 函数工具，可按 namespace 分组。function 声明中的 name、description 和 parameters 直接放在工具对象中。custom 工具包装为接收 input 字符串的函数；grammar 格式只作为提示，不强制约束。其他工具类型仅回显，不传给模型执行。namespace 内只有 function 可调用。 |
+| `tool_choice` | `none` \| `auto` \| `required` \| `ToolChoiceNamedTool` | `"auto"` | 工具选择行为："auto"、"none"、"required"，或指定一个命名 function/custom tool。 |
 | `parallel_tool_calls` | `boolean` | `true` | 模型是否可以并行发起多个工具调用。 |
 | `previous_response_id` | `string` \| `null` | `null` | 暂不支持。设置该字段的请求会被拒绝。 |
 | `store` | `boolean` | `false` | 为 true 时暂不支持。store=true 的请求会被拒绝。 |
@@ -255,6 +255,23 @@ OpenAI Responses API 的最小可用子集，用于文本生成、流式返回�
 | `call_id` | `string` | **必填** | 函数调用 ID。 |
 | `output` | `string` \| `list[string \| ResponsesInputTextBlock \| ResponsesInputImageBlock \| ResponsesInputFileBlock]` | `""` | 函数输出，可以是文本或内容块。 |
 
+#### `ResponsesCustomToolCallInputItem` 对象
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `type` | `custom_tool_call` | `"custom_tool_call"` | custom 工具调用输入项。 |
+| `call_id` | `string` | **必填** | 工具调用 ID。 |
+| `name` | `string` | **必填** | custom 工具名称。 |
+| `input` | `string` | **必填** | 自由文本形式的工具输入。 |
+
+#### `ResponsesCustomToolCallOutputInputItem` 对象
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `call_id` | `string` | **必填** | 工具调用 ID。 |
+| `output` | `string` \| `list[string \| ResponsesInputTextBlock \| ResponsesInputImageBlock \| ResponsesInputFileBlock]` | `""` | custom 工具输出，可为文本或内容块。 |
+| `type` | `custom_tool_call_output` | `"custom_tool_call_output"` | custom 工具调用结果输入项。 |
+
 #### `ResponsesReasoningInputItem` 对象
 
 | 参数 | 类型 | 默认值 | 说明 |
@@ -295,8 +312,8 @@ OpenAI Responses API 的最小可用子集，用于文本生成、流式返回�
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `type` | `function` | `"function"` | 命名 function tool 选择器类型。 |
-| `name` | `string` | **必填** | 要选择的 function tool 名称。 |
+| `type` | `function` \| `custom` | `"function"` | 命名 function 或 custom tool 选择器类型。 |
+| `name` | `string` | **必填** | 要选择的 function 或 custom tool 名称。 |
 | `namespace` | `string` \| `null` | `null` | 函数所属的命名空间。 |
 
 #### 当前限制
@@ -306,7 +323,7 @@ OpenAI Responses API 的最小可用子集，用于文本生成、流式返回�
 | `previous_response_id` | 返回 `400 invalid_request_error`。 |
 | `store=true` | 返回 `400 invalid_request_error`。 |
 | `conversation` | 返回 `400 invalid_request_error`。 |
-| OpenAI 内建工具（`web_search`、`file_search` 等） | 暂不支持。 |
+| OpenAI 内建工具 | 仅 function、namespace 内的 function 和包装为函数的 custom 工具可调用。其他工具类型仅回显，不传给模型执行。`tool_choice=required` 要求至少有一个可调用函数或 custom 工具。custom grammar 格式只作为提示，不强制约束。 |
 | 真正的多模态理解 | 暂不支持。 |
 
 通过单字符串 `serve.model_alias` 配置一个额外模型名，例如 `serve.model_alias=GLM-5.3`。`/v1/models` 列出实际模型名和可选别名，不重复列出同名项。生成接口接受这两个名称并原样回显；省略时使用 `models.name`。别名不改变权重加载。

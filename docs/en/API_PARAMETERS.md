@@ -187,7 +187,7 @@ Minimal subset of the OpenAI Responses API for text generation, streaming, funct
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `model` | `string` \| `null` | `null` | Model identifier. Defaults to the loaded model when omitted and supports configured model aliases. |
-| `input` | `string` \| `list[ResponsesMessageInputItem \| ResponsesFunctionCallInputItem \| ResponsesFunctionCallOutputInputItem \| ResponsesReasoningInputItem \| object]` \| `null` | `null` | Input text or input items. Supported item types include messages, function_call, and function_call_output. |
+| `input` | `string` \| `list[ResponsesMessageInputItem \| ResponsesFunctionCallInputItem \| ResponsesFunctionCallOutputInputItem \| ResponsesCustomToolCallInputItem \| ResponsesCustomToolCallOutputInputItem \| ResponsesReasoningInputItem \| object]` \| `null` | `null` | Input text or input items. Supported item types include messages, function_call, function_call_output, custom_tool_call, and custom_tool_call_output. |
 | `instructions` | `string` \| `null` | `null` | System or developer instructions prepended to the request. |
 | `max_output_tokens` | `integer` \| `null` | `null` | Maximum number of tokens to generate. Uses the server default when omitted. |
 | `stream` | `boolean` | `false` | Whether to stream the response using Responses-style SSE events. |
@@ -196,8 +196,8 @@ Minimal subset of the OpenAI Responses API for text generation, streaming, funct
 | `top_p` | `number` \| `null` | `null` | Nucleus sampling threshold. Uses the server default when omitted. |
 | `text` | `ResponsesTextConfig` \| `null` | `null` | Text output configuration, including text.format. |
 | `reasoning` | `ResponsesReasoningConfig` \| `null` | `null` | Reasoning configuration. reasoning.effort='none' disables thinking; other values are treated as enabled. |
-| `tools` | `list[object]` | `[]` | Function tools, optionally grouped in namespaces. Both Responses-style flat function tools and Chat Completions-style nested function tools are accepted. |
-| `tool_choice` | `none` \| `auto` \| `required` \| `ToolChoiceNamedTool` | `"auto"` | Tool choice behavior: "auto", "none", "required", or a named function tool. |
+| `tools` | `list[object]` | `[]` | Function tools, optionally grouped in namespaces. Function declarations place name, description, and parameters directly on the tool object. Custom tools are wrapped as functions taking a string input; grammar formats are prompt hints, not enforced constraints. Other tool types are echoed but excluded from model tools. Namespace members must be functions to be callable. |
+| `tool_choice` | `none` \| `auto` \| `required` \| `ToolChoiceNamedTool` | `"auto"` | Tool choice behavior: "auto", "none", "required", or a named function/custom tool. |
 | `parallel_tool_calls` | `boolean` | `true` | Whether the model can make multiple tool calls in parallel. |
 | `previous_response_id` | `string` \| `null` | `null` | Unsupported. Requests setting this field are rejected. |
 | `store` | `boolean` | `false` | Unsupported when true. Requests with store=true are rejected. |
@@ -255,6 +255,23 @@ Minimal subset of the OpenAI Responses API for text generation, streaming, funct
 | `call_id` | `string` | **required** | Function call identifier. |
 | `output` | `string` \| `list[string \| ResponsesInputTextBlock \| ResponsesInputImageBlock \| ResponsesInputFileBlock]` | `""` | Function output as text or content blocks. |
 
+#### `ResponsesCustomToolCallInputItem` Object
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `type` | `custom_tool_call` | `"custom_tool_call"` | Custom tool call input item. |
+| `call_id` | `string` | **required** | Tool call identifier. |
+| `name` | `string` | **required** | Custom tool name. |
+| `input` | `string` | **required** | Free-form tool input. |
+
+#### `ResponsesCustomToolCallOutputInputItem` Object
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `call_id` | `string` | **required** | Tool call identifier. |
+| `output` | `string` \| `list[string \| ResponsesInputTextBlock \| ResponsesInputImageBlock \| ResponsesInputFileBlock]` | `""` | Custom tool output as text or content blocks. |
+| `type` | `custom_tool_call_output` | `"custom_tool_call_output"` | Custom tool output input item. |
+
 #### `ResponsesReasoningInputItem` Object
 
 | Parameter | Type | Default | Description |
@@ -295,8 +312,8 @@ Minimal subset of the OpenAI Responses API for text generation, streaming, funct
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `type` | `function` | `"function"` | Named function tool selector type. |
-| `name` | `string` | **required** | Name of the function tool to select. |
+| `type` | `function` \| `custom` | `"function"` | Named function or custom tool selector type. |
+| `name` | `string` | **required** | Name of the function or custom tool to select. |
 | `namespace` | `string` \| `null` | `null` | Namespace containing the function. |
 
 #### Current Limitations
@@ -306,7 +323,7 @@ Minimal subset of the OpenAI Responses API for text generation, streaming, funct
 | `previous_response_id` | Rejected with `400 invalid_request_error`. |
 | `store=true` | Rejected with `400 invalid_request_error`. |
 | `conversation` | Rejected with `400 invalid_request_error`. |
-| Built-in OpenAI tools (`web_search`, `file_search`, etc.) | Not supported. |
+| Built-in OpenAI tools | Only functions, namespace functions, and custom tools wrapped as functions are callable. Other tool types are echoed but excluded from model tools. `tool_choice=required` requires a callable function or custom tool. Custom grammar formats are prompt hints, not enforced constraints. |
 | True multimodal understanding | Not supported. |
 
 Use `serve.model_alias` to configure one additional model name, for example `serve.model_alias=GLM-5.3`. `/v1/models` lists the loaded name and the optional alias without duplicates. Generation endpoints accept either name and echo it unchanged; omission uses `models.name`. The alias does not change loaded weights.

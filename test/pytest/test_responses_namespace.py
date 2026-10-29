@@ -67,8 +67,6 @@ def test_namespace_name_collisions_are_rejected(tools):
     [
         {"type": "namespace", "tools": []},
         {"type": "namespace", "name": "crm", "tools": {}},
-        namespace(child={"type": "custom", "name": "code"}),
-        namespace(child=namespace()),
         namespace(child="invalid"),
     ],
 )
@@ -340,3 +338,252 @@ def test_namespace_endpoint_returns_400_on_flattened_name_collision(client_and_p
     assert response.status_code == 400
     assert "conflicting tool name" in response.json()["error"]["message"]
     assert captured == []
+
+
+def _response_body_and_events(response, stream):
+    if not stream:
+        return response.json(), []
+    events = [
+        json.loads(line[6:])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert events[-1]["type"] == "response.completed"
+    return events[-1]["response"], events
+
+
+@pytest.mark.parametrize(
+    "search_type",
+    ["web_search", "web_search_preview", "file_search", "code_interpreter", "unknown"],
+)
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("choice", ["auto", "required"])
+def test_native_search_keeps_namespace_function_callable(
+    client_and_params, search_type, stream, choice
+):
+    client, captured = client_and_params
+    tools = [{"type": search_type, "external_web_access": False}, namespace()]
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": "Search",
+            "tools": tools,
+            "tool_choice": choice,
+            "stream": stream,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert len(captured[0].tools) == 1
+    assert captured[0].tools[0]["function"]["name"] == "crm__lookup"
+    assert captured[0].tool_config.choice == choice
+    body, events = _response_body_and_events(response, stream)
+    assert body["tools"] == tools
+    assert body["output"][0]["type"] == "function_call"
+    assert body["output"][0]["namespace"] == "crm"
+    assert body["output"][0]["name"] == "lookup"
+
+
+@pytest.mark.parametrize(
+    "search_type",
+    ["web_search", "web_search_preview", "file_search", "code_interpreter", "unknown"],
+)
+@pytest.mark.parametrize("stream", [False, True])
+def test_native_search_only_generates_text(
+    client_and_params, monkeypatch, search_type, stream
+):
+    client, captured = client_and_params
+
+    class TextStream:
+        tokens_len = 2
+        reasoning_tokens = 0
+        input_cached_tokens = 0
+
+        async def __aiter__(self):
+            yield "No search backend.", False, None
+
+    from_params = api.UserRequest.from_request_params
+
+    def text_request(params):
+        req = from_params(params)
+        req.tool_call_params = None
+        req.finish_reason = "stop"
+        req.async_stream = TextStream()
+        return req
+
+    monkeypatch.setattr(api.UserRequest, "from_request_params", text_request)
+    monkeypatch.setattr(
+        api, "_stream_source_for_response", lambda req: req.async_stream
+    )
+    monkeypatch.setattr(api, "REASONING_OUTPUT_STATES", set(), raising=False)
+    tools = [{"type": search_type}]
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": "Search",
+            "tools": tools,
+            "tool_choice": "auto",
+            "stream": stream,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert captured[0].tools == []
+    body, events = _response_body_and_events(response, stream)
+    if stream:
+        assert events[-1]["type"] == "response.completed"
+        assert not any("web_search" in event["type"] for event in events)
+    assert body["tools"] == tools
+    assert body["status"] == "completed"
+    assert body["output"][0]["type"] == "message"
+    assert body["output_text"] == "No search backend."
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        [],
+        [{"type": "web_search"}],
+        [{"type": "web_search_preview"}],
+        [{"type": "namespace", "name": "empty", "tools": []}],
+    ],
+)
+def test_required_rejects_no_callable_functions(client_and_params, tools):
+    client, captured = client_and_params
+    response = client.post(
+        "/v1/responses",
+        json={"input": "Search", "tools": tools, "tool_choice": "required"},
+    )
+    assert response.status_code == 400
+    assert "requires at least one callable function or custom" in response.text
+    assert not captured
+
+
+def test_named_native_search_is_not_supported(client_and_params):
+    client, captured = client_and_params
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": "Search",
+            "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "web_search"},
+        },
+    )
+    assert response.status_code in (400, 422)
+    assert not captured
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "choice", ["auto", "required", {"type": "custom", "name": "sql"}]
+)
+def test_custom_tool_roundtrip(client_and_params, monkeypatch, stream, choice):
+    client, captured = client_and_params
+    raw = 'SELECT "你好";\n'
+    wrapped = json.dumps({"input": raw}, ensure_ascii=False)
+
+    async def source(req):
+        for name, args in [
+            ("s", ""),
+            ("ql", ""),
+            ("", wrapped[:12]),
+            ("", wrapped[12:]),
+        ]:
+            yield ChoiceDelta(
+                tool_calls=[{"index": 0, "function": {"name": name, "arguments": args}}]
+            ), False, None
+
+    monkeypatch.setattr(api, "_stream_source_for_response", source)
+    tool = {
+        "type": "custom",
+        "name": "sql",
+        "description": "Run SQL",
+        "format": {"type": "text"},
+    }
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": "Query",
+            "tools": [tool],
+            "stream": stream,
+            "tool_choice": choice,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert captured[0].tools[0]["function"]["parameters"]["properties"] == {
+        "input": {"type": "string"}
+    }
+    body, events = _response_body_and_events(response, stream)
+    if stream:
+        assert not any("function_call_arguments" in e["type"] for e in events)
+        assert (
+            "".join(
+                e["delta"]
+                for e in events
+                if e["type"] == "response.custom_tool_call_input.delta"
+            )
+            == raw
+        )
+        assert (
+            next(
+                e for e in events if e["type"] == "response.custom_tool_call_input.done"
+            )["input"]
+            == raw
+        )
+        assert (
+            next(e for e in events if e["type"] == "response.output_item.added")[
+                "item"
+            ]["input"]
+            == ""
+        )
+    item = body["output"][0]
+    assert item["type"] == "custom_tool_call"
+    assert item["input"] == raw
+    assert "arguments" not in item
+    assert body["tools"] == [tool]
+    followup = client.post(
+        "/v1/responses",
+        json={
+            "input": [
+                item,
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": item["call_id"],
+                    "output": "ok",
+                },
+            ],
+            "tools": [tool],
+        },
+    )
+    assert followup.status_code == 200, followup.text
+    history = captured[-1].messages
+    assert json.loads(history[0]["tool_calls"][0]["function"]["arguments"]) == {
+        "input": raw
+    }
+    assert history[1]["content"] == "ok"
+
+
+def test_namespace_filters_non_function_members():
+    group = namespace()
+    group["tools"] += [{"type": "custom", "name": "raw"}, {"type": "file_search"}]
+    internal, public, names = api.normalize_response_tools([group])
+    assert len(internal) == 1
+    assert list(names) == ["crm__lookup"]
+    assert public == [group]
+
+
+@pytest.mark.parametrize(
+    "nested",
+    [
+        {"type": "function", "function": {"name": "lookup"}},
+        {"function": {"name": "lookup"}},
+        {"type": "function", "name": "lookup", "function": {"name": "different"}},
+    ],
+)
+@pytest.mark.parametrize("in_namespace", [False, True])
+def test_responses_rejects_nested_function_declarations(
+    client_and_params, nested, in_namespace
+):
+    client, captured = client_and_params
+    tool = namespace(child=nested) if in_namespace else nested
+    response = client.post("/v1/responses", json={"input": "hi", "tools": [tool]})
+    assert response.status_code == 400, response.text
+    assert not captured

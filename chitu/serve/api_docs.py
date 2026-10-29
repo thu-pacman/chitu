@@ -118,12 +118,12 @@ ENDPOINT_EXTRA_SECTIONS = {
                 },
                 {
                     "en": [
-                        "Built-in OpenAI tools (`web_search`, `file_search`, etc.)",
-                        "Not supported.",
+                        "Built-in OpenAI tools",
+                        "Only functions, namespace functions, and custom tools wrapped as functions are callable. Other tool types are echoed but excluded from model tools. `tool_choice=required` requires a callable function or custom tool. Custom grammar formats are prompt hints, not enforced constraints.",
                     ],
                     "zh": [
-                        "OpenAI 内建工具（`web_search`、`file_search` 等）",
-                        "暂不支持。",
+                        "OpenAI 内建工具",
+                        "仅 function、namespace 内的 function 和包装为函数的 custom 工具可调用。其他工具类型仅回显，不传给模型执行。`tool_choice=required` 要求至少有一个可调用函数或 custom 工具。custom grammar 格式只作为提示，不强制约束。",
                     ],
                 },
                 {

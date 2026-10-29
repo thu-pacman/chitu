@@ -119,13 +119,14 @@ class ResponsesTextConfig(BaseModel):
 
 
 class ToolChoiceNamedTool(BaseModel):
-    type: Literal["function"] = DocField(
+    type: Literal["function", "custom"] = DocField(
         "function",
-        en="Named function tool selector type.",
-        zh="命名 function tool 选择器类型。",
+        en="Named function or custom tool selector type.",
+        zh="命名 function 或 custom tool 选择器类型。",
     )
     name: str = DocField(
-        en="Name of the function tool to select.", zh="要选择的 function tool 名称。"
+        en="Name of the function or custom tool to select.",
+        zh="要选择的 function 或 custom tool 名称。",
     )
     namespace: str | None = DocField(
         None, en="Namespace containing the function.", zh="函数所属的命名空间。"
@@ -228,6 +229,35 @@ class ResponsesFunctionCallOutputInputItem(BaseModel):
     )
 
 
+class ResponsesCustomToolCallInputItem(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["custom_tool_call"] = DocField(
+        "custom_tool_call",
+        en="Custom tool call input item.",
+        zh="custom 工具调用输入项。",
+    )
+    call_id: str = DocField(en="Tool call identifier.", zh="工具调用 ID。")
+    name: str = DocField(en="Custom tool name.", zh="custom 工具名称。")
+    input: str = DocField(en="Free-form tool input.", zh="自由文本形式的工具输入。")
+
+
+class ResponsesCustomToolCallOutputInputItem(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    call_id: str = DocField(en="Tool call identifier.", zh="工具调用 ID。")
+    output: str | list[str | ResponsesInputContentBlock] = DocField(
+        "",
+        en="Custom tool output as text or content blocks.",
+        zh="custom 工具输出，可为文本或内容块。",
+    )
+    type: Literal["custom_tool_call_output"] = DocField(
+        "custom_tool_call_output",
+        en="Custom tool output input item.",
+        zh="custom 工具调用结果输入项。",
+    )
+
+
 class ResponsesReasoningInputItem(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -242,6 +272,8 @@ ResponsesInputItem = Annotated[
     ResponsesMessageInputItem
     | ResponsesFunctionCallInputItem
     | ResponsesFunctionCallOutputInputItem
+    | ResponsesCustomToolCallInputItem
+    | ResponsesCustomToolCallOutputInputItem
     | ResponsesReasoningInputItem,
     Field(discriminator="type"),
 ]
@@ -254,8 +286,7 @@ def _model_to_dict(value):
 
 
 class ResponsesCreateRequest(BaseModel):
-    """
-    Minimal subset of OpenAI Responses API.
+    """Minimal subset of OpenAI Responses API.
 
     Unknown fields are accepted to stay compatible with current SDKs, but most of
     them are ignored unless explicitly handled below.
@@ -269,8 +300,8 @@ class ResponsesCreateRequest(BaseModel):
     )
     input: str | list[ResponsesInputItem | dict[str, Any]] | None = DocField(
         None,
-        en="Input text or input items. Supported item types include messages, function_call, and function_call_output.",
-        zh="输入文本或 input item 列表。支持 message、function_call 和 function_call_output 等 item 类型。",
+        en="Input text or input items. Supported item types include messages, function_call, function_call_output, custom_tool_call, and custom_tool_call_output.",
+        zh="输入文本或 input item 列表。支持 message、function_call、function_call_output、custom_tool_call 和 custom_tool_call_output 等 item 类型。",
     )
     instructions: Optional[str] = DocField(
         None,
@@ -314,13 +345,13 @@ class ResponsesCreateRequest(BaseModel):
     )
     tools: list[dict[str, Any]] = DocField(
         default_factory=list,
-        en="Function tools, optionally grouped in namespaces. Both Responses-style flat function tools and Chat Completions-style nested function tools are accepted.",
-        zh="函数工具，可按 namespace 分组。既支持 Responses 风格的扁平 function tool，也支持 Chat Completions 风格的嵌套 function tool。",
+        en="Function tools, optionally grouped in namespaces. Function declarations place name, description, and parameters directly on the tool object. Custom tools are wrapped as functions taking a string input; grammar formats are prompt hints, not enforced constraints. Other tool types are echoed but excluded from model tools. Namespace members must be functions to be callable.",
+        zh="函数工具，可按 namespace 分组。function 声明中的 name、description 和 parameters 直接放在工具对象中。custom 工具包装为接收 input 字符串的函数；grammar 格式只作为提示，不强制约束。其他工具类型仅回显，不传给模型执行。namespace 内只有 function 可调用。",
     )
     tool_choice: Literal["none", "auto", "required"] | ToolChoiceNamedTool = DocField(
         "auto",
-        en='Tool choice behavior: "auto", "none", "required", or a named function tool.',
-        zh='工具选择行为："auto"、"none"、"required"，或指定一个命名 function tool。',
+        en='Tool choice behavior: "auto", "none", "required", or a named function/custom tool.',
+        zh='工具选择行为："auto"、"none"、"required"，或指定一个命名 function/custom tool。',
     )
     parallel_tool_calls: bool = DocField(
         True,
@@ -449,95 +480,183 @@ def _internal_tool_name(name: str, namespace: str | None = None) -> str:
     return f"{namespace}__{name}"
 
 
+def _normalize_function_tool(tool: Any) -> dict[str, Any]:
+    """Validate a flat Responses function declaration and return its public form.
+
+    Reject nested function declarations, non-function types, invalid names,
+    and non-string descriptions. Fill defaults for description and parameters,
+    and preserve strict when supplied; parameter schemas are not validated here.
+
+    This function does not mutate the input or register model tools. The caller
+    uses the returned declaration for response echoing and model-tool registration.
+    """
+    if not isinstance(tool, dict):
+        raise ValueError("Each tool must be an object")
+    if "function" in tool:
+        raise ValueError(
+            "Responses function tools must use flat fields, not a nested function object"
+        )
+    if tool.get("type") != "function":
+        raise ValueError(f"Unsupported tool type: {tool.get('type')}")
+    name = tool.get("name", "")
+    description = tool.get("description")
+    if description is None:
+        description = ""
+    parameters = tool.get("parameters") or {}
+    strict = tool.get("strict")
+
+    _internal_tool_name(name)
+    if not isinstance(description, str):
+        raise ValueError("Tool description must be a string")
+    public_tool = {
+        "type": "function",
+        "name": name,
+        "description": description,
+        "parameters": parameters,
+    }
+    if strict is not None:
+        public_tool["strict"] = strict
+    return public_tool
+
+
+def _custom_tool_as_function(tool: dict[str, Any]) -> dict[str, Any]:
+    """Validate a custom declaration and convert it to a function declaration.
+
+    The model backend accepts JSON function arguments, so free-form input is
+    wrapped in a string field. Response serialization unwraps it for the client.
+    """
+    description = tool.get("description")
+    if description is None:
+        description = ""
+    if not isinstance(description, str):
+        raise ValueError("Tool description must be a string")
+    format_spec = tool.get("format")
+    if format_spec is not None:
+        if not isinstance(format_spec, dict) or format_spec.get("type") not in {
+            "text",
+            "grammar",
+        }:
+            raise ValueError("Custom tool format must be text or grammar")
+        if format_spec["type"] == "grammar":
+            if format_spec.get("syntax") not in {
+                "lark",
+                "regex",
+            } or not isinstance(format_spec.get("definition"), str):
+                raise ValueError("Custom tool grammar requires syntax and definition")
+            description += "\nInput format (not enforced by the server): " + json.dumps(
+                format_spec, ensure_ascii=False
+            )
+    name = tool.get("name", "")
+    return _normalize_function_tool(
+        {
+            "type": "function",
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {"input": {"type": "string"}},
+                "required": ["input"],
+                "additionalProperties": False,
+            },
+        }
+    )
+
+
 def normalize_response_tools(
     tools: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], ResponseToolNames]:
+    """Return model tools, response declarations, and model-to-public call identities.
+
+    Response declarations include ignored tools. Only registered tools are exposed
+    to the model and included in the call identity map.
+    """
     internal_tools: list[dict[str, Any]] = []
     public_tools: list[dict[str, Any]] = []
     tool_names: ResponseToolNames = {}
 
-    def add_function(
-        tool: Any,
+    def register_function(
+        function: dict[str, Any],
         namespace: str | None = None,
         namespace_description: str = "",
-    ) -> dict[str, Any]:
-        if not isinstance(tool, dict):
-            raise ValueError("Each tool must be an object")
-        if "function" in tool:
-            fn = tool["function"]
-            if not isinstance(fn, dict):
-                raise ValueError("Tool function must be an object")
-            tool_type = tool.get("type")
-            if tool_type not in {None, "function"}:
-                raise ValueError(f"Unsupported tool type: {tool_type}")
-            name = fn.get("name", "")
-            description = fn.get("description") or ""
-            parameters = fn.get("parameters") or {}
-            strict = tool.get("strict", fn.get("strict"))
-        else:
-            tool_type = tool.get("type")
-            if tool_type != "function":
-                raise ValueError(f"Unsupported tool type: {tool_type}")
-            name = tool.get("name", "")
-            description = tool.get("description") or ""
-            parameters = tool.get("parameters") or {}
-            strict = tool.get("strict")
-
+        *,
+        custom: bool = False,
+    ) -> None:
+        """Register a normalized function and its public call identity."""
+        # Namespace flattening can collide with top-level names. Check the shared
+        # registry before adding a function to the model's tool list.
+        name = function["name"]
         internal_name = _internal_tool_name(name, namespace)
-        if not isinstance(description, str):
-            raise ValueError("Tool description must be a string")
         if internal_name in tool_names:
             raise ValueError(f"Duplicate or conflicting tool name: {internal_name}")
-        tool_names[internal_name] = {"name": name}
+        identity = {"name": name}
         if namespace is not None:
-            tool_names[internal_name]["namespace"] = namespace
-        internal_description = "\n".join(
-            part for part in (namespace_description, description) if part
-        )
-
+            identity["namespace"] = namespace
+        if custom:
+            identity["type"] = "custom"
+        tool_names[internal_name] = identity
         internal_tools.append(
             {
                 "type": "function",
                 "function": {
                     "name": internal_name,
-                    "description": internal_description,
-                    "parameters": parameters,
+                    "description": "\n".join(
+                        part
+                        for part in (namespace_description, function["description"])
+                        if part
+                    ),
+                    "parameters": function["parameters"],
                 },
             }
         )
-        public_tool = {
-            "type": "function",
-            "name": name,
-            "description": description,
-            "parameters": parameters,
-        }
-        if strict is not None:
-            public_tool["strict"] = strict
-        return public_tool
 
     for tool in tools:
-        if tool.get("type") != "namespace":
-            public_tools.append(add_function(tool))
-            continue
-        namespace = tool.get("name")
-        if not isinstance(namespace, str) or not namespace:
-            raise ValueError("Namespace name is required")
-        children = tool.get("tools")
-        if not isinstance(children, list):
-            raise ValueError("Namespace tools must be an array")
-        description = tool.get("description") or ""
-        if not isinstance(description, str):
-            raise ValueError("Namespace description must be a string")
-        public_tools.append(
-            {
-                "type": "namespace",
-                "name": namespace,
-                "description": description,
-                "tools": [
-                    add_function(child, namespace, description) for child in children
-                ],
-            }
-        )
+        tool_type = tool.get("type")
+        if not isinstance(tool_type, str) or not tool_type:
+            raise ValueError("Tool type must be a non-empty string")
+        if tool_type == "function":
+            function = _normalize_function_tool(tool)
+            register_function(function)
+            public_tools.append(function)
+        elif tool_type == "custom":
+            register_function(_custom_tool_as_function(tool), custom=True)
+            public_tools.append(dict(tool))
+        elif tool_type == "namespace":
+            namespace = tool.get("name")
+            if not isinstance(namespace, str) or not namespace:
+                raise ValueError("Namespace name is required")
+            children = tool.get("tools")
+            if not isinstance(children, list):
+                raise ValueError("Namespace tools must be an array")
+            description = tool.get("description")
+            if description is None:
+                description = ""
+            if not isinstance(description, str):
+                raise ValueError("Namespace description must be a string")
+            public_children = []
+            for child in children:
+                if (
+                    not isinstance(child, dict)
+                    or not isinstance(child.get("type"), str)
+                    or not child["type"]
+                ):
+                    raise ValueError("Namespace tools must be objects with a tool type")
+                if child["type"] == "function":
+                    function = _normalize_function_tool(child)
+                    register_function(function, namespace, description)
+                    public_children.append(function)
+                else:
+                    public_children.append(dict(child))
+            public_tools.append(
+                {
+                    "type": "namespace",
+                    "name": namespace,
+                    "description": description,
+                    "tools": public_children,
+                }
+            )
+        else:
+            # Echo declarations without registering them as callable functions.
+            public_tools.append(dict(tool))
     return internal_tools, public_tools, tool_names
 
 
@@ -590,12 +709,18 @@ def responses_input_to_internal(
             raise ValueError("Each input item must be an object")
 
         item_type = item.get("type")
-        if item_type == "function_call":
+        if item_type in {"function_call", "custom_tool_call"}:
             call_id = item.get("call_id")
             name = item.get("name")
             if not call_id or not name:
-                raise ValueError("function_call requires call_id and name")
-            arguments = item.get("arguments", "")
+                raise ValueError(f"{item_type} requires call_id and name")
+            if item_type == "custom_tool_call":
+                custom_input = item.get("input")
+                if not isinstance(custom_input, str):
+                    raise ValueError("custom_tool_call.input must be a string")
+                arguments = json.dumps({"input": custom_input}, ensure_ascii=False)
+            else:
+                arguments = item.get("arguments", "")
             if isinstance(arguments, dict):
                 # Some clients send arguments as a JSON object; serialize it
                 # instead of Python-repr'ing it (str() would produce single
@@ -620,10 +745,10 @@ def responses_input_to_internal(
 
         flush_tool_calls()
 
-        if item_type == "function_call_output":
+        if item_type in {"function_call_output", "custom_tool_call_output"}:
             call_id = item.get("call_id")
             if not call_id:
-                raise ValueError("function_call_output requires call_id")
+                raise ValueError(f"{item_type} requires call_id")
             output = item.get("output", "")
             if isinstance(output, str):
                 output_text = output
@@ -719,7 +844,7 @@ def _make_message_item(item_id: str, text: str) -> dict[str, Any]:
     }
 
 
-def _make_function_call_item(
+def _make_tool_call_item(
     *,
     item_id: str,
     call_id: str,
@@ -727,6 +852,23 @@ def _make_function_call_item(
     arguments: str,
     tool_names: ResponseToolNames | None = None,
 ) -> dict[str, Any]:
+    identity = (tool_names or {}).get(name, {"name": name})
+    if identity.get("type") == "custom":
+        custom_input = arguments
+        try:
+            decoded = json.loads(arguments)
+            if isinstance(decoded, dict) and isinstance(decoded.get("input"), str):
+                custom_input = decoded["input"]
+        except ValueError:
+            pass
+        return {
+            "id": item_id,
+            "type": "custom_tool_call",
+            "call_id": call_id,
+            "name": identity["name"],
+            "input": custom_input,
+            "status": "completed",
+        }
     return {
         "id": item_id,
         "type": "function_call",
@@ -925,7 +1067,7 @@ def _build_message_item_done_events(
     ]
 
 
-def _build_function_call_started_event(
+def _build_tool_call_started_event(
     *,
     emit: Callable[[str, dict[str, Any]], str],
     item_id: str,
@@ -934,7 +1076,7 @@ def _build_function_call_started_event(
     output_index: int,
     tool_names: ResponseToolNames | None = None,
 ) -> str:
-    item = _make_function_call_item(
+    item = _make_tool_call_item(
         item_id=item_id, call_id=call_id, name=name, arguments="", tool_names=tool_names
     )
     item["status"] = "in_progress"
@@ -948,24 +1090,46 @@ def _build_function_call_started_event(
     )
 
 
-def _build_function_call_done_events(
+def _build_tool_call_done_events(
     *,
     emit: Callable[[str, dict[str, Any]], str],
-    function_item: dict[str, Any],
+    tool_item: dict[str, Any],
     output_index: int,
 ) -> list[str]:
+    if tool_item["type"] == "custom_tool_call":
+        return [
+            emit(
+                "response.custom_tool_call_input." + suffix,
+                {
+                    "type": "response.custom_tool_call_input." + suffix,
+                    "item_id": tool_item["id"],
+                    "output_index": output_index,
+                    key: tool_item["input"],
+                },
+            )
+            for suffix, key in [("delta", "delta"), ("done", "input")]
+        ] + [
+            emit(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": tool_item,
+                },
+            )
+        ]
     return [
         emit(
             "response.function_call_arguments.done",
             {
                 "type": "response.function_call_arguments.done",
-                "item_id": function_item["id"],
+                "item_id": tool_item["id"],
                 "output_index": output_index,
-                "arguments": function_item["arguments"],
-                "name": function_item["name"],
+                "arguments": tool_item["arguments"],
+                "name": tool_item["name"],
                 **(
-                    {"namespace": function_item["namespace"]}
-                    if "namespace" in function_item
+                    {"namespace": tool_item["namespace"]}
+                    if "namespace" in tool_item
                     else {}
                 ),
             },
@@ -975,7 +1139,7 @@ def _build_function_call_done_events(
             {
                 "type": "response.output_item.done",
                 "output_index": output_index,
-                "item": function_item,
+                "item": tool_item,
             },
         ),
     ]
@@ -1014,7 +1178,7 @@ async def collect_response_output(
         buf = tool_buffers[index]
         call_id = buf["id"] or f"call_{gen_req_id()}"
         output_items.append(
-            _make_function_call_item(
+            _make_tool_call_item(
                 item_id=f"fc_{call_id}",
                 call_id=call_id,
                 name=buf["name"],
@@ -1104,7 +1268,7 @@ async def responses_stream_from_async_stream(
     async for data, state, _extra in stream:
         if not data:
             continue
-        if public_tools and isinstance(data, ChoiceDelta):
+        if tool_names and isinstance(data, ChoiceDelta):
             if data.content:
                 if not text_started:
                     text_started = True
@@ -1136,7 +1300,7 @@ async def responses_stream_from_async_stream(
                 # exposing the tool identity, then flush any buffered arguments.
                 if not buf["started"] and (not tool_names or argument_delta):
                     buf["started"] = "1"
-                    yield _build_function_call_started_event(
+                    yield _build_tool_call_started_event(
                         emit=emit,
                         item_id=item_id,
                         call_id=call_id,
@@ -1145,7 +1309,12 @@ async def responses_stream_from_async_stream(
                         tool_names=tool_names,
                     )
                     argument_delta = buf["arguments"]
-                if buf["started"] and argument_delta:
+                # The JSON wrapper may split inside an escape sequence. Buffer it
+                # until completion before emitting the decoded custom input.
+                is_custom = (tool_names or {}).get(buf["name"], {}).get(
+                    "type"
+                ) == "custom"
+                if buf["started"] and argument_delta and not is_custom:
                     yield emit(
                         "response.function_call_arguments.delta",
                         {
@@ -1196,7 +1365,7 @@ async def responses_stream_from_async_stream(
         call_id = buf["id"] or f"call_{gen_req_id()}"
         output_index = index + (1 if text_started else 0)
         if not buf["started"]:
-            yield _build_function_call_started_event(
+            yield _build_tool_call_started_event(
                 emit=emit,
                 item_id=f"fc_{call_id}",
                 call_id=call_id,
@@ -1204,19 +1373,19 @@ async def responses_stream_from_async_stream(
                 output_index=output_index,
                 tool_names=tool_names,
             )
-        function_item = _make_function_call_item(
+        tool_item = _make_tool_call_item(
             item_id=f"fc_{call_id}",
             call_id=call_id,
             name=buf["name"],
             arguments=buf["arguments"],
             tool_names=tool_names,
         )
-        function_item["status"] = status
-        for event in _build_function_call_done_events(
-            emit=emit, function_item=function_item, output_index=output_index
+        tool_item["status"] = status
+        for event in _build_tool_call_done_events(
+            emit=emit, tool_item=tool_item, output_index=output_index
         ):
             yield event
-        output_items.append(function_item)
+        output_items.append(tool_item)
 
     response = build_responses_response(
         created_at=created_at,
@@ -1244,6 +1413,10 @@ async def handle_responses_request(
         internal_tools, public_tools, tool_names = normalize_response_tools(
             request.tools
         )
+        if request.tool_choice == "required" and not internal_tools:
+            raise ValueError(
+                "tool_choice=required requires at least one callable function or custom tool"
+            )
         if isinstance(request.tool_choice, ToolChoiceNamedTool):
             selected_name = _internal_tool_name(
                 request.tool_choice.name, request.tool_choice.namespace
@@ -1251,8 +1424,15 @@ async def handle_responses_request(
             selected_identity = request.tool_choice.model_dump(
                 exclude={"type"}, exclude_none=True
             )
-            if tool_names.get(selected_name) != selected_identity:
-                raise ValueError("tool_choice must select a defined function tool")
+            actual_identity = dict(tool_names.get(selected_name, {}))
+            actual_type = actual_identity.pop("type", "function")
+            if (
+                actual_identity != selected_identity
+                or actual_type != request.tool_choice.type
+            ):
+                raise ValueError(
+                    "tool_choice must select a defined function or custom tool"
+                )
             tool_config = ToolConfig(
                 "required",
                 not request.parallel_tool_calls,
@@ -1307,9 +1487,21 @@ async def handle_responses_request(
         enable_thinking, reasoning_effort_from_request(request)
     )
 
+    request_id = gen_req_id()
+    ignored_types = [
+        tool.get("type")
+        for tool in request.tools
+        if tool.get("type") not in {"function", "namespace", "custom"}
+    ]
+    if ignored_types:
+        logger.warning(
+            "Request %s: excluding non-callable tool declarations %s from model tools",
+            request_id,
+            ignored_types,
+        )
     req_params = RequestParams(
         messages=internal_messages,
-        request_id=gen_req_id(),
+        request_id=request_id,
         tools=internal_tools,
         tool_config=tool_config,
         logprobs=False,
