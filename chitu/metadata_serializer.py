@@ -330,6 +330,16 @@ class MetadataSerializer:
 
                 # 新任务（首次传输）相关字段
                 if is_new_task:
+                    if task.initial_output_tokens:
+                        if config.include_tokens:
+                            # History is already in tokens; only send its length.
+                            task_data["initial_output_len"] = len(
+                                task.initial_output_tokens
+                            )
+                        else:
+                            task_data["initial_output_tokens"] = (
+                                task.initial_output_tokens
+                            )
                     # 只在新任务时传输 tokens
                     if config.include_tokens:
                         task_data["tokens"] = list(task.prefix_tokens)
@@ -536,6 +546,12 @@ class MetadataSerializer:
             task_data.get("response_format_params")
         )
         prompt_len = task_data.get("prompt_len")
+        initial_output_tokens = task_data.get("initial_output_tokens")
+        if "initial_output_len" in task_data:
+            prefix_len = prompt_len if prompt_len is not None else len(tokens)
+            initial_output_tokens = tokens[
+                prefix_len - task_data["initial_output_len"] : prefix_len
+            ]
         task = Task(
             task_id=task_id,
             req=None,
@@ -544,6 +560,7 @@ class MetadataSerializer:
             tool_call_params=tool_call_params,
             response_format_params=response_format_params,
             prompt_len=prompt_len,
+            initial_output_tokens=initial_output_tokens,
         )
         task.return_logprobs = task_data.get("return_logprobs")
         task._test_flag = task_data.get("_test_flag")
