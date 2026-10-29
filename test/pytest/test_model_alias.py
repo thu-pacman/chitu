@@ -1,6 +1,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -79,7 +80,7 @@ def test_openai_response_uses_resolved_name(
 
     monkeypatch.setattr(openai_api, "submit_request", submit)
     builder = "build_completion_user_request" if completion else "build_user_request"
-    monkeypatch.setattr(openai_api, builder, lambda *_: fake_request())
+    monkeypatch.setattr(openai_api, builder, AsyncMock(return_value=fake_request()))
     request = (
         openai_api.CompletionsRequest(prompt="hi", model=name, stream=stream)
         if completion

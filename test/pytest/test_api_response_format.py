@@ -4,6 +4,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -197,9 +198,9 @@ def test_chat_http_creation_time_and_model(monkeypatch):
             serve=SimpleNamespace(model_alias=None),
         ),
     )
-    monkeypatch.setattr(chat, "build_user_request", lambda *args: req)
+    monkeypatch.setattr(chat, "build_user_request", AsyncMock(return_value=req))
     monkeypatch.setattr(chat, "set_min_batch_size", lambda *args: None)
-    clock = SimpleNamespace(time=lambda: 100)
+    clock = SimpleNamespace(time=lambda: 100, monotonic=lambda: 100)
     monkeypatch.setattr(chat, "time", clock)
 
     async def submit(req):

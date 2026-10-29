@@ -30,6 +30,7 @@ if not DOC_GENERATION:
         submit_request,
         build_chat_template_kwargs,
     )
+    from chitu.metrics.prometheus_collector import observe_router_stage
     from chitu.sampling.utils import validate_response_format_grammar
     from chitu.serve.abort import (
         run_with_client_abort,
@@ -644,7 +645,12 @@ def _response_format_error(message: str, status_code: int = 400) -> JSONResponse
     )
 
 
-def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
+async def build_user_request(
+    req: ChatRequest, priority: int = 1, arrival_ts: float | None = None
+) -> UserRequest:
+    """Build a request with prompt encoding off the event loop."""
+    if arrival_ts is None:
+        arrival_ts = time.monotonic()
     # enable_thinking / max_new_tokens / chat_template_kwargs
     args = get_global_args()
     max_new_tokens = (
@@ -689,7 +695,14 @@ def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
         stop_with_eos=req.stop_with_eos,
         ttft_timeout_s=ttft_timeout_s,
     )
-    return UserRequest.from_request_params(req_params)
+    params_done_ts = time.monotonic()
+    encoded = await asyncio.to_thread(UserRequest.encode_request_params, req_params)
+    tokenize_done_ts = time.monotonic()
+    user_req = UserRequest.from_request_params(req_params, encoded=encoded)
+    user_req.router_arrival_ts = arrival_ts
+    observe_router_stage("req_received", params_done_ts - arrival_ts)
+    observe_router_stage("tokenize", tokenize_done_ts - params_done_ts)
+    return user_req
 
 
 def _model_not_found_error(error: ValueError) -> JSONResponse:
@@ -712,6 +725,7 @@ async def handle_chat_completion(
     http_request: Optional[Any] = None,
 ):
 
+    arrival_ts = time.monotonic()
     args = get_global_args()
     created = int(time.time())
     try:
@@ -729,7 +743,7 @@ async def handle_chat_completion(
             "constraint can be enforced per request"
         )
     try:
-        user_req = build_user_request(request, priority)
+        user_req = await build_user_request(request, priority, arrival_ts)
     except (PromptTooLongError, InvalidToolCallArgumentsError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if user_req.response_format_params is not None:
@@ -984,15 +998,21 @@ class CompletionAsyncResponse:
         return full_response
 
 
-def build_completion_user_request(
-    req: CompletionsRequest, priority: int = 1
+async def build_completion_user_request(
+    req: CompletionsRequest, priority: int = 1, arrival_ts: float | None = None
 ) -> UserRequest:
+    """Build a completion request with prompt encoding off the event loop."""
+    if arrival_ts is None:
+        arrival_ts = time.monotonic()
     args = get_global_args()
     max_new_tokens = (
         req.max_tokens if req.max_tokens is not None else args.infer.max_seq_len
     )
     ttft_timeout_s = req.extra_body.get("ttft_timeout_s", req.ttft_timeout_s)
-    return UserRequest.from_prompt_text(
+    params_done_ts = time.monotonic()
+    encoded = await asyncio.to_thread(UserRequest.encode_prompt_text, req.prompt)
+    tokenize_done_ts = time.monotonic()
+    user_req = UserRequest.from_prompt_text(
         req.prompt,
         req.conversation_id,
         max_new_tokens=max_new_tokens,
@@ -1004,7 +1024,13 @@ def build_completion_user_request(
         priority=priority,
         save_trace_dir=args.debug.save_trace_dir,
         ttft_timeout_s=ttft_timeout_s,
+        encoded=encoded,
     )
+
+    user_req.router_arrival_ts = arrival_ts
+    observe_router_stage("req_received", params_done_ts - arrival_ts)
+    observe_router_stage("tokenize", tokenize_done_ts - params_done_ts)
+    return user_req
 
 
 async def handle_completion(
@@ -1014,13 +1040,14 @@ async def handle_completion(
 ):
     """openai text-completions endpoint (raw prompt, no chat template)."""
 
+    arrival_ts = time.monotonic()
     args = get_global_args()
     try:
         response_model = resolve_model_name(request.model, args)
     except ValueError as e:
         return _model_not_found_error(e)
     try:
-        user_req = build_completion_user_request(request, priority)
+        user_req = await build_completion_user_request(request, priority, arrival_ts)
     except PromptTooLongError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     set_min_batch_size(request.min_batch_size)
