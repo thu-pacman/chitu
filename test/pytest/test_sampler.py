@@ -99,7 +99,8 @@ def _sparse_from_full(full, K=50):
 @pytest.fixture(autouse=True)
 def _set_mtp_size(monkeypatch, global_args):
     """Reset mtp_size to 1 for each test; individual tests override as needed."""
-    monkeypatch.setattr(get_global_args().infer, "mtp_size", 1)
+    # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+    monkeypatch.setitem(get_global_args().infer, "mtp_size", 1)
 
 
 @pytest.fixture(autouse=True)
@@ -1123,7 +1124,8 @@ class TestSampleMTP:
 
     @pytest.fixture(autouse=True)
     def _set_mtp3(self, monkeypatch, global_args):
-        monkeypatch.setattr(get_global_args().infer, "mtp_size", 3)
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "mtp_size", 3)
 
     def test_all_greedy_argmax(self, sampler, global_args):
         sampler.mtp_size = 3
@@ -1207,7 +1209,8 @@ class TestVerifyTokensMTP:
 
     @pytest.fixture(autouse=True)
     def _set_mtp3(self, monkeypatch, global_args):
-        monkeypatch.setattr(get_global_args().infer, "mtp_size", 3)
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "mtp_size", 3)
 
     def test_all_greedy_exact_match(self, sampler, global_args):
         """All greedy: exact-match fast path, accept_indices from match."""
@@ -1330,7 +1333,8 @@ class TestVerifyMtpMixed:
 
     @pytest.fixture(autouse=True)
     def _set_mtp3(self, monkeypatch, global_args):
-        monkeypatch.setattr(get_global_args().infer, "mtp_size", 3)
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "mtp_size", 3)
 
     def test_non_greedy_rejection_resample(self, sampler, global_args):
         """Non-greedy: draft rejected, token resampled from residual."""
@@ -1675,7 +1679,8 @@ class TestMTPRejectionEdgeCases:
 
     @pytest.fixture(autouse=True)
     def _set_mtp3(self, monkeypatch, global_args):
-        monkeypatch.setattr(get_global_args().infer, "mtp_size", 3)
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "mtp_size", 3)
 
     # ---- position invariance ----
 
@@ -2232,7 +2237,8 @@ class TestDraftBatchRows:
 
     @pytest.fixture(autouse=True)
     def _set_mtp3(self, monkeypatch, global_args):
-        monkeypatch.setattr(get_global_args().infer, "mtp_size", 3)
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "mtp_size", 3)
 
     @staticmethod
     def _states(sampler):

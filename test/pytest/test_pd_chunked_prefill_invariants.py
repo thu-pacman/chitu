@@ -440,24 +440,28 @@ class TestTaskMaxSeqLen:
     """Task.max_seq_len：计算层统一使用的长度上限（= min(全局 max_seq_len, prompt + max_new_tokens)）。"""
 
     def test_default_is_prompt_plus_max_new_tokens(self, monkeypatch):
-        monkeypatch.setattr(get_global_args().infer, "max_seq_len", 4096)
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "max_seq_len", 4096)
         t = _make_decode_task("req", prompt_len=100, max_new_tokens=64)
         assert t.max_seq_len == 164
 
     def test_capped_by_global_max_seq_len(self, monkeypatch):
-        monkeypatch.setattr(get_global_args().infer, "max_seq_len", 150)
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "max_seq_len", 150)
         t = _make_decode_task("req", prompt_len=100, max_new_tokens=64)
         assert t.max_seq_len == 150
 
     def test_without_request_falls_back_to_global(self, monkeypatch):
-        monkeypatch.setattr(get_global_args().infer, "max_seq_len", 4096)
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "max_seq_len", 4096)
         t = _make_decode_task("req", prompt_len=100, max_new_tokens=64)
         t.req = None
         assert t.max_seq_len == 4096
 
     def test_stop_uses_task_max_seq_len(self, monkeypatch):
         """长度停止按 Task.max_seq_len 判定：synced 达到 (prompt + max_new_tokens) 即停。"""
-        monkeypatch.setattr(get_global_args().infer, "max_seq_len", 4096)
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "max_seq_len", 4096)
         t = _make_decode_task(
             "req", prompt_len=100, synced_new_tokens=64, max_new_tokens=64
         )
@@ -487,7 +491,8 @@ class TestMaxAllocSeqLen:
 
     @staticmethod
     def _with_mtp_size(monkeypatch, mtp_size):
-        monkeypatch.setattr(get_global_args().infer, "mtp_size", mtp_size)
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "mtp_size", mtp_size)
 
     def test_mtp4_4096_is_exact_bound(self, monkeypatch):
         # 4096/mtp4：主路径写入 <= 4100，MTP 寻址 <= 4103 ⇒ 需要 4104
@@ -532,7 +537,8 @@ class TestMaxAllocSeqLenInvariants:
     """
 
     def test_prompt_must_be_shorter_than_max_seq_len(self, monkeypatch):
-        monkeypatch.setattr(get_global_args().infer, "max_seq_len", 4096, raising=False)
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "max_seq_len", 4096)
         # prompt == max_seq_len 被拒（否则整段 prompt 会写到 index max_seq_len - 1）
         with pytest.raises(PromptTooLongError):
             UserRequest.cap_max_new_tokens(128, 4096)
@@ -544,12 +550,9 @@ class TestMaxAllocSeqLenInvariants:
         """跑到长度上限的请求，cache 长度不超过 max_alloc_seq_len。"""
         max_seq_len = 4096
         prompt_len = 100
-        monkeypatch.setattr(
-            get_global_args().infer, "max_seq_len", max_seq_len, raising=False
-        )
-        monkeypatch.setattr(
-            get_global_args().infer, "mtp_size", mtp_size, raising=False
-        )
+        # Please always use `setitem` rather than `setattr` on `OmegaConf` objects.
+        monkeypatch.setitem(get_global_args().infer, "max_seq_len", max_seq_len)
+        monkeypatch.setitem(get_global_args().infer, "mtp_size", mtp_size)
         monkeypatch.setattr(
             backend_module.Backend, "executor", SimpleNamespace(mtp_size=mtp_size)
         )
