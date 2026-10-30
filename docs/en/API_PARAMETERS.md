@@ -607,13 +607,14 @@ No request body parameters.
 POST /terminate_engine
 ````
 
-Gracefully terminates the engine and shuts down the server after confirmation.
+Starts graceful engine termination in the background and immediately returns HTTP 202.
 
 #### Parameters (`TerminateRequest` Object)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `confirm` | `boolean` | `false` | Must be true to confirm engine termination. |
+| `drain_timeout_s` | `number` \| `null` | `null` | Seconds to wait for in-flight requests to finish. Omit to wait indefinitely; use 0 to terminate them immediately. |
 
 ### Server Status (Deprecated)
 
@@ -635,7 +636,7 @@ No request body parameters.
 GET /server_status
 ````
 
-Returns whether the service is initialized.
+Returns whether the service is initialized and whether graceful termination is in progress.
 
 No request body parameters.
 

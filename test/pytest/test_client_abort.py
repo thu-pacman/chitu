@@ -31,6 +31,7 @@ from omegaconf import OmegaConf
 
 import chitu.dp_router as dp_router
 import chitu.serve.abort as serve_abort
+import chitu.testing.exception as test_exceptions
 from chitu.distributed.pd_disaggregation.pd_request_router import PDRequestRouter
 from chitu.distributed.pd_disaggregation.pd_scheduler import (
     PDInstanceRequestManager,
@@ -54,6 +55,7 @@ from chitu.serve.abort import (
     run_with_client_abort,
     stream_with_client_abort,
 )
+from chitu.serve.crash import is_shutting_down, set_shutting_down
 from chitu.task import (
     Task,
     TaskCollector,
@@ -78,6 +80,7 @@ def _isolate_global_state():
     update_task_ids = set(TaskCollector._update_task_ids)
     request_router = dp_router._request_router
     token_router = dp_router._token_router
+    shutting_down = is_shutting_down()
     yield
     TaskPool.pool.clear()
     TaskPool.pool.update(pool)
@@ -90,6 +93,7 @@ def _isolate_global_state():
     TaskCollector._update_task_ids.update(update_task_ids)
     dp_router._request_router = request_router
     dp_router._token_router = token_router
+    set_shutting_down(shutting_down)
 
 
 def _set_multi_inst(n_insts: int) -> None:
@@ -186,10 +190,15 @@ def _router_config(*, algorithm: str = "least_loaded") -> RouterConfig:
     )
 
 
-def _build_router(*, algorithm: str = "least_loaded") -> RequestRouter:
+def _build_router(
+    *, algorithm: str = "least_loaded", n_insts: int = 1
+) -> RequestRouter:
     set_global_args(
         OmegaConf.create(
-            {"infer": {"max_seq_len": 8192, "enable_prefix_caching": True}}
+            {
+                "infer": {"max_seq_len": 8192, "enable_prefix_caching": True},
+                "multi_inst": {"n_insts": n_insts},
+            }
         ),
         need_ensure=False,
         need_preprocess=False,
@@ -305,6 +314,89 @@ def test_abort_task_keeps_earlier_finish_reason():
     assert abort_task("req-already-done") is True
 
     assert task.req.finish_reason == "stop"
+
+
+def test_router_rejects_new_requests_after_termination_begins():
+    router = _build_router()
+    token_router = _FakeTokenRouter({})
+    dp_router._request_router = router
+    dp_router._token_router = token_router
+    req = _make_request("late-request")
+
+    set_shutting_down()
+
+    assert asyncio.run(router.add_request(req)) is False
+    assert req.finished
+    assert not router.pending_requests
+    assert is_shutting_down()
+
+
+def test_wait_for_requests_drained_waits_for_pending_and_active_requests():
+    router = _build_router()
+    token_router = _FakeTokenRouter({})
+    dp_router._request_router = router
+    dp_router._token_router = token_router
+
+    pending_req = _make_request("pending-request")
+    active_req = _make_request("active-request")
+    router.pending_requests.append(pending_req)
+    token_router.active_requests[active_req.request_id] = active_req
+
+    assert asyncio.run(router.wait_for_requests_drained(0.01)) is False
+
+    router.pending_requests.clear()
+    token_router.active_requests.clear()
+    assert asyncio.run(router.wait_for_requests_drained(0.01)) is True
+
+
+def test_wait_for_requests_drained_zero_timeout_returns_immediately():
+    router = _build_router()
+    dp_router._request_router = router
+    dp_router._token_router = _FakeTokenRouter({})
+    router.pending_requests.append(_make_request("pending-request"))
+
+    assert asyncio.run(router.wait_for_requests_drained(0.0)) is False
+
+    router.pending_requests.clear()
+    assert asyncio.run(router.wait_for_requests_drained(0.0)) is True
+
+
+def test_wait_for_requests_drained_none_timeout_waits_indefinitely():
+    router = _build_router()
+    dp_router._request_router = router
+    dp_router._token_router = _FakeTokenRouter({})
+
+    async def scenario():
+        router.pending_requests.append(_make_request("pending-request"))
+        waiter = asyncio.create_task(router.wait_for_requests_drained(None))
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+
+        router.pending_requests.clear()
+        assert await asyncio.wait_for(waiter, timeout=1.0) is True
+
+    asyncio.run(scenario())
+
+
+def test_wait_for_requests_drained_honors_stuck_injection(monkeypatch):
+    router = _build_router()
+    dp_router._request_router = router
+    dp_router._token_router = _FakeTokenRouter({})
+    monkeypatch.setattr(
+        test_exceptions,
+        "get_global_args",
+        lambda need_ensure=False: types.SimpleNamespace(
+            test=types.SimpleNamespace(inject_exception="terminate_drain_stuck")
+        ),
+    )
+
+    assert asyncio.run(router.wait_for_requests_drained(0.01)) is False
+
+
+def test_router_expected_termination_ids_covers_all_instances():
+    router = _build_router(n_insts=3)
+
+    assert router._expected_termination_ids() == {0, 1, 2}
 
 
 # --------------------------------------------------------------------------
@@ -471,6 +563,81 @@ def test_pd_router_abort_request_stops_both_prefill_and_decode():
         assert message["request_id"] == req.request_id
     assert req.finished
     assert req.request_id not in router.pending_pd_requests
+
+
+def test_pd_router_inflight_includes_pending_and_dispatched_requests():
+    router = _build_pd_router()
+    pending_req = _make_request("pd-pending")
+    dispatched_req = _make_request("pd-dispatched")
+    router.pending_pd_requests[pending_req.request_id] = PendingPDRequest(
+        request_id=pending_req.request_id,
+        original_request=pending_req,
+        prefill_scheduler_id=0,
+        decode_scheduler_id=0,
+        status=PDRequestStatus.PENDING,
+    )
+    router.pending_pd_requests[dispatched_req.request_id] = PendingPDRequest(
+        request_id=dispatched_req.request_id,
+        original_request=dispatched_req,
+        prefill_scheduler_id=0,
+        decode_scheduler_id=0,
+        status=PDRequestStatus.DISPATCHED,
+    )
+
+    assert router._has_inflight_requests() is True
+
+
+def test_pd_router_ignores_failed_request():
+    router = _build_pd_router()
+    failed_req = _make_request("pd-failed")
+    router.pending_pd_requests[failed_req.request_id] = PendingPDRequest(
+        request_id=failed_req.request_id,
+        original_request=failed_req,
+        prefill_scheduler_id=0,
+        decode_scheduler_id=0,
+        status=PDRequestStatus.FAILED,
+    )
+
+    assert router._has_inflight_requests() is False
+
+
+def test_pd_router_ignores_finished_request():
+    router = _build_pd_router()
+    finished_req = _make_request("pd-finished", finished=True)
+    router.pending_pd_requests[finished_req.request_id] = PendingPDRequest(
+        request_id=finished_req.request_id,
+        original_request=finished_req,
+        prefill_scheduler_id=0,
+        decode_scheduler_id=0,
+        status=PDRequestStatus.DISPATCHED,
+    )
+
+    assert router._has_inflight_requests() is False
+
+
+def test_pd_router_rejects_new_requests_after_termination_begins():
+    router = _build_pd_router()
+    dp_router._request_router = router
+    dp_router._token_router = _FakeTokenRouter({})
+    req = _make_request("pd-late-request")
+
+    set_shutting_down()
+
+    assert asyncio.run(router.add_request(req)) is False
+    assert req.finished
+    assert not router.pending_requests
+    assert not router.pending_pd_requests
+
+
+def test_pd_router_expected_termination_ids_only_includes_online_workers():
+    router = _build_pd_router()
+    router.prefill_schedulers = {
+        0: {"status": "online", "global_instance_id": 0},
+        1: {"status": "offline", "global_instance_id": 1},
+    }
+    router.decode_schedulers = {0: {"status": "online", "global_instance_id": 2}}
+
+    assert router._expected_termination_ids() == {0, 2}
 
 
 def test_pd_router_find_inflight_request_checks_pd_registry():

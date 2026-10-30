@@ -607,13 +607,14 @@ POST /init
 POST /terminate_engine
 ````
 
-在确认后优雅终止引擎并关闭服务。
+在后台启动引擎优雅终止流程，并立即返回 HTTP 202。
 
 #### 参数（`TerminateRequest` 对象）
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `confirm` | `boolean` | `false` | 必须设置为 true 才会确认终止引擎。 |
+| `drain_timeout_s` | `number` \| `null` | `null` | 等待在途请求完成的秒数。省略表示不设限；设置为 0 表示立即终止在途请求。 |
 
 ### 服务状态（已弃用）
 
@@ -635,7 +636,7 @@ POST /status
 GET /server_status
 ````
 
-返回服务是否已初始化。
+返回服务是否已初始化，以及是否正在优雅终止。
 
 无请求体参数。
 

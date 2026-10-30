@@ -179,6 +179,16 @@ def test_inject_exception_kv_transfer_slow(req_id: str = "") -> None:
     time.sleep(delay_s)
 
 
+def test_inject_exception_terminate_drain_stuck() -> bool:
+    """Keep the graceful-termination drain loop busy until its timeout expires.
+
+    Location: ``RequestRouter._wait_for_requests_drained``.
+    Purpose: exercise the force-terminate path used when accepted requests do
+    not drain within ``/terminate_engine``'s ``drain_timeout_s``.
+    """
+    return _active("terminate_drain_stuck")
+
+
 def test_inject_exception_delayed_crash(role: str) -> None:
     """Inject a delayed process crash (unified crash protocol).
 

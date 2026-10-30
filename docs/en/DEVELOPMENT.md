@@ -921,13 +921,13 @@ curl localhost:21002/v1/messages \
   }'
 ```
 
-Gracefully terminate the engine and API server (requires `{"confirm": true}` to prevent accidental shutdown). In-flight requests will complete before the service exits. New requests are rejected once termination is initiated.
+Gracefully terminate the engine and API server (requires `{"confirm": true}` to prevent accidental shutdown). The endpoint returns HTTP 202 immediately and drains in-flight requests in the background. New inference requests are rejected once termination starts. Set `drain_timeout_s` to bound the drain wait; omit it to wait indefinitely, or use `0` to terminate in-flight requests immediately.
 
 ```bash
 curl localhost:21002/terminate_engine \
   -X POST \
   -H "Content-Type: application/json" \
-  -d '{"confirm": true}'
+  -d '{"confirm": true, "drain_timeout_s": 60}'
 ```
 
 If a client disconnects before its response is finished (for both streaming and
