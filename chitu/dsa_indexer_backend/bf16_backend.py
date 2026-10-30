@@ -84,7 +84,9 @@ class BF16Indexer(DSAIndexer):
                     + ks
                 )
 
-        schedule, ks, ke = self._prefill_schedule(ks, ke, is_causal)
+        schedule, ks, ke = self._prefill_schedule(
+            ks, ke, is_causal, seq_len_delta=seq_len_delta
+        )
 
         return bf16_index_score_ragged_qk_dsv32(
             q,
@@ -103,5 +105,5 @@ class BF16Indexer(DSAIndexer):
     def _decode_score(self, q, weights, seq_len_delta, cache_accessor):
         raise NotImplementedError
 
-    def _prefill_schedule(self, ks, ke, is_causal):
+    def _prefill_schedule(self, ks, ke, is_causal, *, seq_len_delta=None):
         return None, ks, ke
