@@ -5,7 +5,7 @@
 import torch
 import torch.nn.functional as F
 
-from chitu.device_type import has_accelerator
+from chitu.device_type import has_accelerator, is_enflame
 from chitu.ops.utils import check_checkpoint_args, make_op_dispatcher
 from chitu.utils import try_import_platform_dep
 from typing import Optional
@@ -16,6 +16,7 @@ has_triton_impl = has_triton and has_accelerator()
 if has_triton_impl:
     from chitu.ops.triton_ops import (
         causal_conv1d_update_triton,
+        causal_conv1d_update_gcu_b1_inplace,
         causal_conv1d_prefill_triton,
     )
 
@@ -107,6 +108,46 @@ if has_triton_impl:
     causal_conv1d_update.register("triton", available=has_triton_impl)(
         causal_conv1d_update_triton
     )
+
+
+def causal_conv1d_update_qwen3_next(
+    this_hidden_states: torch.Tensor,
+    old_hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+):
+    """Qwen3-Next decode entry point with a fail-closed GCU fast path.
+
+    Qwen3-Next decode is B=1 with a fixed 4-token conv state. The dedicated
+    in-place kernel avoids the generic kernel's unused 16-way batch lane and
+    per-step state allocation, while keeping the same BF16/FP32 reduction.
+
+    Keeping this separate from the public generic operator makes the in-place
+    state contract explicit and preserves generic callers' aliasing semantics.
+    """
+    same_gcu_device = (
+        this_hidden_states.device.type == "gcu"
+        and this_hidden_states.device == old_hidden_states.device
+        and this_hidden_states.device == weight.device
+    )
+    supported = (
+        has_triton_impl
+        and is_enflame()
+        and same_gcu_device
+        and tuple(this_hidden_states.shape) == (1, 10240)
+        and tuple(old_hidden_states.shape) == (1, 10240, 4)
+        and tuple(weight.shape) == (10240, 1, 4)
+        and this_hidden_states.dtype == torch.bfloat16
+        and old_hidden_states.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and this_hidden_states.stride(1) == 1
+        and old_hidden_states.is_contiguous()
+        and weight.is_contiguous()
+    )
+    if supported:
+        return causal_conv1d_update_gcu_b1_inplace(
+            this_hidden_states, old_hidden_states, weight
+        )
+    return causal_conv1d_update(this_hidden_states, old_hidden_states, weight)
 
 
 @make_op_dispatcher

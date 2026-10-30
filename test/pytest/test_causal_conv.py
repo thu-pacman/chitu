@@ -1,9 +1,14 @@
 import pytest
 import torch
 
-from chitu.ops import causal_conv1d_update, causal_conv1d_prefill
+from chitu.ops import (
+    causal_conv1d_update,
+    causal_conv1d_update_qwen3_next,
+    causal_conv1d_prefill,
+)
 from chitu.utils import try_import_platform_dep
 from chitu.testing import AssertOpCalled, assert_close
+from chitu.device_type import is_enflame
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -68,6 +73,29 @@ def test_causal_conv1d_update_fp32_weight(impl):
     )
     assert_close(output, output_bf16, atol=5e-2, rtol=5e-2)
     assert_close(new_hidden_state, new_hidden_state_bf16, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_enflame(), reason="Enflame GCU is required")
+def test_causal_conv1d_update_qwen3_next_b1_is_exact_and_inplace():
+    torch.manual_seed(1234)
+    this_hidden_state = torch.randn(1, 10240, dtype=torch.bfloat16, device="cuda")
+    old_hidden_state = torch.randn(1, 10240, 4, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(10240, 1, 4, dtype=torch.bfloat16, device="cuda")
+    state_ref_input = old_hidden_state.clone()
+    # The production control for this shape is Chitu's generic Triton kernel.
+    # Compare byte-for-byte at that exact numerical boundary (the framework
+    # reference uses a different reduction/materialization sequence).
+    output_ref, state_ref = causal_conv1d_update(
+        this_hidden_state, state_ref_input, weight, impl="triton"
+    )
+    state_ptr = old_hidden_state.data_ptr()
+    output, state = causal_conv1d_update_qwen3_next(
+        this_hidden_state, old_hidden_state, weight
+    )
+
+    assert state.data_ptr() == state_ptr
+    assert torch.equal(output, output_ref)
+    assert torch.equal(state, state_ref)
 
 
 @pytest.mark.parametrize(

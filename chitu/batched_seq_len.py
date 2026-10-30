@@ -12,6 +12,13 @@ from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.utils import invalidate_cached_property, create_tensor, resolved_device
 
 
+@functools.cache
+def _classic_decode_seq_ids(
+    device: torch.device | str, batch_size: int
+) -> torch.Tensor:
+    return torch.arange(batch_size, device=device, dtype=torch.int32)
+
+
 class BatchedSeqLen:
     """
     Lengths of different sequences in one batch, accessible from both CPU and GPU.
@@ -675,7 +682,10 @@ class BatchedSeqLenDelta:
     @property
     def delta_seq_ids_tensor_device(self):
         if self.is_classic_decoding:
-            return torch.arange(self.batch_size, device=self.device, dtype=torch.int32)
+            # Classic decode (B=1-style decoding) has constant delta sequence IDs
+            # equal to arange(batch_size). Values depend only on (device,
+            # batch_size), so they are cached and reused across all layers.
+            return _classic_decode_seq_ids(self.device, self.batch_size)
         else:
             return self._delta.seq_ids_tensor_device
 

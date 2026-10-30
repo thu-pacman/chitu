@@ -27,7 +27,32 @@ def _auto_hadamard_transform():
         return "fast_hadamard_transform"
     if has_scipy:
         return "scipy"
-    raise NotImplementedError("Please install either scipy or fast_hadamard_transform")
+    return "torch"
+
+
+@hadamard_transform.register("torch")
+def hadamard_transform_torch(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Portable FWHT fallback using log2(N) Torch butterfly stages."""
+    if x.numel() == 0:
+        return x
+
+    dim = x.shape[-1]
+    dim_padded = dim if is_power_of_two(dim) else next_power_of_two(dim)
+    if dim_padded != dim:
+        y = torch.nn.functional.pad(x, (0, dim_padded - dim))
+    else:
+        y = x
+
+    leading_shape = y.shape[:-1]
+    butterfly = 1
+    while butterfly < dim_padded:
+        y = y.reshape(*leading_shape, -1, butterfly * 2)
+        left = y[..., :butterfly]
+        right = y[..., butterfly:]
+        y = torch.cat((left + right, left - right), dim=-1)
+        butterfly *= 2
+
+    return y.reshape(*leading_shape, dim_padded)[..., :dim] * scale
 
 
 @functools.cache

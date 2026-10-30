@@ -38,6 +38,7 @@ from chitu.ops import (
     recurrent_gated_delta_rule_all_state,
     silu_and_mul,
     causal_conv1d_update,
+    causal_conv1d_update_qwen3_next,
     causal_conv1d_prefill,
     rms_norm_gate,
     fused_g,
@@ -92,12 +93,6 @@ class Qwen3NextRMSNormGated(nn.Module):
             impl=impl,
         )
         return out
-
-
-def get_mtp_accept_indices():
-    from chitu.backend import Backend
-
-    return Backend.model.mtp_accept_indices.get()
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
@@ -261,7 +256,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # real decode; the prefill branch would be equivalent but uses the
         # slower chunk kernels).
         if use_precomputed_states:
-            qkv, conv_state = causal_conv1d_update(qkv, conv_state, self.conv1d.weight)
+            qkv, conv_state = causal_conv1d_update_qwen3_next(
+                qkv, conv_state, self.conv1d.weight
+            )
             # qkv: (bsz, hidden_size), conv_state: (bsz, hidden_size, state_len)
         # mtp decode, could be optimized with a fused kernel
         elif is_mtp_decode_stage:

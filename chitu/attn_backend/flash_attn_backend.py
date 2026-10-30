@@ -4,19 +4,25 @@
 
 from typing import Optional
 from typing_extensions import override
+import math
 
 import torch
 
-from chitu.attn_backend.base import AttnBackend
+from chitu.attn_backend.ref_attn_backend import RefAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
-from chitu.device_type import is_muxi
+from chitu.device_type import is_enflame, is_muxi
 from chitu.utils import try_import_opt_dep
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_attn3, has_flash_attn3 = try_import_opt_dep(
     "flash_attn_interface", "flash_attn_interface"
 )
+
+try:
+    from flash_attn.vllm_flash_attn import flash_attn_varlen_func as _fa_varlen
+except Exception:
+    _fa_varlen = None
 
 
 def _expand_fa3_descale(descale, batch_size, num_kv_heads):
@@ -27,7 +33,7 @@ def _expand_fa3_descale(descale, batch_size, num_kv_heads):
     return descale.view(1, 1).expand(batch_size, num_kv_heads)
 
 
-class FlashAttnBackend(AttnBackend):
+class FlashAttnBackend(RefAttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
@@ -38,7 +44,7 @@ class FlashAttnBackend(AttnBackend):
         # flash_attn_with_kvcache (the new token's KV is neither written into
         # the cache nor attended), which corrupts every decode-with-append
         # path. MACA's FA2 build implements append correctly, so pin to FA2.
-        if has_flash_attn3 and not is_muxi():
+        if has_flash_attn3 and not is_muxi() and not is_enflame():
             self._fa = flash_attn3
             self._use_fa3 = True
         elif has_flash_attn:
@@ -53,10 +59,14 @@ class FlashAttnBackend(AttnBackend):
 
     @override
     def decode_op_supports_mtp(self) -> bool:
-        return True
+        # GCU decode is paged-only and classic-decoding-only; the vendor
+        # varlen flash-decode takes one query token per sequence.
+        return not is_enflame()
 
     @override
     def decode_supports_prepare_in_graph(self) -> bool:
+        if is_enflame():
+            return False
         # FlashAttention's decode entry points take every quantity that changes
         # between two MTP draft steps as a device tensor: `cache_seqlens` and
         # `block_table` are read straight from the KV cache accessor, and the
@@ -86,6 +96,33 @@ class FlashAttnBackend(AttnBackend):
         sinks=None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
+        if is_enflame():
+            # The GCU vendor FA2 build only covers the plain causal varlen
+            # path. Keep the Ref implementation for attention features it
+            # does not expose instead of silently dropping them.
+            unsupported = (
+                not has_flash_attn
+                or sinks is not None
+                or topk_indices is not None
+                or (window_size is not None and tuple(window_size) != (-1, -1))
+                or (softcap not in (0.0, None))
+                or k.shape[-1] != v.shape[-1]
+            )
+            if unsupported:
+                return RefAttnBackend.prefill_ragged_qkvo(
+                    self,
+                    q,
+                    k,
+                    v,
+                    seq_len_delta,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=softcap,
+                    softmax_scale=softmax_scale,
+                    sinks=sinks,
+                    topk_indices=topk_indices,
+                )
+
         if topk_indices is not None:
             raise NotImplementedError()
 
@@ -144,6 +181,23 @@ class FlashAttnBackend(AttnBackend):
         sinks=None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
+        if is_enflame():
+            # GCU is paged-only (enforced at backend init); route here to the
+            # reference cache write/read rather than the append-in-kernel path.
+            return RefAttnBackend.decode_dense_kv(
+                self,
+                q,
+                kv_cache,
+                k,
+                v,
+                seq_len_delta=seq_len_delta,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                sinks=sinks,
+                topk_indices=topk_indices,
+            )
+
         if topk_indices is not None:
             raise NotImplementedError()
 
@@ -206,6 +260,27 @@ class FlashAttnBackend(AttnBackend):
         sparse_page_table: Optional[torch.Tensor] = None,
         sparse_cache_seqlens: Optional[torch.Tensor] = None,
     ):
+        if is_enflame():
+            if sparse_page_table is not None or sparse_cache_seqlens is not None:
+                raise NotImplementedError(
+                    "Sparse paged decode is not supported on Enflame GCU"
+                )
+            return self._decode_paged_kv_gcu(
+                q,
+                kv_cache,
+                k,
+                v,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                seq_len_delta=seq_len_delta,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                sinks=sinks,
+                topk_indices=topk_indices,
+            )
+
         if topk_indices is not None:
             raise NotImplementedError()
 
@@ -287,6 +362,112 @@ class FlashAttnBackend(AttnBackend):
         output = self._fa.flash_attn_with_kvcache(**kwargs)
         output = output.view(bsz * s_q, output.shape[-2], output.shape[-1])
         return output
+
+    def _decode_paged_kv_gcu(
+        self,
+        q,
+        kv_cache: PagedKVCacheAccessor,
+        k=None,
+        v=None,
+        *,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_len_delta: BatchedSeqLenDelta,
+        window_size=(-1, -1),
+        softcap=0.0,
+        softmax_scale=None,
+        sinks=None,
+        topk_indices=None,
+    ):
+        """Decode on GCU: explicit paged append + vendor varlen flash-decode.
+
+        The GCU flash_attn build does not append k/v from
+        flash_attn_with_kvcache, so write this step's KV with
+        `append_to_paged_kv_cache` and run the vendor varlen kernel over the
+        paged buffer. Anything that kernel does not support falls back to Ref.
+        """
+        if q.numel() == 0:
+            return torch.empty(
+                0, q.shape[1], kv_cache.v.shape[-1], device=q.device, dtype=q.dtype
+            )
+
+        paged_ok = (
+            _fa_varlen is not None
+            and k is not None
+            and v is not None
+            and sinks is None
+            and topk_indices is None
+            and (window_size is None or tuple(window_size) == (-1, -1))
+            and softcap in (0.0, None)
+            and all(s is None for s in (q_descale, k_descale, v_descale))
+            and kv_cache.k.dim() == 4
+            and kv_cache.k.shape[1] % 16 == 0
+            and seq_len_delta.is_classic_decoding
+        )
+        if not paged_ok:
+            return RefAttnBackend.decode_paged_kv(
+                self,
+                q,
+                kv_cache,
+                k,
+                v,
+                seq_len_delta=seq_len_delta,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                sinks=sinks,
+                topk_indices=topk_indices,
+            )
+
+        if softmax_scale is None:
+            softmax_scale = float(1.0 / math.sqrt(q.shape[-1]))
+
+        if not getattr(k, "_qwen38_kv_preappended", False):
+            from chitu.ops import append_to_paged_kv_cache
+
+            append_to_paged_kv_cache(
+                kv_cache.k,
+                kv_cache.block_table,
+                k.contiguous(),
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+                use_i64_offsets=kv_cache.use_i64_offsets,
+            )
+            append_to_paged_kv_cache(
+                kv_cache.v,
+                kv_cache.block_table,
+                v.contiguous(),
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+                use_i64_offsets=kv_cache.use_i64_offsets,
+            )
+
+        from chitu.global_vars import get_global_args
+
+        seqused_k = seq_len_delta.new.lens_tensor_device.to(torch.int32)
+        max_seqlen_k = int(get_global_args().infer.max_seq_len)
+        block_table = kv_cache.block_table
+        batch_size = block_table.shape[0]
+        cu_seqlens_q = torch.arange(
+            0, batch_size + 1, device=q.device, dtype=torch.int32
+        )
+        return _fa_varlen(
+            q,
+            kv_cache.k,
+            kv_cache.v,
+            max_seqlen_q=1,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seqlen_k,
+            seqused_k=seqused_k,
+            causal=True,
+            softmax_scale=softmax_scale,
+            block_table=block_table,
+        )
 
     def _fa3_mla_decode_paged_kv_impl(
         self,
