@@ -256,6 +256,10 @@ def test_responses_lifecycle_timestamps_and_logprobs(monkeypatch, reason, empty)
 
 
 def test_responses_concurrent_tool_streams(monkeypatch):
+    _, public_tools, tool_names = responses.normalize_response_tools(
+        [{"type": "function", "name": "f", "parameters": {"type": "object"}}]
+    )
+
     async def parsed(*args):
         await asyncio.sleep(0)
         yield ChoiceDelta(
@@ -282,8 +286,9 @@ def test_responses_concurrent_tool_streams(monkeypatch):
                         user_req=request(),
                         request=responses.ResponsesCreateRequest(input="hi"),
                         response_model="test-model",
-                        public_tools=[{}],
+                        public_tools=public_tools,
                         public_tool_choice="auto",
+                        tool_names=tool_names,
                         created_at=100,
                     )
                 )

@@ -43,6 +43,10 @@ MSG_TYPE_CRASH = "crash"
 # Plain bool store/load is atomic under the GIL.
 _dying = False
 
+# Process-wide graceful-termination admission gate. Unlike _dying, this only
+# rejects new inference requests; existing work must continue draining.
+_shutting_down = False
+
 # ---- crash reporter (P/D -> Router) ----
 _reporter: Optional["_CrashReporter"] = None
 _reporter_lock = threading.Lock()
@@ -66,6 +70,16 @@ def set_dying() -> None:
 
 def is_dying() -> bool:
     return _dying
+
+
+def set_shutting_down(enabled: bool = True) -> None:
+    """Stop or resume admitting new inference requests."""
+    global _shutting_down
+    _shutting_down = enabled
+
+
+def is_shutting_down() -> bool:
+    return _shutting_down
 
 
 def get_crash_reason() -> Optional[str]:

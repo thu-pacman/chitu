@@ -4,6 +4,7 @@
 
 """FastAPI application, request models, and HTTP route handlers for Chitu serve."""
 
+import asyncio
 import os
 import time
 import traceback
@@ -18,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from chitu.serve import anthropic_api, openai_api, responses_api
 from chitu.serve.api_docs import DocField
+from chitu.serve.errors import ServiceShuttingDown, service_shutting_down_response
 from chitu.serve.model_names import available_model_names
 
 DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
@@ -42,7 +44,7 @@ if not DOC_GENERATION:
         queue_profile_stop,
         resolve_profile_output_dir,
     )
-    from chitu.serve.crash import is_dying
+    from chitu.serve.crash import is_dying, set_shutting_down
     from chitu.serve.middleware import RejectOverloadMiddleware
     from chitu.task import TaskPool
     from chitu.tool_call import (
@@ -53,11 +55,17 @@ if not DOC_GENERATION:
 logger = getLogger(__name__)
 
 _uvicorn_server: Optional[object] = None
+_termination_task: Optional[asyncio.Task] = None
 
 app = FastAPI()
 
 if not DOC_GENERATION:
     app.add_middleware(RejectOverloadMiddleware)
+
+
+@app.exception_handler(ServiceShuttingDown)
+async def handle_service_shutting_down(request, error):
+    return service_shutting_down_response()
 
 
 @dataclass
@@ -466,21 +474,61 @@ class TerminateRequest(BaseModel):
         en="Must be true to confirm engine termination.",
         zh="必须设置为 true 才会确认终止引擎。",
     )
+    drain_timeout_s: Optional[float] = DocField(
+        None,
+        en="Seconds to wait for in-flight requests to finish. Omit to wait indefinitely; use 0 to terminate them immediately.",
+        zh="等待在途请求完成的秒数。省略表示不设限；设置为 0 表示立即终止在途请求。",
+    )
+
+
+async def _terminate_engine_background(drain_timeout_s: Optional[float]) -> None:
+    try:
+        if _is_router_process():
+            router = get_request_router()
+            token_router = get_token_router(check_exist=False)
+            drained = await router.wait_for_requests_drained(drain_timeout_s)
+            if not drained:
+                logger.warning(
+                    "[terminate_engine] request drain incomplete; proceeding with "
+                    "termination"
+                )
+                await router.terminate_all_inflight("service shutting down")
+
+            if token_router is not None:
+                await token_router.begin_termination()
+
+            await router.terminate_instances()
+            await router.wait_for_instances_terminated()
+
+            if token_router is not None:
+                await token_router.shutdown()
+            await router.shutdown()
+        else:
+            from chitu.backend import Backend, BackendState
+
+            Backend.state = BackendState.Terminating
+    except Exception:
+        logger.exception("[terminate_engine] background termination failed")
+    finally:
+        request_server_shutdown()
 
 
 @app.post(
     "/terminate_engine",
+    status_code=202,
     tags=["Lifecycle, Status, and Cache APIs"],
     summary="Terminate Engine",
-    description="Gracefully terminates the engine and shuts down the server after confirmation.",
+    description="Starts graceful engine termination in the background and immediately returns HTTP 202.",
     openapi_extra={
         "x-doc": {
             "zh-summary": "终止引擎",
-            "zh-description": "在确认后优雅终止引擎并关闭服务。",
+            "zh-description": "在后台启动引擎优雅终止流程，并立即返回 HTTP 202。",
         }
     },
 )
 async def terminate_engine(request: TerminateRequest):
+    global _termination_task
+
     if not get_server_status():
         return JSONResponse(
             status_code=400,
@@ -493,32 +541,36 @@ async def terminate_engine(request: TerminateRequest):
                 "message": 'Termination not confirmed. Send {"confirm": true} to proceed.'
             },
         )
+    if request.drain_timeout_s is not None and request.drain_timeout_s < 0:
+        return JSONResponse(
+            status_code=400,
+            content={"message": "drain_timeout_s must be non-negative."},
+        )
+    if _termination_task is not None and not _termination_task.done():
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "Termination already in progress. Engine is draining in the background."
+            },
+        )
 
     logger.info(
-        "[terminate_engine] Termination requested, draining in-flight requests..."
+        "[terminate_engine] Termination requested, starting background shutdown "
+        "(drain_timeout_s=%s)",
+        request.drain_timeout_s,
     )
-    set_server_status(initialized=False)
+    set_shutting_down()
 
-    if _is_router_process():
-        router = get_request_router()
-        token_router = get_token_router(check_exist=False)
-        if token_router is not None:
-            await token_router.begin_termination()
+    _termination_task = asyncio.create_task(
+        _terminate_engine_background(request.drain_timeout_s)
+    )
 
-        await router.terminate_instances()
-        await router.wait_for_instances_terminated()
-
-        if token_router is not None:
-            await token_router.shutdown()
-        await router.shutdown()
-    else:
-        from chitu.backend import Backend, BackendState
-
-        Backend.state = BackendState.Terminating
-
-    request_server_shutdown()
-
-    return {"message": "Terminate signal sent. Engine and server are shutting down."}
+    return JSONResponse(
+        status_code=202,
+        content={
+            "message": "Termination started. Engine is draining in the background."
+        },
+    )
 
 
 @app.post(
@@ -543,16 +595,21 @@ async def get_chitu_status():
     "/server_status",
     tags=["Lifecycle, Status, and Cache APIs"],
     summary="Server Status",
-    description="Returns whether the service is initialized.",
+    description="Returns whether the service is initialized and whether graceful termination is in progress.",
     openapi_extra={
         "x-doc": {
             "zh-summary": "服务状态",
-            "zh-description": "返回服务是否已初始化。",
+            "zh-description": "返回服务是否已初始化，以及是否正在优雅终止。",
         }
     },
 )
 async def get_server_status_endpoint():
-    return asdict(get_server_status())
+    from chitu.serve.crash import is_shutting_down
+
+    return {
+        **asdict(get_server_status()),
+        "shutting_down": is_shutting_down(),
+    }
 
 
 @app.post(

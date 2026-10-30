@@ -9,7 +9,8 @@ from logging import getLogger
 from fastapi.responses import JSONResponse
 
 from chitu.global_vars import get_global_args
-from chitu.serve.crash import is_dying
+from chitu.serve.crash import is_dying, is_shutting_down
+from chitu.serve.errors import service_shutting_down_response
 from chitu.task import TaskPool
 
 logger = getLogger(__name__)
@@ -36,17 +37,10 @@ class RejectOverloadMiddleware:
         if scope["type"] == "http" and scope["path"].startswith(
             _INFERENCE_PATH_PREFIXES
         ):
-            if is_dying():
-                # During a crash window, reject new inference requests.
-                response = JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": {
-                            "message": "Service is shutting down",
-                            "type": "shutting_down",
-                        }
-                    },
-                )
+            if is_dying() or is_shutting_down():
+                # Reject new inference requests during a crash or graceful
+                # termination; accepted work keeps draining.
+                response = service_shutting_down_response()
                 await response(scope, receive, send)
                 return
 

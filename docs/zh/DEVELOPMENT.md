@@ -923,13 +923,13 @@ curl localhost:21002/v1/messages \
   }'
 ```
 
-优雅终止引擎和 API 服务（需要 `{"confirm": true}` 以防止误操作）。已在处理的请求会在服务退出前完成，终止发起后新请求将被拒绝。
+优雅终止引擎和 API 服务（需要 `{"confirm": true}` 以防止误操作）。接口会立即返回 HTTP 202，并在后台等待在途请求完成；终止发起后新的推理请求将被拒绝。可通过 `drain_timeout_s` 限制等待时间；省略表示不设限，设置为 `0` 表示立即终止在途请求。
 
 ```bash
 curl localhost:21002/terminate_engine \
   -X POST \
   -H "Content-Type: application/json" \
-  -d '{"confirm": true}'
+  -d '{"confirm": true, "drain_timeout_s": 60}'
 ```
 
 如果客户端在响应生成完成前断开连接（无论流式还是非流式请求），HTTP 层会检测到连接已关闭，

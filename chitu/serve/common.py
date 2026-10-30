@@ -29,6 +29,7 @@ from chitu.task_type import TaskType
 from chitu.utils import get_chitu_env
 from chitu.dp_router import get_request_router, get_token_router
 from chitu.serve.crash import report_and_exit
+from chitu.serve.errors import ServiceShuttingDown
 
 logger = getLogger(__name__)
 
@@ -476,7 +477,8 @@ async def submit_request(req: UserRequest):
         logger.debug(f"[HTTP] Using DP mode for request: {req.request_id}")
         token_router = get_token_router()
         request_router = get_request_router()
-        await request_router.add_request(req)
+        if not await request_router.add_request(req):
+            raise ServiceShuttingDown()
         await token_router.register_request(req)
     else:
         from chitu.testing.exception import test_inject_exception_request_build_failure

@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import chitu.batched_seq_len as batched_seq_len_module
+from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 import chitu.dsa_indexer_backend as dsa_indexer_module
 from chitu.dsa_indexer_backend import DSAIndexer, get_indexer_class
 import chitu.dsa_indexer_backend.base as base_backend
@@ -746,28 +748,252 @@ def test_deepgemm_decode_metadata_reuses_its_static_buffer(monkeypatch):
     assert addresses[0] == addresses[1] and len(calls) == 2
 
 
-def test_triton_prefill_schedule_is_shared_per_step_and_reset(monkeypatch):
-    indexer = object.__new__(triton_backend.TritonBF16Indexer)
-    indexer._init_backend(None)
-    calls = []
+@pytest.fixture
+def triton_prefill_indexer(monkeypatch, global_args):
+    if not triton_backend.has_triton:
+        pytest.skip("requires the Triton BF16 backend")
+    monkeypatch.setitem(global_args.models, "index_topk", 2)
+    monkeypatch.setitem(global_args.infer, "cache_type", "paged")
+    return triton_backend.TritonBF16Indexer("triton_bf16")
 
-    def build(ks, block_m, device):
-        calls.append(ks)
-        return torch.zeros(1, dtype=torch.int32), torch.tensor([ks.numel()]), 1
 
-    monkeypatch.setattr(triton_backend, "DEFAULT_BLOCK_M", 8, raising=False)
-    monkeypatch.setattr(triton_backend, "_bucket_max_n", lambda n: n, raising=False)
-    monkeypatch.setattr(triton_backend, "build_qblock_schedule", build, raising=False)
-    ks, ke = torch.tensor([0, 0]), torch.tensor([10, 20])
-    first, _, _ = indexer._prefill_schedule(ks, ke, True)
-    second, actual_ks, actual_ke = indexer._prefill_schedule(
-        ks.clone(), ke.clone(), True
+@pytest.fixture
+def cpu_prefill_delta(monkeypatch):
+    # CPU metadata does not need pinned allocation or CUDA graph capture.
+    def create_tensor(data, device, dtype=None, sync_free=True):
+        return torch.tensor(data, device=device, dtype=dtype)
+
+    monkeypatch.setattr(batched_seq_len_module, "create_tensor", create_tensor)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    return BatchedSeqLenDelta(
+        [1, 3],
+        [5, 7],
+        device="cpu",
+        max_batch_size=2,
+        max_total_len=32,
+        max_total_delta_len=16,
     )
+
+
+@pytest.mark.parametrize("pcp_size", [1, 2])
+def test_triton_prefill_schedules_distinguish_equal_sized_chunks(
+    triton_prefill_indexer, cpu_prefill_delta, pcp_size
+):
+    indexer = triton_prefill_indexer
+    delta = cpu_prefill_delta
+    query_delta = (
+        delta
+        if pcp_size == 1
+        else BatchedSeqLenDeltaView(delta, indices=torch.arange(0, 8, pcp_size))
+    )
+    schedules = {}
+    for layer in range(2):
+        for start in range(0, 8 // pcp_size, 2):
+            # Views are recreated per layer, including PCP index slices.
+            view = BatchedSeqLenDeltaView(query_delta, start, start + 2)
+            seq_ids = view.delta_seq_ids_tensor_device
+            ks = delta.new.prefix_lens_tensor_device[seq_ids]
+            ke = ks + view.delta_position_ids_tensor_device + 1
+            schedule, actual_ks, actual_ke = indexer._prefill_schedule(
+                ks, ke, True, seq_len_delta=view
+            )
+
+            assert schedule is not None
+            assert torch.equal(actual_ks, ks)
+            assert torch.equal(actual_ke, ke)
+            assert schedule["actual_max_n"] == int((ke - ks).max())
+            assert schedule["block_q_start"].tolist() == [0]
+            assert schedule["block_n_rows"].tolist() == [2]
+            if layer == 0:
+                assert all(schedule is not other for other in schedules.values())
+                schedules[start] = schedule
+            else:
+                assert schedule is schedules[start]
+
+    assert len(indexer._prefill_schedules) == len(schedules)
+
+
+def test_triton_prefill_schedule_is_shared_per_step_and_reset(
+    triton_prefill_indexer, cpu_prefill_delta
+):
+    indexer = triton_prefill_indexer
+    delta = cpu_prefill_delta
+    ks = delta.new.prefix_lens_tensor_device[delta.delta_seq_ids_tensor_device]
+    ke = ks + delta.delta_position_ids_tensor_device + 1
+    first, _, _ = indexer._prefill_schedule(ks, ke, True, seq_len_delta=delta)
+    second, actual_ks, actual_ke = indexer._prefill_schedule(
+        ks.clone(), ke.clone(), True, seq_len_delta=delta
+    )
+
     assert first is second
     assert actual_ks is ks and actual_ke is ke
-    assert len(calls) == 1
-    indexer.prepare_metadata_for_prefill(object())
-    assert indexer.prefill_schedule is None
-    third, _, _ = indexer._prefill_schedule(ks, ke + 1, True)
-    assert third is not first and third["actual_max_n"] == 21
-    assert len(calls) == 2
+    assert first["block_q_start"].tolist() == [0, 4]
+    assert first["block_n_rows"].tolist() == [4, 4]
+    assert first["actual_max_n"] == 7
+
+    indexer.prepare_metadata_for_prefill(delta)
+    rebuilt, _, _ = indexer._prefill_schedule(ks, ke, True, seq_len_delta=delta)
+    assert rebuilt is not first
+    assert torch.equal(rebuilt["ks"], ks)
+    assert torch.equal(rebuilt["ke"], ke)
+    assert len(indexer._prefill_schedules) == 1
+
+
+@pytest.mark.parametrize(
+    ("old_lengths", "new_lengths", "start"),
+    [([2, 2], [5, 7], 0), ([1, 3], [6, 6], 4)],
+    ids=["old_lengths_change", "new_lengths_change"],
+)
+def test_triton_prefill_length_update_invalidates_all_chunk_schedules(
+    triton_prefill_indexer, cpu_prefill_delta, old_lengths, new_lengths, start
+):
+    indexer = triton_prefill_indexer
+    delta = cpu_prefill_delta
+    previous = []
+    for chunk_start in (0, 4):
+        view = BatchedSeqLenDeltaView(delta, chunk_start, chunk_start + 4)
+        ks = delta.new.prefix_lens_tensor_device[view.delta_seq_ids_tensor_device]
+        ke = ks + view.delta_position_ids_tensor_device + 1
+        schedule, _, _ = indexer._prefill_schedule(ks, ke, True, seq_len_delta=view)
+        previous.append(schedule)
+
+    # Keep the same metadata object and total query count without an explicit reset.
+    delta.copy_from_list(old_lengths, new_lengths)
+    assert delta.delta_total_len == 8
+    view = BatchedSeqLenDeltaView(delta, start, start + 4)
+    ks = delta.new.prefix_lens_tensor_device[view.delta_seq_ids_tensor_device]
+    ke = ks + view.delta_position_ids_tensor_device + 1
+    current, actual_ks, actual_ke = indexer._prefill_schedule(
+        ks, ke, True, seq_len_delta=view
+    )
+
+    assert all(current is not old for old in previous)
+    assert torch.equal(actual_ks, ks)
+    assert torch.equal(actual_ke, ke)
+    assert not torch.equal(previous[start // 4]["ke"], actual_ke)
+    assert current["actual_max_n"] == int((ke - ks).max())
+    assert len(indexer._prefill_schedules) == 1
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and triton_backend.has_triton),
+    reason="requires a CUDA/HIP GPU and Triton",
+)
+@pytest.mark.parametrize(
+    ("pcp_size", "chunk_rows"),
+    [(1, None), (1, 4), (2, 2)],
+    ids=["single_pass", "query_chunks", "pcp_query_chunks"],
+)
+@pytest.mark.parametrize("is_causal", [True, False])
+def test_triton_prefill_cached_scores_and_topk_match_reference(
+    monkeypatch, global_args, triton_prefill_indexer, pcp_size, chunk_rows, is_causal
+):
+    indexer = triton_prefill_indexer
+    monkeypatch.setitem(global_args.infer, "op_impl", "triton")
+    delta = BatchedSeqLenDelta(
+        [2, 3],
+        [7, 9],
+        device="cuda",
+        max_batch_size=2,
+        max_total_len=32,
+        max_total_delta_len=16,
+    )
+    # Dyadic values keep BF16 products exact and TopK scores distinct.
+    keys = torch.zeros(16, 128, dtype=torch.bfloat16, device="cuda")
+    keys[:7, 0] = torch.arange(1, 8, device="cuda") / 8
+    keys[7:, 0] = torch.arange(9, 0, -1, device="cuda") / 8
+    block_table = torch.tensor([[3, 1, 5], [4, 0, 2]], dtype=torch.int32, device="cuda")
+    storage = torch.zeros(6, 4, 128, dtype=torch.bfloat16, device="cuda")
+    bf16_backend.append_to_paged_kv_cache(
+        storage,
+        block_table,
+        keys,
+        delta.new.position_ids_tensor_device,
+        delta.new.seq_ids_tensor_device,
+        impl="torch",
+    )
+    accessor = PagedKVCacheAccessor(block_table, {"indexer_k": storage})
+    query_delta = (
+        delta
+        if pcp_size == 1
+        else BatchedSeqLenDeltaView(
+            delta, indices=torch.arange(0, 11, pcp_size, device="cuda")
+        )
+    )
+    rows = query_delta.delta_total_len
+    indexer._indexer_logits_chunk_bytes = (
+        None if chunk_rows is None else indexer.row_width(query_delta) * 4 * chunk_rows
+    )
+    selected_chunk_rows = indexer.chunk_size(query_delta)
+    assert selected_chunk_rows == chunk_rows
+    rows_per_chunk = selected_chunk_rows or rows
+    schedules = {}
+
+    for layer in range(2):
+        q = torch.zeros(rows, 64, 128, dtype=torch.bfloat16, device="cuda")
+        q[:, :, 0] = layer + 1
+        weights = torch.ones(rows, 64, dtype=torch.float32, device="cuda")
+        for start in range(0, rows, rows_per_chunk):
+            stop = min(start + rows_per_chunk, rows)
+            view = (
+                query_delta
+                if rows_per_chunk >= rows
+                else BatchedSeqLenDeltaView(query_delta, start, stop)
+            )
+            seq_ids = view.delta_seq_ids_tensor_device
+            local_ks = (
+                delta.new.prefix_lens_tensor_device[seq_ids] if pcp_size > 1 else None
+            )
+            local_ke = None
+            if pcp_size > 1:
+                local_ke = (
+                    view.delta_position_ids_tensor_device + 1
+                    if is_causal
+                    else delta.new.lens_tensor_device[seq_ids]
+                )
+            actual = indexer.index_score(
+                q[start:stop],
+                weights[start:stop],
+                view,
+                accessor,
+                is_causal,
+                ks=local_ks,
+                ke=local_ke,
+            )
+            lengths = (
+                view.delta_position_ids_tensor_device + 1
+                if is_causal
+                else delta.new.lens_tensor_device[seq_ids]
+            )
+            expected = torch.full(
+                (stop - start, int(lengths.max())),
+                -torch.inf,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            for row, (seq_id, length) in enumerate(
+                zip(seq_ids.tolist(), lengths.tolist())
+            ):
+                seq_start = (0, 7)[seq_id]
+                qk = (
+                    q[start + row].float()
+                    @ keys[seq_start : seq_start + length].float().T
+                )
+                expected[row, :length] = (
+                    qk.relu() * weights[start + row, :, None]
+                ).sum(0)
+
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            actual_ids = indexer.topk_indices(actual, 2, view)
+            assert torch.equal(
+                actual_ids, expected.topk(2, dim=-1).indices.to(torch.int32)
+            )
+            schedule = indexer.prefill_schedule
+            assert schedule is not None
+            if layer == 0:
+                assert all(schedule is not other for other in schedules.values())
+                schedules[start] = schedule
+            else:
+                assert schedule is schedules[start]
+
+    assert len(indexer._prefill_schedules) == len(schedules)

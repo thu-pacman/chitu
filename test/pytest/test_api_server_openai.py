@@ -83,12 +83,13 @@ async def unexpected_submit_request(_request):
     raise AssertionError("oversized request reached submit_request")
 
 
-def create_client(monkeypatch, *, max_seq_len=4, formatter=None):
+def create_client(monkeypatch, *, max_seq_len=4, formatter=None, n_insts=1):
     args = SimpleNamespace(
         infer=SimpleNamespace(max_seq_len=max_seq_len, max_concurrent_requests=None),
         debug=SimpleNamespace(save_trace_dir=None),
         models=SimpleNamespace(name="test-model"),
         serve=SimpleNamespace(api_keys=[], validate_api_key=False),
+        multi_inst=SimpleNamespace(n_insts=n_insts),
     )
     monkeypatch.setattr(api_server.Backend, "formatter", formatter or DummyFormatter())
     monkeypatch.setattr(api_server.Backend, "tokenizer", DummyTokenizer())
@@ -214,6 +215,30 @@ def test_internal_value_error_remains_server_error(monkeypatch, completion):
 
     assert response.status_code == 500
     assert response.json() == {"detail": "internal failure"}
+
+
+def test_common_submit_request_rejection_returns_503(monkeypatch):
+    client = create_client(monkeypatch, max_seq_len=4096, n_insts=2)
+
+    class RejectingRequestRouter:
+        async def add_request(self, request):
+            return False
+
+    monkeypatch.setattr(
+        serve_common, "get_request_router", lambda: RejectingRequestRouter()
+    )
+    monkeypatch.setattr(serve_common, "get_token_router", lambda: None)
+    monkeypatch.setattr(openai_api, "submit_request", serve_common.submit_request)
+
+    response = post_chat_completion(client)
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "message": "Service is shutting down",
+            "type": "shutting_down",
+        }
+    }
 
 
 def test_broken_tool_call_history_is_replayed_in_completions_api(monkeypatch):

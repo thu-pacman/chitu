@@ -604,6 +604,7 @@ class Task:
         priority: int = 1,
         stop_with_eos: bool = True,
         block_length: int = 32,
+        initial_output_tokens: list[int] | None = None,
     ):
         from chitu.distributed.pd_disaggregation.pd_scheduler import PDSchedulerInfo
 
@@ -627,6 +628,13 @@ class Task:
         )
         self.prompt_len = (
             prompt_len if prompt_len is not None else len(self.prefix_tokens)
+        )
+        # Eviction folds prior output into the new prefill. Snapshot it for
+        # sampling-state replay, separately from subsequently generated tokens.
+        self.initial_output_tokens = (
+            self.prefix_tokens[len(req.prompt_tokens) : self.prompt_len]
+            if req is not None
+            else list(initial_output_tokens or [])
         )
         self.mtp_accept_index: int = -1
         """ last mtp accept index, equals to (number of last accept token) - 1, -1 means last round is not mtp decode """

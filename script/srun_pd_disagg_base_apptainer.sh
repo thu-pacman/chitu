@@ -659,28 +659,64 @@ pd_node_main() {
   # srun returns max(task_exit_codes).  --kill-on-bad-exit ensures a
   # non-zero exit on any task terminates all others across the cluster.
   #
-  # Node0: Router exit 0 → 200 (success); Router exit N → N; P/D crash → N.
-  # Other nodes: propagate whatever P/D exits with (0=normal, N=crash).
+  # A graceful /terminate_engine makes instances exit one by one: Prefill is
+  # usually drained long before Decode. A zero exit must therefore only retire
+  # that process; it must not end the srun step and kill the instances that are
+  # still draining. A non-zero exit is still a crash and is propagated at once.
+  # Poll child state with kill -0 so this works with bash versions older than
+  # 5.1, where `wait -n -p` is unavailable.
+  wait_for_drain() {
+    local router_pid="${1:-}"
+    shift || true
+    local -a pending=("$@")
+    [ -n "${router_pid}" ] && pending+=("${router_pid}")
+
+    while [ "${#pending[@]}" -gt 0 ]; do
+      local -a remaining=()
+      local pid code
+      for pid in "${pending[@]}"; do
+        if kill -0 "${pid}" 2>/dev/null; then
+          remaining+=("${pid}")
+          continue
+        fi
+
+        if wait "${pid}"; then
+          code=0
+        else
+          code=$?
+        fi
+
+        [ "${code}" = "0" ] || return "${code}"
+        if [ -n "${router_pid}" ] && [ "${pid}" = "${router_pid}" ]; then
+          return 0
+        fi
+      done
+
+      pending=("${remaining[@]}")
+      [ "${#pending[@]}" -eq 0 ] || sleep 0.2
+    done
+    return 0
+  }
+
+  # Node0: all processes exit 0 → 200 (success); any exit N → N.
+  # Other nodes: wait for every local P/D process, propagating the first crash.
   if [ "${SLURM_PROCID}" = "0" ]; then
-    set +e
-    wait -n "${ROUTER_PID}" "${LOCAL_PIDS[@]}"
-    first_code=$?
-    set -e
-    if ! kill -0 "${ROUTER_PID}" 2>/dev/null; then
-      # Router was the first to exit.
-      if [ "${first_code}" = "0" ]; then
-        exit 200
-      fi
-      exit "${first_code}"
+    if wait_for_drain "${ROUTER_PID}" "${LOCAL_PIDS[@]}"; then
+      code=0
+    else
+      code=$?
     fi
-    # A P/D instance exited first — propagate its exit code.
-    exit "${first_code}"
+    if [ "${code}" = "0" ]; then
+      exit 200
+    fi
+    exit "${code}"
   else
-    set +e
-    wait -n "${LOCAL_PIDS[@]}"
-    code=$?
-    set -e
-    exit $code
+    if wait_for_drain "" "${LOCAL_PIDS[@]}"; then
+      code=0
+    else
+      code=$?
+    fi
+    exit "${code}"
   fi
 }
 

@@ -94,32 +94,16 @@ def test_responses_input_to_internal_supports_tool_roundtrip_items():
     ]
 
 
-@pytest.mark.parametrize(
-    "tools",
-    [
-        [
-            {
-                "type": "function",
-                "name": "get_weather",
-                "description": "Get weather",
-                "parameters": {"type": "object", "properties": {}},
-                "strict": True,
-            }
-        ],
-        [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "description": "Get weather",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-                "strict": True,
-            }
-        ],
-    ],
-)
-def test_normalize_response_tools_accepts_flat_and_chat_shapes(tools):
+def test_normalize_response_tools_accepts_flat_shape():
+    tools = [
+        {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {"type": "object", "properties": {}},
+            "strict": True,
+        }
+    ]
     internal_tools, public_tools, tool_names = normalize_response_tools(tools)
 
     assert tool_names == {"get_weather": {"name": "get_weather"}}
@@ -202,3 +186,27 @@ def test_normalize_text_config_keeps_json_schema_shape():
     assert normalized["format"]["type"] == "json_schema"
     assert normalized["format"]["name"] == "recipe"
     assert internal["schema"]["required"] == ["title"]
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        [{"type": "function"}],
+        [{"type": "function", "name": "sql"}, {"type": "custom", "name": "sql"}],
+        [{"type": "custom"}],
+        [{"type": "custom", "name": "sql", "format": {"type": "grammar"}}],
+    ],
+)
+def test_invalid_function_and_custom_tools_are_rejected(tools):
+    with pytest.raises(ValueError):
+        normalize_response_tools(tools)
+
+
+@pytest.mark.parametrize("description", [False, 0, [], {}])
+@pytest.mark.parametrize("tool_type", ["function", "custom", "namespace"])
+def test_tool_descriptions_reject_non_string_values(description, tool_type):
+    tool = {"type": tool_type, "name": "example", "description": description}
+    if tool_type == "namespace":
+        tool["tools"] = []
+    with pytest.raises(ValueError, match="description must be a string"):
+        normalize_response_tools([tool])

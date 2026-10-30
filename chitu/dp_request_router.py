@@ -60,8 +60,10 @@ from chitu.dp_router import (
 from chitu.serve.crash import (
     MSG_TYPE_CRASH,
     is_dying,
+    is_shutting_down,
     report_and_exit,
     get_crash_reason,
+    set_shutting_down,
 )
 
 logger = logging.getLogger(__name__)
@@ -1460,8 +1462,15 @@ class RequestRouter:
                 socket, payload, f"instance:{local_instance_id}"
             )
 
-    async def add_request(self, request: UserRequest):
+    async def add_request(self, request: UserRequest) -> bool:
         """Add new request to processing queue."""
+        if is_shutting_down():
+            logger.info(
+                "[REQUEST_ROUTER] rejecting request %s during termination",
+                request.request_id,
+            )
+            self.finish_request_before_recv_stop(request, error="service shutting down")
+            return False
         self._ensure_ttft_deadline(request)
         self.pending_requests.append(request)
 
@@ -1469,6 +1478,7 @@ class RequestRouter:
         logger.debug(
             f"Added request {request.request_id} to queue (queue size: {len(self.pending_requests)})"
         )
+        return True
 
     async def _send_with_retry(
         self,
@@ -1590,17 +1600,64 @@ class RequestRouter:
             [addr for addr_list in self.collector_addrs.values() for addr in addr_list]
         )
 
+    def _has_inflight_requests(self) -> bool:
+        """Whether the Router still owns any unfinished user request."""
+        token_router = get_token_router(check_exist=False)
+        if token_router is not None and any(
+            not request.finished for request in token_router.active_requests.values()
+        ):
+            return True
+        return any(not request.finished for request in self.pending_requests)
+
+    async def _wait_for_requests_drained(self) -> None:
+        from chitu.testing.exception import (
+            test_inject_exception_terminate_drain_stuck,
+        )
+
+        while (
+            self._has_inflight_requests()
+            or test_inject_exception_terminate_drain_stuck()
+        ):
+            await asyncio.sleep(0.05)
+
+    async def wait_for_requests_drained(
+        self, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Wait until the Router has no accepted requests left.
+
+        ``None`` waits indefinitely. A non-positive timeout does not wait and
+        reports whether the Router is already drained; the caller force-stops any
+        remaining work otherwise.
+        """
+        if timeout_s is not None and timeout_s <= 0:
+            return not self._has_inflight_requests()
+        if timeout_s is None:
+            await self._wait_for_requests_drained()
+            return True
+        try:
+            await asyncio.wait_for(
+                self._wait_for_requests_drained(),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[REQUEST_ROUTER] timed out waiting for in-flight requests")
+            return False
+        return True
+
+    def _expected_termination_ids(self) -> set[int]:
+        """Global instance IDs that should send a termination acknowledgement."""
+        return set(range(self._n_insts))
+
     async def wait_for_instances_terminated(self, timeout_s: float = 30.0) -> bool:
         """Wait until all instances report termination through the stats channel."""
+        expected = self._expected_termination_ids()
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            if all(self._drain_complete.get(i, False) for i in range(self._n_insts)):
+            if all(self._drain_complete.get(i, False) for i in expected):
                 return True
             await asyncio.sleep(0.05)
 
-        pending = [
-            i for i in range(self._n_insts) if not self._drain_complete.get(i, False)
-        ]
+        pending = sorted(i for i in expected if not self._drain_complete.get(i, False))
         logger.warning(
             f"[REQUEST_ROUTER] timed out waiting for instance termination: {pending}"
         )

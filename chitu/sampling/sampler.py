@@ -115,6 +115,9 @@ class TaskSampleState:
             # state, i.e. no constraint at all.
             tokens = list(task.prefix_tokens)
 
+        # Replay output folded into the prefill on eviction, then new output.
+        tokens = getattr(task, "initial_output_tokens", []) + tokens
+
         state = TaskSampleState(
             task=task,
             sample_params=task.sample_params,

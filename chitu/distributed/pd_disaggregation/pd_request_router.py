@@ -58,6 +58,7 @@ from chitu.serve.crash import (
     MSG_TYPE_CRASH,
     report_and_exit,
     is_dying,
+    is_shutting_down,
     get_crash_reason,
 )
 from chitu.dp_router import get_token_router
@@ -1090,6 +1091,26 @@ class PDRequestRouter(RequestRouter):
         return super()._find_inflight_request(request_id)
 
     @override
+    def _has_inflight_requests(self) -> bool:
+        """Every accepted PD request remains here until it finishes or fails."""
+        return any(
+            pd_request.status != PDRequestStatus.FAILED
+            and not pd_request.original_request.finished
+            for pd_request in self.pending_pd_requests.values()
+        )
+
+    @override
+    def _expected_termination_ids(self) -> set[int]:
+        expected: set[int] = set()
+        for schedulers in (self.prefill_schedulers, self.decode_schedulers):
+            expected.update(
+                info["global_instance_id"]
+                for info in schedulers.values()
+                if info.get("status") == "online"
+            )
+        return expected
+
+    @override
     async def abort_request(
         self, request_id: str, reason: str = "client disconnected"
     ) -> bool:
@@ -1145,14 +1166,21 @@ class PDRequestRouter(RequestRouter):
             self.finish_request_before_recv_stop(request, finish_reason="aborted")
         return True
 
-    async def add_request(self, request: UserRequest):
+    async def add_request(self, request: UserRequest) -> bool:
         """Add request to router"""
+        if is_shutting_down():
+            logger.info(
+                "[PD_ROUTER] rejecting request %s during termination",
+                request.request_id,
+            )
+            self.finish_request_before_recv_stop(request, error="service shutting down")
+            return False
         self._ensure_ttft_deadline(request)
         if self._reject_ttft_timeout(
             request, "ttft_pd_router"
         ) or self._reject_overlong_request(request):
             self.total_requests += 1
-            return
+            return True
         if not await self._add_pd_request(request):
             logger.warning(
                 "[PD_ROUTER][request_rejected] req_id=%s reason=pd_pair_unavailable",
@@ -1164,6 +1192,7 @@ class PDRequestRouter(RequestRouter):
                 error="No available prefill/decode workers",
             )
             self.total_requests += 1
+        return True
 
     def _reject_overlong_request(self, request: UserRequest) -> bool:
         for enabled, stage, req_len, schedulers in (
