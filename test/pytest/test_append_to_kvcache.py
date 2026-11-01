@@ -578,6 +578,128 @@ def test_paged_empty_this_kv_semantics(impl):
     assert_close(out, before, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.parametrize("impl", ["torch", "triton"])
+@pytest.mark.skipif(not has_accelerator(), reason="Requires an accelerator")
+def test_paged_dcp(impl):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+    if impl == "torch" and has_torch_npu:
+        pytest.skip("Ascend Torch DCP append is not supported")
+
+    device = "cuda"
+    page_size, dcp_size = 4, 4
+    table = torch.tensor([[4, 1], [3, -1]], device=device, dtype=torch.int32)
+    positions = [14, 15, 16, 2, 3, 4, -1, 20]
+    seq_ids = [0, 0, 0, 1, 1, 1, -1, 1]
+    values = (
+        (torch.arange(len(positions) * 514, device=device) % 97)
+        .to(torch.bfloat16)
+        .reshape(-1, 2, 257)
+    )
+
+    for rank in range(dcp_size):
+        # Gaps between pages and a record wider than one GPU block.
+        storage = torch.full((6, 8, 2, 257), -1, device=device, dtype=values.dtype)
+        expected = storage.clone()
+        for row, (seq_id, pos) in enumerate(zip(seq_ids, positions)):
+            if pos < 0 or (pos // page_size) % dcp_size != rank:
+                continue
+            page = int(table[seq_id, pos // (page_size * dcp_size)].item())
+            if page >= 0:
+                expected[page, pos % page_size] = values[row]
+
+        append_to_paged_kv_cache(
+            storage[:, :page_size],
+            table,
+            values,
+            torch.tensor(positions, device=device, dtype=torch.int32),
+            torch.tensor(seq_ids, device=device, dtype=torch.int32),
+            decode_cp_size=dcp_size,
+            decode_cp_rank=rank,
+            impl=impl,
+        )
+        assert_close(storage, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not has_accelerator(), reason="Requires an accelerator")
+@pytest.mark.parametrize("dcp_size", [1, 2])
+def test_paged_getters(dcp_size):
+    if dcp_size > 1 and has_torch_npu:
+        pytest.skip("Ascend Torch DCP append is not supported")
+    device = "cuda"
+    cache = torch.zeros(3, 4, 2, device=device)
+    values = torch.tensor([[1, 2], [3, 4]], device=device, dtype=cache.dtype)
+    page_ids = torch.tensor([2, 0], device=device, dtype=torch.int32)
+    offsets = torch.tensor([3, 1], device=device, dtype=torch.int32)
+    expected = cache.clone()
+    expected[2, 3] = values[0]
+    if dcp_size == 1:
+        expected[0, 1] = values[1]
+
+    append_to_paged_kv_cache(
+        cache,
+        None,
+        values,
+        torch.tensor([4, 0], device=device, dtype=torch.int32),
+        get_page_ids=lambda: page_ids,
+        get_offs_in_page=lambda: offsets,
+        decode_cp_size=dcp_size,
+        decode_cp_rank=dcp_size - 1,
+        impl="torch",
+    )
+    assert_close(cache, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(
+    not has_triton or not has_accelerator() or has_torch_npu,
+    reason="Requires CUDA/HIP Triton and graph support",
+)
+def test_paged_dcp_graph():
+    device = "cuda"
+    cache = torch.full((4, 4, 3), -1, device=device, dtype=torch.bfloat16)
+    table = torch.tensor([[2, 0], [3, 1]], device=device, dtype=torch.int32)
+    positions = torch.tensor([4, 3], device=device, dtype=torch.int32)
+    values = torch.tensor([[1, 2, 3], [4, 5, 6]], device=device, dtype=cache.dtype)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        append_to_paged_kv_cache(
+            cache,
+            table,
+            values,
+            positions,
+            decode_cp_size=4,
+            decode_cp_rank=1,
+            impl="triton",
+        )
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        append_to_paged_kv_cache(
+            cache,
+            table,
+            values,
+            positions,
+            decode_cp_size=4,
+            decode_cp_rank=1,
+            impl="triton",
+        )
+
+    for new_positions, writes in [
+        ([4, 3], [(0, 2, 0)]),
+        ([0, 3], []),
+        ([20, 23], [(0, 0, 0), (1, 1, 3)]),
+    ]:
+        cache.fill_(-1)
+        positions.copy_(torch.tensor(new_positions, device=device, dtype=torch.int32))
+        expected = torch.full_like(cache, -1)
+        for row, page, offset in writes:
+            expected[page, offset] = values[row]
+        graph.replay()
+        assert_close(cache, expected, atol=0.0, rtol=0.0)
+
+
 @pytest.mark.parametrize("impl", ["triton"])
 def test_paged_offset_overflow_case_matches_torch_with_i64(impl):
     """

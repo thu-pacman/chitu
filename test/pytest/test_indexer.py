@@ -470,7 +470,7 @@ def test_fp8_dsa_main_cache_validates_base_tensor_rules_for_packed_layout():
 def _paged_accessor(*keys: str) -> PagedKVCacheAccessor:
     return PagedKVCacheAccessor(
         torch.zeros(1, 1, dtype=torch.int32),
-        {key: torch.empty(1, 4, 128) for key in keys},
+        {key: torch.empty(1, 3, 1) for key in keys},
     )
 
 
