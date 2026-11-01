@@ -325,14 +325,56 @@ def test_soft_fp8_dequant_is_close_to_dequant(dtype: torch.dtype, record_benchma
     block_size = 128
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    dequant_b = record_benchmark.run(
-        lambda: soft_fp8_blockfp8_weight_dequant(b, b_s),
+    soft_dequant_b = record_benchmark.run(
+        lambda: blockfp8_weight_dequant(b, b_s, impl="soft_triton"),
         dim=dim,
         impl="soft_fp8_dequant",
     )
-    soft_dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
+    dequant_b = blockfp8_weight_dequant(b, b_s, impl="triton")
 
     assert_close(dequant_b, soft_dequant_b, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not has_native_fp8(),
+    reason="This test requires the GPU to have native FP8 support",
+)
+@pytest.mark.skipif(not has_triton, reason="triton is not available")
+def test_blockfp8_weight_dequant_auto_selects_impl_by_raise_lower_bit_float_to():
+    torch.set_default_dtype(torch.bfloat16)
+    dim = 256
+    block_size = 128
+    b, b_s = init_b_and_b_s(dim, block_size)
+
+    # `raise_lower_bit_float_to` larger than one byte declares that the platform
+    # cannot run fp8 compute, so the fp8 bits are decoded in software (soft fp8).
+    set_global_args(
+        OmegaConf.create({"infer": {"raise_lower_bit_float_to": "bfloat16"}}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    with AssertOpCalled("blockfp8_weight_dequant", "soft_triton"):
+        soft_dequant_b = blockfp8_weight_dequant(b, b_s)
+    assert_close(
+        soft_dequant_b,
+        soft_fp8_blockfp8_weight_dequant(b, b_s),
+        rtol=0,
+        atol=0,
+    )
+
+    set_global_args(
+        OmegaConf.create({"infer": {"raise_lower_bit_float_to": "float8_e4m3fn"}}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    with AssertOpCalled("blockfp8_weight_dequant", "triton"):
+        dequant_b = blockfp8_weight_dequant(b, b_s)
+    assert_close(
+        dequant_b,
+        blockfp8_weight_dequant(b, b_s, impl="triton"),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.parametrize("bs", [0, 1, 256])

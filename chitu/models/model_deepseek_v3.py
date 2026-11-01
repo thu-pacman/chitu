@@ -47,7 +47,6 @@ from chitu.ops import (
     silu_and_mul,
     situ_and_mul,
     blockfp8_weight_dequant,
-    soft_fp8_blockfp8_weight_dequant,
     blockfp8_weight_quant,
     unpack_every_uint8_to_two_fp4_e2m1_in_uint8,
     from_fp4_e2m1_in_uint8,
@@ -2359,12 +2358,6 @@ class TransformerDeepSeekV3(Transformer):
         tp_size = get_tp_size()
         n_local_heads = self.params.n_heads // tp_size
 
-        weight_dequant_fn = (
-            soft_fp8_blockfp8_weight_dequant
-            if get_global_args().infer.raise_lower_bit_float_to == "bfloat16"
-            else blockfp8_weight_dequant
-        )
-
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -2392,7 +2385,7 @@ class TransformerDeepSeekV3(Transformer):
                     assert prefix + "kv_b_proj.scale" in checkpoint
                     kv_b_proj_scale = checkpoint.pop(prefix + "kv_b_proj.scale")
                     old_device = kv_b_proj_ckpt_weight.device
-                    kv_b_proj_weight = weight_dequant_fn(
+                    kv_b_proj_weight = blockfp8_weight_dequant(
                         kv_b_proj_ckpt_weight.cuda(),
                         kv_b_proj_scale.cuda(),
                         scale_block_shape=[block_size, block_size],
@@ -2446,7 +2439,7 @@ class TransformerDeepSeekV3(Transformer):
                     assert prefix + "q_b_proj.scale" in checkpoint
                     q_b_proj_scale = checkpoint.pop(prefix + "q_b_proj.scale")
                     old_device = q_b_proj_ckpt_weight.device
-                    q_b_proj_weight = weight_dequant_fn(
+                    q_b_proj_weight = blockfp8_weight_dequant(
                         q_b_proj_ckpt_weight.cuda(),
                         q_b_proj_scale.cuda(),
                         scale_block_shape=[block_size, block_size],
@@ -2561,7 +2554,7 @@ class TransformerDeepSeekV3(Transformer):
                     assert prefix + "o_proj.scale" in checkpoint
                     o_proj_scale = checkpoint.pop(prefix + "o_proj.scale")
                     old_device = o_proj_ckpt_weight.device
-                    o_proj_weight = weight_dequant_fn(
+                    o_proj_weight = blockfp8_weight_dequant(
                         o_proj_ckpt_weight.cuda(),
                         o_proj_scale.cuda(),
                         scale_block_shape=[block_size, block_size],

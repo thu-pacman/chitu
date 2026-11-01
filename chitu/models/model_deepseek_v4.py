@@ -72,7 +72,6 @@ from chitu.ops.deepseek_v4_decode_plan import (
 from chitu.ops.mhc import mhc_pre, mhc_post
 from chitu.ops.quant import (
     blockfp8_weight_dequant,
-    soft_fp8_blockfp8_weight_dequant,
 )
 from chitu.quantization import (
     NormalLinear,
@@ -1799,12 +1798,7 @@ class AttentionDeepSeekV4(Attention):
         if isinstance(self.wo_a, NormalLinear):
             return self.wo_a.weight
         elif isinstance(self.wo_a, Blockfp8Linear):
-            weight_dequant_fn = (
-                soft_fp8_blockfp8_weight_dequant
-                if get_global_args().infer.raise_lower_bit_float_to == "bfloat16"
-                else blockfp8_weight_dequant
-            )
-            return weight_dequant_fn(
+            return blockfp8_weight_dequant(
                 self.wo_a.weight,
                 self.wo_a.scale,
                 scale_block_shape=self.wo_a.scale_block_shape,

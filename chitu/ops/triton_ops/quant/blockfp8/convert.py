@@ -603,7 +603,6 @@ def blockfp8_weight_dequant_triton(
 def soft_fp8_blockfp8_weight_dequant_triton(
     x: torch.Tensor,
     s: torch.Tensor,
-    *,
     scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ) -> torch.Tensor:
     """
