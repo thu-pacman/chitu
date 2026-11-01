@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from chitu.lazy import eval_lazy, make_lazy_op
 from chitu.ops.utils import check_checkpoint_args, make_op_dispatcher
-from chitu.device_type import is_hygon, is_muxi
+from chitu.device_type import is_enflame, is_hygon, is_muxi
 from chitu.utils import try_import_opt_dep, try_import_platform_dep
 
 if is_muxi():
@@ -71,7 +71,7 @@ def naive_recurrent_gated_delta_rule_all_state(
 
     Returns:
         o: [B, T, H, V]
-        final_state: [B, H, T, K, V] if output_final_state else None
+        final_state: [B, T, H, K, V] if output_final_state else None
     """
     initial_dtype = q.dtype
     if use_qk_l2norm_in_kernel:
@@ -80,41 +80,49 @@ def naive_recurrent_gated_delta_rule_all_state(
         q = F.rms_norm(q, (head_dim,), eps=1e-6) * inv_scale
         k = F.rms_norm(k, (head_dim,), eps=1e-6) * inv_scale
 
+    # Inputs already use the public [B, T, H, ...] layout.  Keep that layout
+    # instead of materializing five H/T transposes only to transpose outputs
+    # back at the end.  Each per-head reduction still sees the same contiguous
+    # K/V row and therefore retains the established arithmetic order.
     q, k, v, beta, g = map(
-        lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g]
+        lambda x: x.contiguous().to(torch.float32), [q, k, v, beta, g]
     )
-    B, H, T, K = k.shape
+    B, T, H, K = k.shape
     V = v.shape[-1]
 
-    o = torch.zeros(B, H, T, V, device=v.device, dtype=v.dtype)
-    h = torch.zeros(B, H, K, V, device=v.device, dtype=v.dtype)
-
-    if initial_state is not None:
+    # Every time slice of ``o`` is assigned below, so zero-filling it only
+    # adds a device launch.  Likewise, do not allocate and fill a throwaway
+    # state when the caller supplies ``initial_state`` (the decode path).
+    # Allocate in the public [B, T, H, ...] layout.  The old implementation
+    # wrote strided token slices in [B, H, T, ...] and then transposed and
+    # materialized both outputs, even though every element is produced once.
+    o = torch.empty(B, T, H, V, device=v.device, dtype=v.dtype)
+    if initial_state is None:
+        h = torch.zeros(B, H, K, V, device=v.device, dtype=v.dtype)
+    else:
         h = initial_state.to(torch.float32)
 
     if scale is None:
         scale = 1 / (q.shape[-1] ** 0.5)
     q = q * scale
 
-    h_all = torch.empty(B, H, T, K, V, device=v.device, dtype=v.dtype)
+    h_all = torch.empty(B, T, H, K, V, device=v.device, dtype=v.dtype)
 
     for i in range(T):
-        b_q = q[:, :, i]
-        b_k = k[:, :, i]
-        b_v = v[:, :, i]
-        h = h * g[:, :, i].exp()[..., None, None]
-        b_beta = beta[:, :, i]
+        b_q = q[:, i]
+        b_k = k[:, i]
+        b_v = v[:, i]
+        h = h * g[:, i].exp()[..., None, None]
+        b_beta = beta[:, i]
         b_v = b_v - (h * b_k[..., None]).sum(-2)
         b_v = b_v * b_beta[..., None]
         h = h + b_k.unsqueeze(-1) * b_v.unsqueeze(-2)
-        o[:, :, i] = torch.einsum("bhd,bhdm->bhm", b_q, h)
-        h_all[:, :, i] = h
-
-    h_all = h_all.transpose(1, 2).contiguous()
+        o[:, i] = torch.einsum("bhd,bhdm->bhm", b_q, h)
+        h_all[:, i] = h
 
     if not output_final_state:
         h_all = None
-    o = o.transpose(1, 2).contiguous().to(initial_dtype)
+    o = o.to(initial_dtype)
 
     return o, h_all
 
@@ -168,6 +176,11 @@ def _auto_chunk_gated_delta_rule(
     checkpoint_cu_starts=None,
     checkpoint_every_n_tokens: int = 0,
 ):
+    if is_enflame():
+        # No GCU implementation is ported onto the new model yet; f-la's flash
+        # kernels are CUDA-only. Pin to the torch implementation (revisit when a
+        # GCU impl is registered below).
+        return "torch"
     if (
         checkpoint_every_n_tokens > 0
         or state_checkpoints is not None
@@ -485,6 +498,8 @@ def _auto_chunk_kimi_delta_attention(
     ``requested_impl`` lets explicit choices pass through the same startup
     validation instead of bypassing the resolver via ``impl``.
     """
+    if is_enflame():
+        return "torch"
     if query is not None:
         head_dim = query.shape[-1]
     if g is not None or beta is not None:
@@ -848,6 +863,8 @@ def recurrent_kimi_delta_attention(
 
 @recurrent_kimi_delta_attention.register_auto
 def _auto_recurrent_kimi_delta_attention():
+    if is_enflame():
+        return "torch"
     if has_boltops_kda:
         return "boltops_kda"
     if has_fla_kda:
@@ -1265,6 +1282,8 @@ def recurrent_gated_delta_rule(
 
 @recurrent_gated_delta_rule.register_auto
 def _auto_recurrent_gated_delta_rule():
+    if is_enflame():
+        return "torch"
     if has_fla:
         return "fla"
     return "torch"
@@ -1363,6 +1382,8 @@ def recurrent_gated_delta_rule_all_state(
 
 @recurrent_gated_delta_rule_all_state.register_auto
 def _auto_recurrent_gated_delta_rule_all_state():
+    if is_enflame():
+        return "torch"
     if has_triton:
         return "triton"
     return "torch"

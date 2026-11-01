@@ -6,11 +6,8 @@ import logging
 from typing import Optional
 from dataclasses import dataclass, field, replace
 import torch
-from xgrammar import (
-    allocate_token_bitmask,
-    GrammarMatcher,
-    BatchGrammarMatcher,
-)
+import xgrammar
+
 from chitu.global_vars import get_global_args, is_pd_prefill_only
 from chitu.task import Task, SampleParams, PackedTasks, PackedTasksResult, TaskType
 from chitu.ops.sampling import (
@@ -23,11 +20,17 @@ from chitu.ops.sampling import (
     resample_mtp_rejected,
     batch_append_tokens,
 )
-from chitu.utils import ceil_div, create_tensor, get_chitu_bool_env, step_timer
+from chitu.utils import ceil_div, create_tensor, step_timer
 
 from .utils import get_tokenizer_info, get_op_device
 
 logger = logging.getLogger(__name__)
+
+# xgrammar is a required dependency; older versions may lack the batched
+# matcher. Keep the per-task GrammarMatcher path available in that case.
+allocate_token_bitmask = getattr(xgrammar, "allocate_token_bitmask", None)
+GrammarMatcher = getattr(xgrammar, "GrammarMatcher", None)
+BatchGrammarMatcher = getattr(xgrammar, "BatchGrammarMatcher", None)
 
 TOKEN_BLOCK_SIZE = 256
 "token block size for frequency penalty"
@@ -93,7 +96,7 @@ class TaskSampleState:
     enable_frequency_penalty: bool
     token_blocks: list[torch.Tensor] | None = None
     output_len: int = 0
-    matcher: GrammarMatcher | None = None
+    matcher: "GrammarMatcher | None" = None
     # Sparse proposal p' (probs, token_ids), shape (mtp_size-1, k) per task:
     # stored at the task's OWN top-k width -- the proposal a draft step returns
     # is `Sampler.max_top_k_samples` wide -- so a task is not pinned to the width of
@@ -126,6 +129,11 @@ class TaskSampleState:
         )
 
         if task.grammar:
+            if GrammarMatcher is None:
+                raise RuntimeError(
+                    "Grammar-constrained decoding requested but the installed "
+                    "xgrammar does not provide GrammarMatcher; install a newer xgrammar."
+                )
             matcher = GrammarMatcher(task.grammar)
             for i, token in enumerate(tokens):
                 if matcher.is_terminated():
@@ -214,7 +222,9 @@ class Sampler:
         self.states: dict[str, TaskSampleState] = {}
         # The rows of the step whose draft has run but whose verify has not.
         self._draft_batch: DraftBatch | None = None
-        self.batch_matcher = BatchGrammarMatcher()
+        self.batch_matcher = (
+            BatchGrammarMatcher() if BatchGrammarMatcher is not None else None
+        )
 
         # Draft proposal params (per-request), set by `prepare_draft_sample_params`
         # before each draft loop. The model reads them via `sample_draft_tokens`
@@ -656,9 +666,13 @@ class Sampler:
                     batch_matchers.append(state.matcher)
                     batch_indices.append(ti)
             if batch_matchers:
-                self.batch_matcher.batch_fill_next_token_bitmask(
-                    batch_matchers, bitmask, batch_indices
-                )
+                if self.batch_matcher is not None:
+                    self.batch_matcher.batch_fill_next_token_bitmask(
+                        batch_matchers, bitmask, batch_indices
+                    )
+                else:
+                    for matcher, batch_index in zip(batch_matchers, batch_indices):
+                        matcher.fill_next_token_bitmask(bitmask, batch_index)
                 all_filled_indices.extend(batch_indices)
             if all_filled_indices:
                 bitmask_gpu = bitmask.to(logits.device, non_blocking=True)

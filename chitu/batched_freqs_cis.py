@@ -20,6 +20,9 @@ class BatchedFreqsCis:
     cos: torch.Tensor
     sin: torch.Tensor
 
+    def __getitem__(self, index) -> "BatchedFreqsCis":
+        return BatchedFreqsCis(self.cos[index], self.sin[index])
+
     @functools.cached_property
     def separatedly_doubled_cos(self):
         return torch.cat([self.cos, self.cos], dim=-1)
