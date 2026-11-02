@@ -50,7 +50,7 @@ def _normalize_model_type(v) -> Any:
 def register_kv_cache_spec(
     *,
     model_types: Optional[List[Any]] = None,
-    predicate: Optional[Callable[[Any], bool]] = None,
+    predicate: Optional[KVSpecPredicate] = None,
     priority: int = 0,
     cache_name: str = "main",
 ):

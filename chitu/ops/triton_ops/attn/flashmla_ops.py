@@ -99,12 +99,12 @@ def quant_pertoken_kvcache_dsa(
     input_k_cache: torch.Tensor,  # [num_blocks, block_size, 1, d] or [num_blocks, block_size, d] or [N, d]
     dv: int = 512,
     tile_size: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     Returns:
-        quantized_nope: [N, dv] uint8 (bit pattern of float8_e4m3fn)
-        scales: [N, dv // tile_size] float32
-        rope_part: [N, d - dv] same dtype as input
+        A packed tensor viewed as uint8 with the last dim expanded from d to 656
+        per token: 512 bytes of fp8-quantized nope part, 16 bytes of 4 fp32
+        scales, and 128 bytes of the 64-dim bf16 rope part.
     """
     assert tile_size == 128, "Only tile_size=128 is supported"
     assert dv % tile_size == 0
