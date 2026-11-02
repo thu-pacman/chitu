@@ -89,6 +89,8 @@ def _auto_blockfp8_weight_dequant():
     except Exception:
         soft_fp8 = False
     if soft_fp8:
+        if is_enflame():
+            return "soft_torch"
         return "soft_triton"
     return "triton"
 
@@ -188,6 +190,22 @@ def soft_fp8_blockfp8_weight_dequant_torch(
     )
     expanded_scale = expanded_scale[..., :rows, :cols]
     return (fp8_as_fp32 * expanded_scale).to(torch.get_default_dtype())
+
+
+def _blockfp8_weight_dequant_soft_torch(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+) -> torch.Tensor:
+    return soft_fp8_blockfp8_weight_dequant_torch(
+        x, s, scale_block_shape=scale_block_shape
+    )
+
+
+blockfp8_weight_dequant.register_candidate("soft_torch")
+blockfp8_weight_dequant.register("soft_torch")(
+    _blockfp8_weight_dequant_soft_torch
+)
 
 
 soft_fp8_blockfp8_weight_dequant.register_candidate("triton")
