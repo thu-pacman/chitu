@@ -193,7 +193,6 @@ from .parse import (
     NameParser,
     FunctionParser,
     ContentParser,
-    EmptyStringParser,
     ToolParserImplBase,
 )
 
@@ -232,7 +231,6 @@ class MyModelParserImpl(ToolParserImplBase):
     arguments = TriggeredParser(
         "<parameter={}\n</parameter>\n",
         parser=argument,
-        outside_parser=EmptyStringParser(),
     )
     tool = SequenceParser(
         "\n<function={}>\n{}</function>\n",
@@ -263,7 +261,7 @@ from .my_model_parser import MyModelToolParser
 tool_parser: MyModelToolParser
 ```
 
-这个例子依赖工具 schema 中存在 `function.parameters.properties`。如果请求里的工具没有 `properties`，parser 侧读取参数类型时会失败。
+这个例子按 `function.parameters.properties` 区分参数类型。工具没有 `parameters`、或没有 `properties`，只意味着"不知道参数类型"：值走 JSON 分支，不会失败。注意 grammar 侧比 parser 更严：构建工具调用 grammar 仍要读 `function.parameters`，缺了会让这次请求退化成无约束生成。
 
 ### 3. 注册 parser
 
@@ -408,7 +406,7 @@ grammar 约束的是原始生成流，所以 trigger 必须匹配正文和 tools
 - `ToolConfig.subset` 用于指定只能调用某些工具，命名工具选择会走这个机制。
 - 当有效工具数量小于等于一个时，grammar 会自动停止在第一个工具调用之后。
 - required tool call 与 thinking 同时启用时，grammar 可能会先要求 reasoning token，再进入工具调用格式；但个别 parser 可以禁止这种组合，例如 DeepSeek V3.1。
-- parser 侧的 `ToolsInfo` 读取 `tool["function"]["parameters"]["properties"]`，工具 schema 应提供 object parameters 和 properties。
+- parser 侧的 `ToolsInfo` 从 `function.parameters.properties` 读参数类型。缺 `parameters` 或缺 `properties` 都只表示"类型未知"，值按 JSON 处理，不会报错。grammar 侧仍要求 `function.parameters` 存在（缺了会让请求退化成无约束），所以工具 schema 仍建议提供 object parameters 和 properties。
 - 如果 tokenizer info 不可用，或 parser 的 `build_grammar()` 返回 `None`，`compile_grammar()` 会返回 `(None, "")`，采样时不会挂上 matcher。适配时不要只看 `tool_parser` 配置，还要验证 grammar 确实被编译并生效。
 
 ## 测试建议
@@ -525,5 +523,5 @@ def test_my_model_tool_parser_minimal():
 | 响应 `content` 里出现完整工具标签，但 `tool_calls` 为空 | 模型输出格式和 `root_parser` 不匹配，或响应层实际加载的 parser 不是预期 parser。 |
 | DSV4 prompt 要求 `<｜DSML｜tool_calls>`，但 grammar 接受 `<｜DSML｜function_calls>` | prompt 格式和 grammar/parser 格式不一致，需要统一块名和标签。 |
 | 分离式模型的结构化 marker（如 `<|open|>tools<|sep|>`）泄漏进 `content` | 模型 yaml 的四个 delimiter id 列表：`separated_tool_calling` 要求全部配置，且每个 id 必须是 marker 各 token 在 tokenizer 里的真实 id。 |
-| parser 抛出 `KeyError` 或参数类型读取失败 | 工具 schema 可能缺少 `function.parameters.properties`，或参数名不在 `properties` 中。 |
+| parser 抛出 `KeyError` 或参数类型读取失败 | 工具 schema 可能缺少 `function.parameters.properties`，或参数名不在 `properties` 中。`ToolsInfo` 已经能容忍 `parameters`/`properties` 缺失；还抛就说明某个自定义 parser 自己在读 schema。 |
 | `tool_choice="required"` 时合法样例被拒绝 | 检查 `enable_thinking` 和 reasoning 配置；最小 grammar 测试先设置 `enable_thinking=False`。 |

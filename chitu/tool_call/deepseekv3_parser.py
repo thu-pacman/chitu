@@ -13,6 +13,7 @@ from .grammar import (
 )
 
 from .parse import (
+    FallbackTriggeredParser,
     TriggeredParser,
     SequenceParser,
     JsonArgumentsParser,
@@ -45,7 +46,7 @@ class DeepSeekV3ParserImpl(ToolParserImplBase):
         "<｜tool▁call▁begin｜>{}<｜tool▁call▁end｜>",
         parser=FunctionParser(parser=tool),
     )
-    root_parser = TriggeredParser(
+    root_parser = FallbackTriggeredParser(
         "<｜tool▁calls▁begin｜>{}<｜tool▁calls▁end｜>",
         parser=tools,
         outside_parser=ContentParser(),

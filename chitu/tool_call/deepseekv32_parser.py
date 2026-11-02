@@ -17,6 +17,7 @@ from .grammar import (
 )
 
 from .parse import (
+    FallbackTriggeredParser,
     TriggeredParser,
     SequenceParser,
     ArgNameParser,
@@ -76,7 +77,7 @@ class DeepSeekV32ParserImpl(ToolParserImplBase):
         "<｜DSML｜invoke {}</｜DSML｜invoke>",
         parser=FunctionParser(parser=tool),
     )
-    root_parser = TriggeredParser(
+    root_parser = FallbackTriggeredParser(
         "<｜DSML｜function_calls>{}</｜DSML｜function_calls>",
         parser=tools,
         outside_parser=ContentParser(),

@@ -10,9 +10,15 @@ class ToolsInfo:
         self.arg_types: dict[str, dict[str, Any]] = {}
         for tool in tools:
             name = tool["function"]["name"]
-            params: dict = tool["function"]["parameters"].get("properties", {})
+            # A tool may omit `parameters`, or write `type` without `properties` (a tool
+            # that takes no arguments). Both only mean "the argument types are unknown"
+            # and must not fail the whole parse.
+            params: dict = (tool["function"].get("parameters") or {}).get(
+                "properties"
+            ) or {}
             self.arg_types[name] = {
-                key: value.get("type", None) for key, value in params.items()
+                key: (value.get("type", None) if isinstance(value, dict) else None)
+                for key, value in params.items()
             }
 
     def get_arg_type(self, name: str, arg_name: str):

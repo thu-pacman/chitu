@@ -18,6 +18,7 @@ from .grammar import (
 )
 
 from .parse import (
+    FallbackTriggeredParser,
     TriggeredParser,
     SequenceParser,
     ArgNameParser,
@@ -66,9 +67,10 @@ class GLM45ParserImpl(ToolParserImplBase):
     arguments = TriggeredParser(
         "<arg_key>{}</arg_value>",
         parser=argument,
+        escape_stops={"<tool_call>"},
     )
     tool = SequenceParser("{}\n{}", parsers=[NameParser(), arguments])
-    tools = TriggeredParser(
+    tools = FallbackTriggeredParser(
         "<tool_call>{}</tool_call>",
         parser=FunctionParser(parser=tool),
         outside_parser=ContentParser(),

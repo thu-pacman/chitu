@@ -193,7 +193,6 @@ from .parse import (
     NameParser,
     FunctionParser,
     ContentParser,
-    EmptyStringParser,
     ToolParserImplBase,
 )
 
@@ -232,7 +231,6 @@ class MyModelParserImpl(ToolParserImplBase):
     arguments = TriggeredParser(
         "<parameter={}\n</parameter>\n",
         parser=argument,
-        outside_parser=EmptyStringParser(),
     )
     tool = SequenceParser(
         "\n<function={}>\n{}</function>\n",
@@ -263,7 +261,7 @@ Finally configure the model yaml. The value must match `MyModelToolParser.__name
 tool_parser: MyModelToolParser
 ```
 
-This example relies on tool schemas containing `function.parameters.properties`. If a request tool has no `properties`, parser-side argument type lookup can fail.
+This example tells argument types apart by `function.parameters.properties`. A tool without `parameters`, or without `properties`, simply has no known argument types: the value takes the JSON branch and nothing fails. Note the grammar side is stricter than the parser here: building a tool-call grammar still reads `function.parameters`, so a tool that omits it makes that request fall back to unconstrained generation.
 
 ### 3. Register the parser
 
@@ -408,7 +406,7 @@ The grammar constrains the RAW generated stream, so its trigger must match the m
 - `ToolConfig.subset` restricts valid calls to selected tool names; named tool choice uses this mechanism.
 - If there is zero or one valid tool, the grammar automatically stops after the first tool call.
 - When required tool calls and thinking are both enabled, the grammar may require reasoning tokens before the tool-call format; individual parsers can reject that combination, as DeepSeek V3.1 does.
-- Parser-side `ToolsInfo` reads `tool["function"]["parameters"]["properties"]`, so tool schemas should provide object parameters and properties.
+- Parser-side `ToolsInfo` reads argument types from `function.parameters.properties`. Missing `parameters` or `properties` means "unknown type" rather than an error: the value is then handled as JSON. The grammar side still requires `function.parameters` (a tool that omits it makes the request unconstrained), so providing object parameters and properties is still recommended.
 - If tokenizer info is unavailable, or the parser's `build_grammar()` returns `None`, `compile_grammar()` returns `(None, "")` and sampling will not attach a matcher. Do not only check `tool_parser`; verify that grammar compilation actually succeeds.
 
 ## Test Recommendations
@@ -525,5 +523,5 @@ Use this symptom table for a first pass:
 | Full tool tags appear in response `content`, but `tool_calls` is empty | The model output format does not match `root_parser`, or the response layer loaded a different parser than expected. |
 | DSV4 prompt asks for `<｜DSML｜tool_calls>`, but grammar accepts `<｜DSML｜function_calls>` | Prompt format and grammar/parser format disagree; align block names and tags. |
 | A separated model's structural markers (e.g. `<|open|>tools<|sep|>`) leak into `content` | The four delimiter id lists in the model yaml: `separated_tool_calling` requires all of them, and each id must be the tokenizer's real id of the marker's tokens. |
-| Parser raises `KeyError` or fails while reading argument types | The tool schema may be missing `function.parameters.properties`, or the generated argument name is not in `properties`. |
+| Parser raises `KeyError` or fails while reading argument types | The tool schema may be missing `function.parameters.properties`, or the generated argument name is not in `properties`. `ToolsInfo` already tolerates a missing `parameters`/`properties`; if this still fires, a custom parser is reading the schema directly. |
 | A valid sample is rejected with `tool_choice="required"` | Check `enable_thinking` and reasoning config; start minimal grammar tests with `enable_thinking=False`. |

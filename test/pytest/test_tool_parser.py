@@ -1,14 +1,28 @@
 import os
 import random, asyncio, json
+from typing import Any, TYPE_CHECKING, cast
+
 import pytest
 import rich
 import xgrammar
 
 from chitu.tool_call import ToolCallParams, ToolConfig
-from chitu.tool_call.utils import _registere_parsers
-from chitu.tool_call.type_def import ChoiceToolCall, ChoiceToolCallFunction
+from chitu.tool_call.dummy_parser import DummyToolParser
+from chitu.tool_call.glm47_parser import GLM47ToolParser
+from chitu.tool_call.parse.reader import Reader
+from chitu.tool_call.utils import _registere_parsers, parse_stream_by_parser
+from chitu.tool_call.type_def import ChoiceDelta, ChoiceToolCall, ChoiceToolCallFunction
+from chitu.output_parser import OutputState
 from chitu.output_parser.type_def import OutputParserParams
 from chitu.output_parser.utils import _output_parser_params_cache
+from tool_parser_corpus import PARSERS as CORPUS_PARSERS
+from tool_parser_corpus import TOOLS as CORPUS_TOOLS
+from tool_parser_corpus import cases as corpus_cases
+from tool_parser_outcome import outcome as corpus_outcome
+from tool_parser_outcome import parse_outcome, stream_outcome
+
+if TYPE_CHECKING:
+    from chitu.async_stream import AsyncDataStream
 
 test_type_arguments = json.dumps({"ks": "vs", "ko": {"kb": True}, "ka": [1, 2, 3]})
 
@@ -70,12 +84,17 @@ def run_match(
         ToolCallParams(
             tools=tools,
             enable_thinking=thinking,
-            config=ToolConfig(choice=tool_choice, at_most_one=not parallel_tool_calls),
+            config=ToolConfig(
+                choice=cast(Any, tool_choice),
+                at_most_one=not parallel_tool_calls,
+            ),
         )
     )
     vocab = sorted(set("".join([data]))) + ["<|CHITU_STOP_TOKEN|>"]
     stop_token_id = len(vocab) - 1
     tokenizer_info = xgrammar.TokenizerInfo(vocab, stop_token_ids=[stop_token_id])
+    if grammar is None:
+        raise ValueError("expected a grammar for the given tools")
     grammar = xgrammar.GrammarCompiler(tokenizer_info).compile_grammar(grammar)
     matcher = xgrammar.GrammarMatcher(grammar)
 
@@ -145,6 +164,7 @@ def run_parse(
 
         try:
             async for delta in parser_obj.parse_stream(async_stream(data)):
+                delta = cast(ChoiceDelta, delta)
                 content += delta.content or ""
                 for tool_delta in delta.tool_calls or []:
                     if tool_delta.index >= len(tools):
@@ -545,15 +565,22 @@ def test_forced_reasoning_params():
     old_get_args = output_parser_utils.get_global_args
     old_get_token_ids = output_parser_utils.get_output_parser_marker_token_ids
     try:
-        output_parser_utils.get_global_args = lambda: SimpleNamespace(
-            models=SimpleNamespace(reasoning_type="forced")
+        setattr(
+            output_parser_utils,
+            "get_global_args",
+            lambda: SimpleNamespace(models=SimpleNamespace(reasoning_type="forced")),
         )
-        output_parser_utils.get_output_parser_marker_token_ids = lambda: (1, 2)
+        cast(Any, output_parser_utils).get_output_parser_marker_token_ids = lambda: (
+            1,
+            2,
+        )
         output_parser_utils._output_parser_params_cache.clear()
         params = output_parser_utils.get_output_parser_params(False)
     finally:
-        output_parser_utils.get_global_args = old_get_args
-        output_parser_utils.get_output_parser_marker_token_ids = old_get_token_ids
+        setattr(output_parser_utils, "get_global_args", old_get_args)
+        cast(Any, output_parser_utils).get_output_parser_marker_token_ids = (
+            old_get_token_ids
+        )
         output_parser_utils._output_parser_params_cache.clear()
 
     assert params.enable_reasoning
@@ -797,13 +824,13 @@ def test_kimi_k3_real_tokenizer():
             )
         )
         info = xgrammar.TokenizerInfo.from_huggingface(
-            tok, vocab_size=163840, stop_token_ids=[163585, 163586]
+            cast(Any, tok), vocab_size=163840, stop_token_ids=[163585, 163586]
         )
         matcher = xgrammar.GrammarMatcher(
-            xgrammar.GrammarCompiler(info).compile_grammar(grammar)
+            xgrammar.GrammarCompiler(info).compile_grammar(cast(Any, grammar))
         )
         accepted = True
-        for token in tok.model.encode(data, allowed_special="all"):
+        for token in cast(Any, tok).model.encode(data, allowed_special="all"):
             if not matcher.accept_token(token):
                 accepted = False
                 break
@@ -897,3 +924,513 @@ def test_kimi_k3_real_tokenizer():
         False,
         False,
     )
+
+
+# ---------------------------------------------------------------------------
+# The shared parse framework (chitu/tool_call/parse/): where a call ends, what
+# broken output turns into, and a generated corpus over every registered format.
+#
+# The tests above are per format and mostly assert a whole call. The ones below
+# drive the framework itself: they exist because the old implementation cut a call
+# out with a plain search for `</tool_call>`, so a value containing that tag was cut
+# in the middle -- the same input raised on the whole-string path and produced a
+# truncated argument on the streaming path.
+# ---------------------------------------------------------------------------
+
+# Tools for the framework tests: `Bash` has a string and an integer argument, `Noop`
+# has no arguments, so "no arguments" and "typed argument" are both covered.
+BASH_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer"},
+                },
+            },
+        },
+    },
+    {"type": "function", "function": {"name": "Noop", "parameters": {}}},
+]
+
+
+def glm_call(name, *pairs):
+    """One call in the GLM format: `<tool_call>name<arg_key>k</arg_key><arg_value>v...`."""
+    body = "".join(
+        f"<arg_key>{k}</arg_key><arg_value>{v}</arg_value>" for k, v in pairs
+    )
+    return f"<tool_call>{name}{body}</tool_call>"
+
+
+async def chunked(data: str, size=None, seed=0):
+    """Cut the output into chunks. `size=None` uses a random 1..5 character split."""
+    pos = 0
+    rnd = random.Random(seed)
+    while pos < len(data):
+        step = size if size is not None else rnd.randint(1, 5)
+        yield data[pos : pos + step]
+        pos += step
+
+
+async def collect_deltas(parser, chunks):
+    return [delta async for delta in parser.parse_stream(chunks)]
+
+
+def aggregate(deltas):
+    content = ""
+    tools: dict[int, list] = {}
+    for delta in deltas:
+        content += delta.content or ""
+        for call in delta.tool_calls or []:
+            slot = tools.setdefault(call.index, ["", ""])
+            slot[0] += call.function.name or ""
+            slot[1] += call.function.arguments or ""
+    return content, [tuple(tools[i]) for i in sorted(tools)]
+
+
+def parse_both(data: str, tools=None, sizes=(None, 1, 2, 3, 5)):
+    """Whole-string and streaming (every chunk size, plus random splits) must agree."""
+    parser = GLM47ToolParser(tools or BASH_TOOLS)
+    content, parsed = parser.parse_string(data)
+    expected = (content, [(t.function.name, t.function.arguments) for t in parsed])
+    for size in sizes:
+        seeds = (0, 1, 2) if size is None else (0,)
+        for seed in seeds:
+            got = aggregate(
+                asyncio.run(collect_deltas(parser, chunked(data, size=size, seed=seed)))
+            )
+            assert got == expected, (
+                f"streaming (size={size}, seed={seed}) disagrees with parse_string: "
+                f"{got!r} != {expected!r}"
+            )
+    return expected
+
+
+def test_argument_value_may_contain_the_region_end_tag():
+    # The old parser split the call here: an error on one path, a truncated argument on
+    # the other.
+    data = glm_call("Bash", ("command", "echo '</tool_call>'"))
+    content, tools = parse_both(data)
+    assert content == ""
+    assert tools == [("Bash", '{"command": "echo \'</tool_call>\'"}')]
+
+
+def test_argument_value_may_contain_the_trigger_tag():
+    data = glm_call("Bash", ("command", "echo '<tool_call>'"))
+    content, tools = parse_both(data)
+    assert content == ""
+    assert tools == [("Bash", '{"command": "echo \'<tool_call>\'"}')]
+
+
+def test_well_formed_response_is_unchanged():
+    data = (
+        "hi "
+        + glm_call("Bash", ("command", "ls -l"), ("timeout", "5"))
+        + " mid "
+        + glm_call("Noop")
+        + " end"
+    )
+    content, tools = parse_both(data)
+    assert content == "hi  mid  end"
+    assert tools == [("Bash", '{"command": "ls -l", "timeout": 5}'), ("Noop", "{}")]
+
+
+def test_repeated_trigger_is_skipped():
+    # The model sometimes repeats the trigger: the outermost parser drops that attempt and
+    # restarts from the next `<tool_call>`.
+    data = "<tool_call>" + glm_call("Bash", ("command", "pwd"))
+    content, tools = parse_both(data)
+    assert content == ""
+    assert tools == [("Bash", '{"command": "pwd"}')]
+
+
+def test_mid_stream_tool_calls():
+    data = (
+        "Let me check.\n"
+        + glm_call("Bash", ("command", "ls"))
+        + "\nand then\n"
+        + glm_call("Bash", ("command", "pwd"))
+        + "\ndone"
+    )
+    content, tools = parse_both(data)
+    assert content == "Let me check.\n\nand then\n\ndone"
+    assert [json.loads(a) for _, a in tools] == [{"command": "ls"}, {"command": "pwd"}]
+
+
+def test_unclosed_call_followed_by_new_call():
+    data = (
+        "<tool_call>Bash<arg_key>command</arg_key><arg_value>a</arg_value>"
+        "<tool_call>Noop</tool_call>"
+    )
+    content, tools = parse_both(data)
+    assert content == ""
+    assert tools == [("Bash", '{"command": "a"}'), ("Noop", "{}")]
+
+
+def test_truncated_argument_value_keeps_a_partial_call():
+    # `max_tokens` cuts the middle of an argument value: both paths give a partial call
+    # instead of dropping it into content.
+    data = "<tool_call>Bash<arg_key>command</arg_key><arg_value>echo hel"
+    content, tools = parse_both(data)
+    assert content == ""
+    assert tools == [("Bash", '{"command": "echo hel"}')]
+
+
+def test_missing_region_end_tag_still_returns_the_call():
+    data = "<tool_call>Bash<arg_key>command</arg_key><arg_value>ls</arg_value>"
+    content, tools = parse_both(data)
+    assert content == ""
+    assert tools == [("Bash", '{"command": "ls"}')]
+
+
+def test_empty_call_stays_text():
+    # An empty name means this is not a call at all: the text goes back to content instead
+    # of emitting a tool call with no name. Constrained decoding rejects such output; the
+    # requirement here is only "no crash, no nameless call, both paths agree".
+    data = "a<tool_call></tool_call>b"
+    content, tools = parse_both(data)
+    assert content == data
+    assert tools == []
+
+
+def test_value_containing_angle_brackets_and_tags():
+    code = "if a < b: print('<tool_call>')  # x"
+    content, tools = parse_both(glm_call("Bash", ("command", code)))
+    assert content == ""
+    assert json.loads(tools[0][1]) == {"command": code}
+
+
+def test_malformed_pieces_pass_through_as_content():
+    # no name at all
+    assert parse_both("a<tool_call></tool_call>b")[0] == "a<tool_call></tool_call>b"
+    # '<' inside the name -> not a tool call
+    data = "x<tool_call>foo <b>bar</b> y"
+    assert parse_both(data) == (data, [])
+    # unknown argument value that is not JSON stays a valid JSON string
+    _, tools = parse_both(glm_call("Bash", ("timeout", "soon")))
+    assert json.loads(tools[0][1]) == {"timeout": "soon"}
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        "text<tool_call>",
+        "text<tool_call>Ba",
+        "text<tool_call>Bash",
+        "<tool_call>Bash<arg_k",
+        "<tool_call>Bash<arg_key>comm",
+        "<tool_call>Bash<arg_key>command</arg_key>",
+        "<tool_call>Bash<arg_key>command</arg_key><arg_value>ls -",
+        "<tool_call>Bash<arg_key>command</arg_key><arg_value>ls</arg_value>",
+        "<tool_call>Bash<arg_key>command</arg_key><arg_value>ls</arg_value></tool_c",
+    ],
+)
+def test_truncated_tool_call_degrades_gracefully(data):
+    content, tools = parse_both(data)
+    for _, args in tools:
+        json.loads(args)  # a partial call still carries valid JSON arguments
+    if not tools:
+        assert content == data  # nothing parsed: the text is returned as content
+
+
+def test_every_prefix_of_a_long_output_is_safe():
+    full = (
+        "lead "
+        + glm_call("Bash", ("command", "ls\n<x>"), ("timeout", "10"))
+        + " mid <tool_call>"
+        + glm_call("Noop")
+        + " tail"
+    )
+    for n in range(len(full) + 1):
+        content, tools = parse_both(full[:n])
+        for _, args in tools:
+            json.loads(args)
+    assert parse_both(full)[1][0][0] == "Bash"
+
+
+def test_plain_text_is_content():
+    content, tools = parse_both("hello world")
+    assert content == "hello world"
+    assert tools == []
+
+
+def test_failed_region_longer_than_the_compaction_threshold_comes_back_whole():
+    # The reader compacts its buffer once the cursor passes 8 KiB. A failed region is
+    # replayed from a recorded offset, so compacting while recording used to truncate the
+    # replay: a 9 KiB region came back empty (whole-string) or lost its first 8192 bytes
+    # (streaming).
+    data = "<tool_call>" + "a" * 9000 + "</tool_call>"
+    content, tools = parse_both(data)
+    assert tools == []
+    assert content == data
+
+
+def test_tool_without_parameters_schema():
+    # A tool may omit `parameters`: its argument types are then unknown (values go through
+    # JSON) and building the parser must not raise.
+    parser = GLM47ToolParser([{"type": "function", "function": {"name": "Noop"}}])
+    content, tools = parser.parse_string(glm_call("Noop"))
+    assert content == ""
+    assert [(t.function.name, t.function.arguments) for t in tools] == [("Noop", "{}")]
+
+
+def test_tool_without_parameters_schema_accepts_arguments():
+    parser = GLM47ToolParser([{"type": "function", "function": {"name": "N"}}])
+    content, tools = parser.parse_string(glm_call("N", ("a", "1")))
+    assert tools[0].function.arguments == '{"a": 1}'
+
+
+def test_committed_region_is_not_kept_for_replay():
+    # Once the tool name is accepted the call cannot be replayed, so the recorded offset is
+    # dropped: otherwise a long successful call keeps a second copy of its own text.
+    reader = Reader()
+    reader.push("<tool_call>")
+    reader.start_trace()
+    assert reader.consume_stop("<tool_call>")
+    reader.commit_trace()
+    assert reader.stop_trace() == ""
+
+
+def test_uncommitted_region_is_kept_for_replay():
+    # Before the commit point the region's text must come back verbatim: this is what makes
+    # a truncated or malformed region reappear in the content instead of vanishing.
+    reader = Reader()
+    reader.push("<tool_call>Nope")
+    reader.start_trace()
+    assert reader.consume_stop("<tool_call>")
+    assert reader.stop_trace() == "<tool_call>"
+
+
+# --- no tool parser / failing parser must pass text through ---------------
+
+
+class _FakeOutputParserParams:
+    # Not a separated model: output text and tool calls share one text region, which the
+    # text-level parser splits itself.
+    separated_tool_calling = False
+
+
+class _FakeOutputParser:
+    params = _FakeOutputParserParams()
+
+
+class _FakeStream:
+    """``parse_stream_by_parser`` reads ``output_parser`` off the stream to tell whether
+    the model is a separated one. This is the minimal fake for that: the text is fed as
+    (text, state, meta) triples."""
+
+    output_parser = _FakeOutputParser()
+
+    def __init__(self, texts):
+        self.texts = texts
+
+    def __aiter__(self):
+        return self._generate()
+
+    async def _generate(self):
+        for text in self.texts:
+            yield (text, OutputState.OUTPUT_OR_TOOL, (None, None))
+
+
+def collect_parsed(parser, texts):
+    async def go():
+        return [
+            item
+            async for item, _, _ in parse_stream_by_parser(
+                cast("AsyncDataStream", _FakeStream(texts)), parser
+            )
+        ]
+
+    return asyncio.run(go())
+
+
+def test_no_tool_parser_passes_tool_call_text_through():
+    texts = ["a<tool_", "call>Bash</tool_call>", "z"]
+    out = collect_parsed(DummyToolParser(BASH_TOOLS), texts)
+    assert "".join(d.content or "" for d in out) == "".join(texts)
+
+
+# --- generated corpus over every registered format ------------------------
+#
+# Two layers, and the split is deliberate:
+#
+# - `CORPUS_HAND` is written by hand: one line per behaviour, with the exact outcome it
+#   must produce. This is where the claims a reviewer should check live, and adding a case
+#   is one line.
+# - The generated layer takes one well-formed sample per format -- built from the format's
+#   own declaration tree -- mutates it (every truncation prefix, dropped or duplicated tags,
+#   tags inside values, one format's sample fed to another) and checks invariants that must
+#   hold for all of them: streaming equals whole-string, reparsing is stable, content only
+#   ever loses characters instead of inventing them, and a response with no tool call comes
+#   back whole. A snapshot of 1400 inputs cannot be reviewed, so the exact-outcome lock
+#   stays on the hand-written rows.
+
+CORPUS_CALL = (
+    "<tool_call>test_type<arg_key>ks</arg_key><arg_value>{}</arg_value></tool_call>"
+)
+
+
+def corpus_text(value):
+    return corpus_outcome(value, [])
+
+
+def corpus_call(name, arguments):
+    return corpus_outcome("", [(name, arguments)])
+
+
+def corpus_calls(*pairs):
+    return corpus_outcome("", list(pairs))
+
+
+def corpus_text_and_call(content, name, arguments):
+    return corpus_outcome(content, [(name, arguments)])
+
+
+# (parser, family, input, expected outcome). `hand-known-limit-*` marks a documented
+# tradeoff rather than "correct": a value containing its own end tag is cut there, as it
+# always was.
+CORPUS_HAND = [
+    (
+        "GLM47ToolParser",
+        "hand-value-has-close-tag",
+        "<tool_call>test_type<arg_key>ks</arg_key>"
+        '<arg_value>echo "</tool_call>"</arg_value></tool_call>',
+        corpus_call("test_type", '{"ks": "echo \\"</tool_call>\\""}'),
+    ),
+    (
+        "GLM47ToolParser",
+        "hand-value-has-open-tag",
+        "<tool_call>test_type<arg_key>ks</arg_key>"
+        "<arg_value>a<tool_call>b</arg_value></tool_call>",
+        corpus_call("test_type", '{"ks": "a<tool_call>b"}'),
+    ),
+    (
+        "GLM47ToolParser",
+        "hand-unclosed-call-then-call",
+        "<tool_call>test_type<arg_key>ks</arg_key><arg_value>ls</arg_value>"
+        + CORPUS_CALL.format("pwd"),
+        corpus_calls(("test_type", '{"ks": "ls"}'), ("test_type", '{"ks": "pwd"}')),
+    ),
+    (
+        "GLM47ToolParser",
+        "hand-repeated-trigger",
+        "<tool_call>" + CORPUS_CALL.format("ls"),
+        corpus_call("test_type", '{"ks": "ls"}'),
+    ),
+    (
+        "GLM47ToolParser",
+        "hand-empty-name",
+        "<tool_call></tool_call>",
+        corpus_text("<tool_call></tool_call>"),
+    ),
+    (
+        "GLM47ToolParser",
+        "hand-unknown-tool",
+        "<tool_call>Nope<arg_key>ks</arg_key><arg_value>v</arg_value></tool_call>",
+        corpus_text(
+            "<tool_call>Nope<arg_key>ks</arg_key><arg_value>v</arg_value></tool_call>"
+        ),
+    ),
+    (
+        "GLM47ToolParser",
+        "hand-truncated-value",
+        "<tool_call>test_type<arg_key>ks</arg_key><arg_value>pw",
+        corpus_call("test_type", '{"ks": "pw"}'),
+    ),
+    ("GLM47ToolParser", "hand-plain-text", "hello", corpus_text("hello")),
+    (
+        "GLM47ToolParser",
+        "hand-text-around-call",
+        "a" + CORPUS_CALL.format("ls") + "b",
+        corpus_text_and_call("ab", "test_type", '{"ks": "ls"}'),
+    ),
+    (
+        "GLM47ToolParser",
+        "hand-tool-without-parameters",
+        "<tool_call>test_empty<arg_key>ks</arg_key><arg_value>v</arg_value></tool_call>",
+        corpus_call("test_empty", '{"ks": "v"}'),
+    ),
+    (
+        "Qwen3ToolParser",
+        "hand-known-limit-value-has-region-end",
+        '<tool_call>\n{"name": "test_type", "arguments": {"ks": "a</tool_call>b"}}\n</tool_call>',
+        corpus_text_and_call('b"}}\n</tool_call>', "test_type", '{"ks": "a'),
+    ),
+]
+
+CORPUS_STREAM_SIZES = (1, 2, 3, 5, 7, 13)
+CORPUS_GENERATED = corpus_cases()
+CORPUS_HAND_IDS = [row[1] for row in CORPUS_HAND]
+CORPUS_GENERATED_IDS = [f"{case[0]}-{case[1]}" for case in CORPUS_GENERATED]
+
+
+def corpus_parser(name):
+    return CORPUS_PARSERS[name](CORPUS_TOOLS)
+
+
+def corpus_stream_outcome(parser, data, size):
+    return stream_outcome(asyncio.run(collect_deltas(parser, chunked(data, size=size))))
+
+
+@pytest.mark.parametrize("name,family,data,expected", CORPUS_HAND, ids=CORPUS_HAND_IDS)
+def test_hand_written_expectation(name, family, data, expected):
+    actual = parse_outcome(corpus_parser(name), data)
+    assert actual == expected, f"{family} / input {data!r}"
+
+
+@pytest.mark.parametrize("name,family,data,expected", CORPUS_HAND, ids=CORPUS_HAND_IDS)
+def test_hand_written_streaming_expectation(name, family, data, expected):
+    for size in CORPUS_STREAM_SIZES:
+        actual = corpus_stream_outcome(corpus_parser(name), data, size)
+        assert actual == expected, f"{family} / chunk size {size}"
+
+
+@pytest.mark.parametrize("name,family,data", CORPUS_GENERATED, ids=CORPUS_GENERATED_IDS)
+def test_generated_input_streams_like_the_whole_string(name, family, data):
+    parser = corpus_parser(name)
+    content, tools = parser.parse_string(data)
+    whole = corpus_outcome(
+        content, [(t.function.name, t.function.arguments) for t in tools]
+    )
+    for size in CORPUS_STREAM_SIZES:
+        assert (
+            corpus_stream_outcome(parser, data, size) == whole
+        ), f"{name} / {family} / chunk size {size} / input {data!r}"
+
+
+@pytest.mark.parametrize("name,family,data", CORPUS_GENERATED, ids=CORPUS_GENERATED_IDS)
+def test_generated_input_reparses_the_same(name, family, data):
+    # Every input is parsed twice: a parser that kept state across calls would drift here.
+    first = parse_outcome(corpus_parser(name), data)
+    second = parse_outcome(corpus_parser(name), data)
+    assert first == second, f"{name} / {family} / input {data!r}"
+
+
+def test_generated_cases_cover_every_registered_format():
+    # `CORPUS_PARSERS` is derived from the registry, so a format that was registered but
+    # whose sample cannot be generated would otherwise show up only as missing coverage.
+    # This is the assertion that makes the omission loud.
+    covered = {name for name, _, _ in CORPUS_GENERATED}
+    assert covered == set(
+        CORPUS_PARSERS
+    ), f"formats without generated cases: {set(CORPUS_PARSERS) - covered}"
+
+
+@pytest.mark.parametrize("name,family,data", CORPUS_GENERATED, ids=CORPUS_GENERATED_IDS)
+def test_generated_input_keeps_content_in_order(name, family, data):
+    # Content is what the parser could not turn into a call, so its characters must come out
+    # of the input in the same order: nothing may be invented, reordered or duplicated.
+    parser = corpus_parser(name)
+    content, tools = parser.parse_string(data)
+    rest = iter(data)
+    assert all(
+        char in rest for char in content
+    ), f"{name} / {family} / content {content!r} / input {data!r}"
+    # And when no call came out, the whole response must be there, because a region that
+    # failed to become a call is fed back as content. The exception is a duplicated trigger,
+    # whose stray marker is dropped on purpose.
+    if not tools and family != "dup_tag":
+        assert content == data, f"{name} / {family} / input {data!r}"

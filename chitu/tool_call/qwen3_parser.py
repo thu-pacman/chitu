@@ -13,6 +13,7 @@ from .grammar import (
 )
 
 from .parse import (
+    FallbackTriggeredParser,
     TriggeredParser,
     SequenceParser,
     JsonArgumentsParser,
@@ -40,7 +41,7 @@ class Qwen3ParserImpl(ToolParserImplBase):
         '\n{"name": "{}", "arguments": {}}\n',
         parsers=[NameParser(), JsonArgumentsParser()],
     )
-    root_parser = TriggeredParser(
+    root_parser = FallbackTriggeredParser(
         "<tool_call>{}</tool_call>",
         parser=FunctionParser(tool),
         outside_parser=ContentParser(),
