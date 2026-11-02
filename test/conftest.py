@@ -600,6 +600,7 @@ def bootstrap_server(singleton_coordinator):
 def global_args():
     cfg = OmegaConf.create(
         {
+            "skip_preprocess": False,
             "models": {
                 "name": "unit-test",
                 "vocab_size": 128,
@@ -607,6 +608,7 @@ def global_args():
                 "head_dim": 8,
             },
             "infer": {
+                "op_impl": "torch",
                 "pcp_size": 1,
                 "tp_size": 1,
                 "pp_size": 1,

@@ -144,7 +144,7 @@ class QuantizationRegistry:
 
     @staticmethod
     def _select_module_impl(backend_impl, effective_kwargs: Mapping[str, Any]):
-        priority = -1
+        priority: int | float = float("-inf")
         impl: Type | None = None
         availability: dict[Type, bool] = {}
         for impl_, when_, priority_ in backend_impl:
