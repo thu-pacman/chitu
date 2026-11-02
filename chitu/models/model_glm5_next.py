@@ -59,7 +59,6 @@ from chitu.ops import (
     recurrent_kimi_delta_attention,
     rms_norm_gate,
     silu_and_mul,
-    soft_fp8_blockfp8_weight_dequant,
     update_singleton_paged_kv_cache,
 )
 from chitu.ops.linear_attn import (
@@ -1912,11 +1911,6 @@ class TransformerGLM5Next(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
         return checkpoint
 
     def _dequantize_self_attn_fp8_weights(self, state_dict: dict[str, Any]) -> None:
-        weight_dequant_fn = (
-            soft_fp8_blockfp8_weight_dequant
-            if get_global_args().infer.raise_lower_bit_float_to == "bfloat16"
-            else blockfp8_weight_dequant
-        )
         for k in list(state_dict.keys()):
             if ".self_attn." not in k or not k.endswith(".weight"):
                 continue
@@ -1933,7 +1927,7 @@ class TransformerGLM5Next(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
                 continue
             scale = state_dict.pop(scale_key)
             old_device = weight.device
-            state_dict[k] = weight_dequant_fn(
+            state_dict[k] = blockfp8_weight_dequant(
                 weight.cuda(),
                 scale.cuda(),
                 scale_block_shape=[128, 128],

@@ -11,6 +11,7 @@ from chitu.ops.quant.blockfp4.convert import (
     to_fp4_e2m1_in_uint8,
     fp4_fake_quant,
     convert_linear_to_swizzled,
+    blockfp4_weight_dequant,
 )
 from chitu.ops.quant.blockfp4.matmul import (
     soft_fp4_raise_to_fp8_blockfp4_gemm,

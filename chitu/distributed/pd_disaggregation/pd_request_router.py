@@ -1180,7 +1180,11 @@ class PDRequestRouter(RequestRouter):
                 "[PD_ROUTER] rejecting request %s during termination",
                 request.request_id,
             )
-            self.finish_request_before_recv_stop(request, error="service shutting down")
+            self.finish_request_before_recv_stop(
+                request,
+                finish_reason=FinishReason.ERROR,
+                error="service shutting down",
+            )
             return False
         self._ensure_ttft_deadline(request)
         if self._reject_ttft_timeout(

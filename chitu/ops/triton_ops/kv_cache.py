@@ -21,9 +21,14 @@ def append_to_paged_kv_cache_triton(
     get_page_ids: Optional[Callable[[], torch.Tensor]] = None,
     get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None,
     use_i64_offsets: bool = False,
+    *,
+    decode_cp_size: int = 1,
+    decode_cp_rank: int = 0,
 ):
     # NOTE: get_page_ids and get_offs_in_page does not benefit this implementation
 
+    if not 0 <= decode_cp_rank < decode_cp_size:
+        raise ValueError("Require 0 <= decode_cp_rank < decode_cp_size")
     if delta_seq_ids is None and page_table.shape[0] != delta_position_ids.shape[0]:
         raise ValueError(
             f"batch_size ({page_table.shape[0]}) must be equal to num_tokens "
@@ -74,6 +79,8 @@ def append_to_paged_kv_cache_triton(
         THIS_KV_STRIDE0=this_kv.stride(0),
         BLOCK_SIZE=block_size,
         HAS_DELTA_SEQ_IDS=delta_seq_ids is not None,
+        DECODE_CP_SIZE=decode_cp_size,
+        DECODE_CP_RANK=decode_cp_rank,
         INDEX_DTYPE=INDEX_DTYPE,
     )
 
@@ -146,6 +153,8 @@ def append_to_paged_kv_cache_kernel(
     THIS_KV_STRIDE0: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # GPU block size, not page size
     HAS_DELTA_SEQ_IDS: tl.constexpr,
+    DECODE_CP_SIZE: tl.constexpr,
+    DECODE_CP_RANK: tl.constexpr,
     INDEX_DTYPE: tl.constexpr,
 ):
     token_id = tl.program_id(axis=0).to(INDEX_DTYPE)
@@ -161,16 +170,26 @@ def append_to_paged_kv_cache_kernel(
     else:
         batch_id = token_id
 
-    page_table_offset = batch_id * NUM_PAGES_PER_SAMPLE + seqlen // PAGE_SIZE
-    page_id = tl.load(page_table_ptr + page_table_offset).to(INDEX_DTYPE)
+    sequence_page_index = seqlen // PAGE_SIZE
+    valid = True
+    if DECODE_CP_SIZE > 1:
+        valid = (seqlen >= 0) & (batch_id >= 0)
+        valid &= sequence_page_index % DECODE_CP_SIZE == DECODE_CP_RANK
+    group_index = sequence_page_index // DECODE_CP_SIZE
+    page_table_offset = batch_id * NUM_PAGES_PER_SAMPLE + group_index
+    page_id = tl.load(page_table_ptr + page_table_offset, mask=valid, other=-1).to(
+        INDEX_DTYPE
+    )
+    if DECODE_CP_SIZE > 1:
+        valid &= page_id >= 0
 
     kv_cache_offset = (
         page_id * KV_CACHE_STRIDE0 + (seqlen % PAGE_SIZE) * KV_CACHE_STRIDE1 + dim_id
     )
     this_kv_offset = token_id * THIS_KV_STRIDE0 + dim_id
 
-    this_kv_data = tl.load(this_kv_ptr + this_kv_offset, mask=dim_mask)
-    tl.store(kv_cache_ptr + kv_cache_offset, this_kv_data, mask=dim_mask)
+    this_kv_data = tl.load(this_kv_ptr + this_kv_offset, mask=dim_mask & valid)
+    tl.store(kv_cache_ptr + kv_cache_offset, this_kv_data, mask=dim_mask & valid)
 
 
 @triton.jit

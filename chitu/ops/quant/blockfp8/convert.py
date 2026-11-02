@@ -7,9 +7,10 @@ from typing import Optional
 import torch
 
 from chitu.lazy import single_dispatch_lazy_tensor
+from chitu.global_vars import get_global_args
 from chitu.ops.utils import make_op_dispatcher
 from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
-from chitu.utils import try_import_platform_dep
+from chitu.utils import parse_dtype, try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -79,12 +80,26 @@ def blockfp8_weight_dequant(
 
 @blockfp8_weight_dequant.register_auto
 def _auto_blockfp8_weight_dequant():
+    try:
+        soft_fp8 = (
+            parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1
+        )
+    except Exception:
+        soft_fp8 = False
+    if soft_fp8:
+        return "soft_triton"
     return "triton"
 
 
 blockfp8_weight_dequant.register_candidate("triton")
 if has_triton:
     blockfp8_weight_dequant.register("triton")(blockfp8_weight_dequant_triton)
+
+blockfp8_weight_dequant.register_candidate("soft_triton")
+if has_triton:
+    blockfp8_weight_dequant.register("soft_triton")(
+        soft_fp8_blockfp8_weight_dequant_triton
+    )
 
 
 @make_op_dispatcher

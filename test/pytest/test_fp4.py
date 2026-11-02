@@ -12,6 +12,7 @@ from chitu.ops import (
     unpack_every_uint8_to_two_fp4_e2m1_in_uint8,
     to_fp4_e2m1_in_uint8,
     from_fp4_e2m1_in_uint8,
+    blockfp4_weight_dequant,
 )
 from chitu.device_type import has_native_fp8, is_hopper
 from chitu.utils import try_import_platform_dep
@@ -45,16 +46,6 @@ def init_weight_and_scales(dim, block_size):
     return b, b_s, b_s_2
 
 
-def do_dequant_b(b, b_s, b_s_2, dim, block_size):
-    return (
-        from_fp4_e2m1_in_uint8(unpack_every_uint8_to_two_fp4_e2m1_in_uint8(b))
-        .view(dim, dim // block_size, block_size)
-        .to(torch.float32)
-        * b_s.view(dim, dim // block_size, 1).to(torch.float32)
-        * b_s_2.view(1, 1, 1)
-    ).view(dim, dim)
-
-
 def do_dequant_a(a_fp8, a_s, dim, act_block_size):
     return (
         a_fp8.to(a_s.dtype).view(dim, dim // act_block_size, act_block_size)
@@ -81,7 +72,7 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm(dim, record_benchmark
 
     # Dequant from `b`, `b_s`, `b_s_2` instead of directly using the tensor generated from
     # `torch.randn`, so the numerical difference is controlled inside the kernels
-    dequant_b = do_dequant_b(b, b_s, b_s_2, dim, block_size).to(default_dtype)
+    dequant_b = blockfp4_weight_dequant(b, b_s, b_s_2, block_size).to(default_dtype)
 
     std_y = torch.nn.functional.linear(a, dequant_b)
     preprocessed_b = Packed4BitWeightAlongK.convert_from(
@@ -130,7 +121,7 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm(dim, record_benchmark)
 
     # Dequant from `b`, `b_s`, `b_s_2` instead of directly using the tensor generated from
     # `torch.randn`, so the numerical difference is controlled inside the kernels
-    dequant_b = do_dequant_b(b, b_s, b_s_2, dim, block_size).to(default_dtype)
+    dequant_b = blockfp4_weight_dequant(b, b_s, b_s_2, block_size).to(default_dtype)
 
     std_y = torch.nn.functional.linear(dequant_a, dequant_b)
     preprocessed_b = Packed4BitWeightAlongK.convert_from(

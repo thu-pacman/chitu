@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
+
 import torch
 
 from chitu.lazy import single_dispatch_lazy_tensor
@@ -80,6 +82,13 @@ FP4_E2M1_LEVELS = torch.tensor(
 )
 
 
+@functools.cache
+def _fp4_e2m1_levels_on(device: torch.device) -> torch.Tensor:
+    """FP4 E2M1 level values on `device`, cached per device."""
+
+    return FP4_E2M1_LEVELS.to(device)
+
+
 def unpack_every_uint8_to_two_fp4_e2m1_in_uint8(packed: torch.Tensor) -> torch.Tensor:
     assert packed.dtype == torch.uint8
     out, half_in = packed.shape
@@ -92,7 +101,7 @@ def from_fp4_e2m1_in_uint8(nibbles: torch.Tensor) -> torch.Tensor:
     n = nibbles.to(torch.uint8)
     sign = torch.where((n >> 3).bool(), -1.0, 1.0)
     idx = (n & 0x7).to(torch.long)
-    levels = FP4_E2M1_LEVELS.to(n.device)
+    levels = _fp4_e2m1_levels_on(n.device)
     val = sign * levels[idx]
     return val  # float32
 
@@ -108,7 +117,7 @@ def pack_every_two_fp4_e2m1_in_uint8_to_one_uint8(w_nib: torch.Tensor) -> torch.
 
 def to_fp4_e2m1_in_uint8(x: torch.Tensor) -> torch.Tensor:
     abs_x = x.abs()
-    levels = FP4_E2M1_LEVELS.to(abs_x.device).view(*([1] * abs_x.dim()), -1)
+    levels = _fp4_e2m1_levels_on(abs_x.device).view(*([1] * abs_x.dim()), -1)
     idx = (abs_x.unsqueeze(-1) == levels).to(torch.uint8).argmax(dim=-1).to(torch.uint8)
     sign = (x < 0).to(torch.uint8) << 3
     nibble = sign | idx
@@ -181,3 +190,31 @@ def convert_linear_to_swizzled(a_sf_linear: torch.Tensor, m, k, block_size):
     tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
     out = tmp.reshape(m_tiles * 128, k_tiles * f // block_size)
     return out[0:m, 0:k]
+
+
+def blockfp4_weight_dequant(weight, scale_1, scale_2, block_size):
+    """
+    Dequantize a blockfp4 (NVFP4-style) weight to float32.
+
+    `weight` packs two FP4 values per uint8 contiguously along the last (K)
+    dimension. `scale_1` holds one scale per `block_size` elements along K, and
+    `scale_2` is the second-level per-tensor scale (a single element). All
+    leading dimensions are batch dimensions.
+    """
+    *dims, k_packed = weight.shape
+    k = k_packed * 2
+
+    up = (
+        from_fp4_e2m1_in_uint8(
+            unpack_every_uint8_to_two_fp4_e2m1_in_uint8(weight.reshape(-1, k_packed))
+        )
+        .view(-1, block_size)
+        .to(torch.float32)
+    )
+
+    dq_w = (
+        up
+        * scale_1.reshape(-1, 1).to(torch.float32)
+        * scale_2.reshape(1, 1).to(torch.float32)
+    ).view(*dims, k)
+    return dq_w

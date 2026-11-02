@@ -16,6 +16,19 @@ from chitu.native_layout.common import (
 from chitu.import_utils import try_import_platform_dep
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
+if has_marlin:
+    from chitu_backend import gptq_marlin_repack
+
+
+def get_scale_perms():
+    scale_perm: list[int] = []
+    for i in range(8):
+        scale_perm.extend([i + 8 * j for j in range(8)])
+    scale_perm_single: list[int] = []
+    for i in range(4):
+        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
+    return scale_perm, scale_perm_single
 
 
 @dataclass

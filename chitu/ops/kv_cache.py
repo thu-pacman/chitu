@@ -39,6 +39,9 @@ def append_to_paged_kv_cache(
     get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None,
     use_i64_offsets: bool = False,
     impl: str = "auto",
+    *,
+    decode_cp_size: int = 1,
+    decode_cp_rank: int = 0,
 ):
     """
     Read from ragged K/V, append to paged K/V cache.
@@ -54,6 +57,11 @@ def append_to_paged_kv_cache(
             the 8th, 9th token of the 1st sequence, and the 7th token of the 2nd sequence,
             delta_seq_ids = [1, 1, 2]. This parameter can be ignored if the number of incremented
             tokens of every sequence is 1.
+        decode_cp_size: Number of KV owners. Each page-table column addresses a
+            group of decode_cp_size sequence pages, with one physical page per owner.
+        decode_cp_rank: This owner's index. Only sequence pages whose index modulo
+            decode_cp_size equals decode_cp_rank are written. Callbacks, when
+            supplied, return owner-local physical page IDs and offsets.
     """
     raise NotImplementedError
 
@@ -133,8 +141,15 @@ def _auto_append_to_paged_kv_cache(
     get_page_ids: Optional[Callable[[], torch.Tensor]] = None,
     get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None,
     use_i64_offsets: bool = False,
+    *,
+    decode_cp_size: int = 1,
+    decode_cp_rank: int = 0,
 ):
-    if has_triton_impl and get_global_args().infer.op_impl != "cpu":
+    if (
+        kv_cache.device.type != "cpu"
+        and has_triton_impl
+        and get_global_args().infer.op_impl != "cpu"
+    ):
         return "triton"
     return "torch"
 
@@ -151,18 +166,56 @@ def append_to_paged_kv_cache_torch(
         Callable[[], torch.Tensor]
     ] = None,  # fn -> (num_tokens,)
     use_i64_offsets: bool = False,
+    *,
+    decode_cp_size: int = 1,
+    decode_cp_rank: int = 0,
 ):
     # NOTE: PyTorch always use i64 offsets in its ops. So we can safely ignore use_i64_offsets
 
+    if not 0 <= decode_cp_rank < decode_cp_size:
+        raise ValueError("Require 0 <= decode_cp_rank < decode_cp_size")
+    if (
+        get_page_ids is None
+        and delta_seq_ids is None
+        and page_table.shape[0] != delta_position_ids.shape[0]
+    ):
+        raise ValueError("Omitting delta_seq_ids requires one token per request")
+    if this_kv.numel() == 0:
+        return
+
     page_size = kv_cache.shape[1]
+    if decode_cp_size > 1:
+
+        positions = delta_position_ids.long()
+        sequence_pages = positions // page_size
+        valid = (positions >= 0) & (sequence_pages % decode_cp_size == decode_cp_rank)
+        if delta_seq_ids is not None:
+            valid &= delta_seq_ids >= 0
+        rows = torch.where(valid)[0]
+        if get_page_ids is None:
+            seq_ids = (
+                torch.arange(this_kv.shape[0], device=this_kv.device)
+                if delta_seq_ids is None
+                else delta_seq_ids.long()
+            )
+            page_ids = page_table[seq_ids[rows], sequence_pages[rows] // decode_cp_size]
+        else:
+            page_ids = get_page_ids()[rows]
+        offsets = (
+            positions[rows] % page_size
+            if get_offs_in_page is None
+            else get_offs_in_page()[rows]
+        )
+        valid = page_ids >= 0
+        rows, page_ids, offsets = rows[valid], page_ids[valid], offsets[valid]
+        # Byte views preserve packed records without dtype-specific indexed reads.
+        cache = kv_cache.view(kv_cache.shape[0], page_size, -1).view(torch.uint8)
+        values = this_kv.reshape(this_kv.shape[0], -1).to(kv_cache.dtype).contiguous()
+        cache[page_ids.long(), offsets.long()] = values.view(torch.uint8)[rows]
+        return
 
     if get_page_ids is None:
         if delta_seq_ids is None:
-            if page_table.shape[0] != delta_position_ids.shape[0]:
-                raise ValueError(
-                    f"batch_size ({page_table.shape[0]}) must be equal to num_tokens "
-                    f"({delta_position_ids.shape[0]}) if ignoring delta_seq_ids"
-                )
             delta_seq_ids = torch.arange(
                 delta_position_ids.shape[0],
                 dtype=delta_position_ids.dtype,
