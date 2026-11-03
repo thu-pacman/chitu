@@ -6,7 +6,7 @@ from .utils import register
 from .abstract_parser import AbstractToolParser
 from .deepseekv32_parser import DeepSeekV32GrammarImpl, DeepSeekV32ParserImpl
 from .grammar import TriggeredMultipleToolsGrammar
-from .parse import TriggeredParser, ContentParser
+from .parse import ContentParser, FallbackTriggeredParser
 
 
 class DeepSeekV4GrammarImpl(DeepSeekV32GrammarImpl):
@@ -19,7 +19,7 @@ class DeepSeekV4GrammarImpl(DeepSeekV32GrammarImpl):
 
 
 class DeepSeekV4ParserImpl(DeepSeekV32ParserImpl):
-    root_parser = TriggeredParser(
+    root_parser = FallbackTriggeredParser(
         "<｜DSML｜tool_calls>{}</｜DSML｜tool_calls>",
         parser=DeepSeekV32ParserImpl.tools,
         outside_parser=ContentParser(),

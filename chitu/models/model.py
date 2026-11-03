@@ -1430,7 +1430,7 @@ class Transformer(nn.Module):
         return self.layers
 
     def _mtp_prefill_cp(self, x, h, freqs_cis):
-        """CP-aware MTP prefill for interleaved context parallel shards."""
+        """CP-aware MTP prefill for the active context-parallel layout."""
         cp_ctx = self.cp_context
         mtp_delta = self.cache_dict["mtp"].mtp_seq_len_delta
         total_tokens = int(mtp_delta.delta_total_len)
@@ -1439,10 +1439,9 @@ class Transformer(nn.Module):
         h = self.norm(h, compute_dtype=h.dtype)
 
         last_token_offsets = mtp_delta.delta_prefix_lens_tensor_device[1:] - 1
-        last_token_owner_ranks = torch.remainder(last_token_offsets, cp_ctx.pcp_size)
-        last_token_offsets_local = torch.div(
-            last_token_offsets, cp_ctx.pcp_size, rounding_mode="floor"
-        ).to(torch.long)
+        last_token_owner_ranks, last_token_offsets_local = (
+            cp_ctx.position_owner_and_local_index(last_token_offsets, total_tokens)
+        )
         owned_mask = last_token_owner_ranks == cp_ctx.cp_rank
         last_token_num = last_token_offsets.shape[0]
         hidden_dim = h.shape[-1]

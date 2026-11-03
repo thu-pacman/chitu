@@ -18,6 +18,7 @@ from .grammar import (
 )
 
 from .parse import (
+    FallbackTriggeredParser,
     TriggeredParser,
     SequenceParser,
     ArgNameParser,
@@ -27,7 +28,6 @@ from .parse import (
     NameParser,
     FunctionParser,
     ContentParser,
-    EmptyStringParser,
     ToolParserImplBase,
 )
 
@@ -67,13 +67,13 @@ class Qwen3CoderParserImpl(ToolParserImplBase):
     arguments = TriggeredParser(
         "<parameter={}\n</parameter>\n",
         parser=argument,
-        outside_parser=EmptyStringParser(),
+        escape_stops={"<tool_call>"},
     )
     tool = SequenceParser(
         "\n<function={}>\n{}</function>\n",
         parsers=[NameParser(), arguments],
     )
-    tools = TriggeredParser(
+    tools = FallbackTriggeredParser(
         "<tool_call>{}</tool_call>",
         parser=FunctionParser(parser=tool),
         outside_parser=ContentParser(),

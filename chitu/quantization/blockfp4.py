@@ -1108,7 +1108,7 @@ class Blockfp4MoeExpertsPackKStride64(Blockfp4MoeExpertsMergedBase):
     when=lambda _: has_torch_npu,
     priority=2,
 )
-class Blockfp4MoeExpertsUnmergedPackNPUNative(Blockfp4MoeExpertsMergedBase):
+class Blockfp4MoeExpertsUnmergedPackNPUNative(Blockfp4MoeExpertsUnmergedBase):
     """
     blockfp4 quantized MoeExperts with weights in Packed4BitWeightNPUNative layout,
     with unmerged gate and up projection.

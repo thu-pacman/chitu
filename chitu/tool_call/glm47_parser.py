@@ -18,6 +18,7 @@ from .grammar import (
 )
 
 from .parse import (
+    FallbackTriggeredParser,
     TriggeredParser,
     SequenceParser,
     ArgNameParser,
@@ -28,7 +29,6 @@ from .parse import (
     FunctionParser,
     ContentParser,
     TakeBeforeParser,
-    EmptyStringParser,
     ToolParserImplBase,
 )
 
@@ -68,14 +68,14 @@ class GLM47ParserImpl(ToolParserImplBase):
     arguments = TriggeredParser(
         "<arg_key>{}</arg_value>",
         parser=argument,
-        outside_parser=EmptyStringParser(),
+        escape_stops={"<tool_call>"},
     )
     tool = TakeBeforeParser(
         "<",
         parser=NameParser(),
         after_parser=arguments,
     )
-    tools = TriggeredParser(
+    tools = FallbackTriggeredParser(
         "<tool_call>{}</tool_call>",
         parser=FunctionParser(parser=tool),
         outside_parser=ContentParser(),

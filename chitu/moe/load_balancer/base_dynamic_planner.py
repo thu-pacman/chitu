@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from logging import getLogger
 import time
 import os
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -24,6 +24,9 @@ if not has_torch_npu:
     LOCAL_WORLD_SIZE = int(os.environ.get("LOCAL_WORLD_SIZE", "8"))
 
 logger = getLogger(__name__)
+
+if TYPE_CHECKING:
+    from chitu.moe.load_balancer.executor import WeightMigrationExecutor
 
 
 @dataclass(frozen=True)
@@ -99,7 +102,7 @@ class BaseMoELoadPlanner(ABC):
             (self.num_layers,), dtype=torch.uint8, device=self._stats_device
         )
 
-        self._action_executor: Optional[Callable[[List[AdjustmentAction]], None]] = None
+        self._action_executor: Optional["WeightMigrationExecutor"] = None
 
         self._in_warmup: bool = False
         self._warned_warmup_skip: bool = False
@@ -170,15 +173,15 @@ class BaseMoELoadPlanner(ABC):
             self._cached_warmup_stats.clear()
 
     def register_action_executor(
-        self, fn: Optional[Callable[[List[AdjustmentAction]], None]]
+        self, executor: Optional["WeightMigrationExecutor"]
     ) -> None:
-        """Register an action executor callback.
+        """Register the executor that migrates expert weights for planned actions.
 
         Args:
-            fn: The callback function to register. It should accept a list of AdjustmentAction
-                and perform the necessary migration actions.
+            executor: The WeightMigrationExecutor to register, or None to disable
+                weight migration.
         """
-        self._action_executor = fn
+        self._action_executor = executor
 
     def get_current_mapping(self, layer_id: int) -> List[torch.Tensor]:
         """Get a deep-copied current mapping for a layer.

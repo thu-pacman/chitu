@@ -68,6 +68,7 @@ from .parse import (
     SequenceParser,
     StringArgValueParser,
     ToolParserImplBase,
+    FallbackTriggeredParser,
     TriggeredParser,
     TypeDispatchParser,
 )
@@ -246,7 +247,7 @@ class KimiK3ParserImpl(ToolParserImplBase):
     # tools channel markers are hidden at token level). The input is the
     # tools channel's text; the outside text is non-call text of the channel
     # (degenerate leftovers or a truncated call), which surfaces as content.
-    root_parser = TriggeredParser(
+    root_parser = FallbackTriggeredParser(
         CALL_OPEN + "{}" + CALL_CLOSE,
         parser=FunctionParser(parser=tool),
         outside_parser=ContentParser(),

@@ -8,7 +8,7 @@ CP (Context Parallelism) utilities.
 Provides CPContext / NoOpCPContext that encapsulate all CP state and operations.
 Access via get_cp_context() singleton. When pcp_size == 1, returns NoOpCPContext
 (identity/no-op). When pcp_size > 1, create_cp_context() selects a layout-specific
-implementation; currently only CPContextInterleaved is available.
+implementation: CPContextInterleaved or CPContextContiguous.
 """
 
 from __future__ import annotations
@@ -34,6 +34,8 @@ def create_cp_context(
         return NoOpCPContext()
     if layout == "interleaved":
         return CPContextInterleaved(pcp_size, cp_group)
+    if layout == "contiguous":
+        return CPContextContiguous(pcp_size, cp_group)
     raise ValueError(f"Unsupported pcp_layout={layout!r}")
 
 
@@ -96,6 +98,65 @@ def build_cp_local_indices(
         device=device,
         dtype=torch.long,
     )
+
+
+def contiguous_interval(
+    rank: int, world_size: int, total_tokens: int
+) -> Tuple[int, int]:
+    """Return one rank's balanced contiguous slice of the global token axis.
+
+    The slice is ``[rank * T // W, (rank + 1) * T // W)``. Segment lengths
+    differ by at most one token, and ``T`` does not need to be divisible by
+    ``W``.
+    """
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1, got {world_size}")
+    if not (0 <= rank < world_size):
+        raise ValueError(f"rank {rank} out of range [0, {world_size})")
+    if total_tokens < 0:
+        raise ValueError(f"total_tokens must be >= 0, got {total_tokens}")
+    return (rank * total_tokens) // world_size, (
+        (rank + 1) * total_tokens
+    ) // world_size
+
+
+def build_contiguous_chunk_lengths(total_tokens: int, pcp_size: int) -> list[int]:
+    """Per-rank lengths for :func:`contiguous_interval`."""
+    return [
+        contiguous_interval(rank, pcp_size, total_tokens)[1]
+        - contiguous_interval(rank, pcp_size, total_tokens)[0]
+        for rank in range(pcp_size)
+    ]
+
+
+def build_cp_contiguous_reorder_idx(
+    chunk_lengths: Sequence[int], expected_n_local: int, device
+) -> torch.Tensor:
+    """Remove per-rank padding from a contiguous-chunk allgather result.
+
+    ``all_gather_into_tensor`` requires equal input shapes. Each rank pads its
+    contiguous chunk to ``expected_n_local`` rows, so the gathered layout is
+    ``[rank0_real, rank0_pad, rank1_real, rank1_pad, ...]``. This index selects
+    only the real rows while preserving rank order, which is already global token
+    order for contiguous chunks.
+    """
+    expected_n_local = int(expected_n_local)
+    if expected_n_local <= 0:
+        raise ValueError(f"expected_n_local must be positive, got {expected_n_local}")
+    parts = []
+    for rank, length in enumerate(chunk_lengths):
+        if length < 0 or length > expected_n_local:
+            raise ValueError(
+                f"chunk length {length} for rank {rank} is outside [0, "
+                f"{expected_n_local}]"
+            )
+        parts.append(
+            torch.arange(length, device=device, dtype=torch.long)
+            + rank * expected_n_local
+        )
+    if not parts:
+        return torch.empty(0, device=device, dtype=torch.long)
+    return torch.cat(parts, dim=0)
 
 
 def pad_rows_to_count(
@@ -189,6 +250,10 @@ class CPContext:
         raise NotImplementedError
 
     def local_flat_indices(self, n_local, total_tokens, device):
+        raise NotImplementedError
+
+    def position_owner_and_local_index(self, positions, total_tokens):
+        """Map global token positions to (owner rank, local row index)."""
         raise NotImplementedError
 
     def slice_for_local(self, tensor, n_local, total_tokens):
@@ -458,6 +523,12 @@ class CPContextInterleaved(CPContext):
             flat_indices = torch.clamp(flat_indices, max=total_tokens - 1)
         return flat_indices, valid_mask
 
+    def position_owner_and_local_index(self, positions, total_tokens):
+        """Map global positions to interleaved owner rank and local row."""
+        owner = torch.remainder(positions, self.pcp_size)
+        local = torch.div(positions, self.pcp_size, rounding_mode="floor")
+        return owner.long(), local.long()
+
     def slice_for_local(
         self, tensor: torch.Tensor, n_local: int, total_tokens: int
     ) -> torch.Tensor:
@@ -487,6 +558,133 @@ class CPContextInterleaved(CPContext):
             self.pcp_size, expected_n_local, device=local_tensor.device
         )
         return gathered[reorder_idx][: self._orig_num_tokens]
+
+
+class CPContextContiguous(CPContext):
+    """Contiguous CP parallelism state and operations.
+
+    Rank ``r`` owns the balanced interval
+    ``[r * T // W, (r + 1) * T // W)`` of the global delta-token axis. Unlike
+    ``CPContextInterleaved``, the residual-stream layout itself is contiguous,
+    so layers do not need an interleaved-to-contiguous all-to-all around each
+    local computation.
+    """
+
+    layout = "contiguous"
+
+    def split_prefill(
+        self,
+        tokens: Optional[torch.Tensor],
+        hiddens: Optional[torch.Tensor],
+        freqs_cis: BatchedFreqsCis,
+        total_tokens: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], BatchedFreqsCis]:
+        """Split CP prefill inputs to this rank's contiguous local rows."""
+        self.prepare_prefill(total_tokens)
+        if not self.step_active:
+            return tokens, hiddens, freqs_cis
+
+        if tokens is None and hiddens is None:
+            raise ValueError(f"CP{self.cp_rank}: missing prefill payload")
+        device = tokens.device if tokens is not None else hiddens.device
+        start, end = contiguous_interval(
+            self.cp_rank, self.pcp_size, self._orig_num_tokens
+        )
+        local_indices = torch.arange(start, end, device=device, dtype=torch.long)
+        if hiddens is not None and hiddens.shape[0] != self._n_local:
+            raise RuntimeError(
+                f"CP{self.cp_rank}: hidden rows {hiddens.shape[0]} != {self._n_local}"
+            )
+        if tokens is not None:
+            tokens = tokens[local_indices]
+        freqs_cis = BatchedFreqsCis(
+            freqs_cis.cos[local_indices],
+            freqs_cis.sin[local_indices],
+        )
+        return tokens, hiddens, freqs_cis
+
+    def prepare_local_lengths(
+        self,
+        seq_len_delta: BatchedSeqLenDelta,
+        n_tokens: int,
+        is_decode_stage: bool,
+    ):
+        """Compute and cache the CP-local query delta view for this step."""
+        if is_decode_stage:
+            self._seq_len_delta_view = None
+            return seq_len_delta
+        else:
+            self._seq_len_delta_view = self._build_local_delta_view(
+                seq_len_delta, n_tokens
+            )
+            return self._seq_len_delta_view
+
+    def _build_local_delta_view(
+        self,
+        seq_len_delta: BatchedSeqLenDelta,
+        n_local: int,
+    ) -> BatchedSeqLenDeltaView:
+        total_tokens = seq_len_delta.delta_position_ids_tensor_device.shape[0]
+        start, end = contiguous_interval(self.cp_rank, self.pcp_size, total_tokens)
+        if end - start != n_local:
+            raise RuntimeError(
+                "CP local delta length does not match real local tokens: "
+                f"got {end - start}, expected {n_local}"
+            )
+        return BatchedSeqLenDeltaView(seq_len_delta, start, end)
+
+    def compute_pp_num_tokens(self, num_tokens: int) -> int:
+        """Compute the number of tokens for PP hidden state transfer."""
+        if not self._should_split_prefill(num_tokens):
+            return num_tokens
+        start, end = contiguous_interval(self.cp_rank, self.pcp_size, num_tokens)
+        return end - start
+
+    def local_flat_indices(
+        self, n_local: int, total_tokens: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build contiguous global indices and validity mask for this rank."""
+        start, end = contiguous_interval(self.cp_rank, self.pcp_size, total_tokens)
+        flat_indices = torch.arange(
+            start, start + n_local, device=device, dtype=torch.long
+        )
+        valid_mask = flat_indices < end
+        if total_tokens > 0:
+            flat_indices = torch.clamp(flat_indices, max=total_tokens - 1)
+        return flat_indices, valid_mask
+
+    def position_owner_and_local_index(self, positions, total_tokens):
+        """Map global positions to contiguous owner rank and local row."""
+        total_tokens = int(total_tokens)
+        if total_tokens <= 0:
+            return torch.zeros_like(positions), positions.clone()
+        owner = ((positions + 1) * self.pcp_size - 1) // total_tokens
+        start = owner * total_tokens // self.pcp_size
+        return owner.long(), (positions - start).long()
+
+    def slice_for_local(
+        self, tensor: torch.Tensor, n_local: int, total_tokens: int
+    ) -> torch.Tensor:
+        """Slice a global tensor to this CP rank's local tokens (contiguous)."""
+        start, _ = contiguous_interval(self.cp_rank, self.pcp_size, total_tokens)
+        return tensor[start : start + n_local]
+
+    def _allgather_global_payload(self, local_tensor: torch.Tensor) -> torch.Tensor:
+        """Allgather a contiguous CP-local payload into global token order."""
+        if local_tensor.shape[0] != self._n_local:
+            raise AssertionError(
+                f"CP{self.cp_rank}: local rows {local_tensor.shape[0]} != "
+                f"{self._n_local}"
+            )
+        chunk_lengths = build_contiguous_chunk_lengths(
+            self._orig_num_tokens, self.pcp_size
+        )
+        expected_n_local = max(chunk_lengths)
+        gathered = self._allgather_padded_rows(local_tensor, expected_n_local)
+        reorder_idx = build_cp_contiguous_reorder_idx(
+            chunk_lengths, expected_n_local, device=local_tensor.device
+        )
+        return gathered[reorder_idx]
 
 
 class NoOpCPContext:
@@ -558,6 +756,9 @@ class NoOpCPContext:
         indices = torch.arange(n_local, device=device, dtype=torch.long)
         mask = torch.ones(n_local, device=device, dtype=torch.bool)
         return indices, mask
+
+    def position_owner_and_local_index(self, positions, total_tokens):
+        return torch.zeros_like(positions), positions
 
     def slice_for_local(self, tensor, n_local, total_tokens):
         return tensor

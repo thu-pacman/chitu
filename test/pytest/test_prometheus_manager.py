@@ -13,6 +13,13 @@ from chitu.metrics import PrometheusMetricsCollector, metrics_runtime_context
 from chitu.metrics.definitions import MetricContext
 from chitu.metrics import PrometheusServerManager
 
+#: Allowed deviation from the nominal rate, as a fraction of it.
+#:
+#: A worker adds to its counter once per second. One late second makes the measured rate come out
+#: lower: at 20 tokens/s it loses 20 tokens over the 10s window, which is 2.0 tokens/s. The old
+#: fixed tolerance of 1.0 is smaller than that, so a run that is actually fine fails.
+RATE_TOLERANCE = 0.25
+
 
 class MockGroup:
     def __init__(self, global_rank, rank_in_group):
@@ -134,7 +141,7 @@ def test_PrometheusServerManager():
                         float(prompt_tps_each_rank[(instance_str, dp_id_str, rank_str)])
                         - 10
                     )
-                    < 1
+                    < RATE_TOLERANCE * 10
                 ), f"prompt_tps_each_rank[{(instance_str, dp_id_str, rank_str)}]:{prompt_tps_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 10"
             if dp_id_str == "1":
                 assert (
@@ -142,7 +149,7 @@ def test_PrometheusServerManager():
                         float(prompt_tps_each_rank[(instance_str, dp_id_str, rank_str)])
                         - 20
                     )
-                    < 1
+                    < RATE_TOLERANCE * 20
                 ), f"prompt_tps_each_rank[{(instance_str, dp_id_str, rank_str)}]:{prompt_tps_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 20"
 
         gen_tps_each_rank = manager.query_metric_rate_each_rank(
@@ -155,7 +162,7 @@ def test_PrometheusServerManager():
                         float(gen_tps_each_rank[(instance_str, dp_id_str, rank_str)])
                         - 100
                     )
-                    < 1
+                    < RATE_TOLERANCE * 100
                 ), f"gen_tps_each_rank[{dp_id_str}]:{gen_tps_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 100"
             if dp_id_str == "1":
                 assert (
@@ -163,7 +170,7 @@ def test_PrometheusServerManager():
                         float(gen_tps_each_rank[(instance_str, dp_id_str, rank_str)])
                         - 200
                     )
-                    < 1
+                    < RATE_TOLERANCE * 200
                 ), f"gen_tps_each_rank[{dp_id_str}]:{gen_tps_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 200"
 
         eviction_rate_each_rank = manager.query_metric_rate_each_rank(
@@ -178,7 +185,7 @@ def test_PrometheusServerManager():
                         )
                         - 1
                     )
-                    < 1
+                    < RATE_TOLERANCE * 1
                 ), f"eviction_rate_each_rank[{dp_id_str}]:{eviction_rate_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 1"
             if dp_id_str == "1":
                 assert (
@@ -188,7 +195,7 @@ def test_PrometheusServerManager():
                         )
                         - 2
                     )
-                    < 1
+                    < RATE_TOLERANCE * 2
                 ), f"eviction_rate_each_rank[{dp_id_str}]:{eviction_rate_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 2"
 
         kvcache_usage_each_rank = manager.query_metric_latest_value_each_rank(

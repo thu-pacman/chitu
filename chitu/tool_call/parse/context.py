@@ -4,14 +4,16 @@
 
 import json
 import uuid
-from typing import Callable, AsyncIterable, AsyncIterator
+from typing import Callable, Generator
+
 from ..type_def import (
-    ChoiceToolCallFunction,
-    ChoiceToolCall,
     ChoiceDelta,
-    ChoiceDeltaToolCallFunction,
     ChoiceDeltaToolCall,
+    ChoiceDeltaToolCallFunction,
+    ChoiceToolCall,
+    ChoiceToolCallFunction,
 )
+from .reader import READ_MORE, Reader
 from .type_def import ToolsInfo
 
 # Maps string content to the escape sequences of a JSON string literal, without
@@ -20,169 +22,200 @@ from .type_def import ToolsInfo
 EscapeFn = Callable[[str], str]
 
 
+def escape_json_content(text: str) -> str:
+    """Escape text for use inside a JSON string literal, without the quotes.
+
+    ``json.dumps`` quotes the whole value, so it cannot be applied per chunk. Its content
+    escaping is a stateless per-character map, hence ``escape_json_content(a + b) ==
+    escape_json_content(a) + escape_json_content(b)``: a string value can be escaped chunk
+    by chunk, and an argument name (assembled whole) uses the same escaping.
+    """
+    return json.dumps(text)[1:-1]
+
+
 class ParseContext:
-    def __init__(self, tools_info: ToolsInfo):
-        self.index = 0
+    """The output of one parse: content, tool calls, and the deltas to stream.
+
+    Whole-string parsing and streaming share this one context. Every ``as_*`` method
+    accumulates into ``content`` / ``arguments`` / ``tools`` (what whole-string parsing
+    reads at the end) and returns the matching delta (what streaming sends right away).
+    Sharing one implementation is what keeps the two paths from diverging -- the old code
+    had a separate streaming implementation, where the same text could raise on one path
+    and be silently truncated on the other.
+    """
+
+    def __init__(self, tools_info: ToolsInfo, reader: Reader, streaming: bool = True):
+        # Whole-string parsing has no use for stream deltas. A delta is a pydantic model
+        # costing a microsecond to build, so a 100-call response would waste milliseconds
+        # building and dropping them.
+        self.streaming = streaming
+        self.tools_info = tools_info
+        # The reader lives here so a parser only needs `ctx`, instead of threading
+        # (reader, stops) through every level.
+        self.reader = reader
         self.content = ""
-        self.tools = []
-        self.tools_info = tools_info
-
-    def begin_function(self):
-        self.name = ""
-        self.arguments = ""
-        self.arg_count = 0
-
-    def as_content(self, string: str):
-        self.content += string
-
-    def as_name(self, string: str):
-        self.name = string
-
-    def as_arguments(self, string: str):
-        self.arg_count = None
-        self.arguments = string
-
-    def as_arg_name(self, string: str):
-        self.arg_count += 1
-        prefix = ', "' if self.arg_count > 1 else '{"'
-        self.arg_name = string
-        # The key becomes part of the assembled arguments JSON: JSON-escape
-        # it (a no-op for the JSON-safe names ordinary tools declare). Same
-        # stateless content escaping as StringArgValueParser.escape — that
-        # class lives in parser.py, which imports this module.
-        self.arguments += prefix + json.dumps(string)[1:-1]
-
-    def as_arg_value(self, string: str):
-        self.arguments += '": ' + string
-
-    def as_arg_value_mapped(self, string: str, escape: EscapeFn) -> None:
-        self.arguments += '": "' + escape(string) + '"'
-
-    def end_function(self):
-        if self.arg_count == 0:
-            self.arguments = "{}"
-        elif self.arg_count is not None:
-            self.arguments += "}"
-
-        function = ChoiceToolCallFunction(name=self.name, arguments=self.arguments)
-        tool = ChoiceToolCall(id=str(uuid.uuid4()), function=function)
-        self.tools.append(tool)
-        self.index += 1
-
-    def get_arg_type(self):
-        assert self.name and self.arg_name
-        return self.tools_info.get_arg_type(self.name, self.arg_name)
-
-
-class StreamParseContext:
-    def __init__(self, tools_info: ToolsInfo):
+        self.tools: list[ChoiceToolCall] = []
         self.index = 0
-        self.tools_info = tools_info
-
-    def begin_function(self):
         self.name = ""
         self.arguments = ""
-        self.id = str(uuid.uuid4())
         self.arg_count = 0
+        # True when the format hands over the whole arguments object at once
+        # (Qwen3 / DeepSeek), so ``end_function`` must not close a brace itself.
+        self.blob_arguments = False
+        self.arg_name = ""
+        self._id = ""
+        # Set when the tool name is rejected: argument parsing must stop, or it would
+        # send arguments deltas for a call that no longer exists, and a delta cannot be
+        # retracted.
+        self.name_rejected = False
 
-    def make_content_delta(self, chunk: str):
-        return ChoiceDelta(content=chunk)
+    # ---- Reading -------------------------------------------------------
+    def read_text(self) -> Generator[object, None, str]:
+        """Read all text this level can see (stopping in front of a stop tag)."""
+        parts: list[str] = []
+        while True:
+            text, tag, need_more = self.reader.take()
+            if text:
+                parts.append(text)
+            if need_more:
+                yield READ_MORE
+                continue
+            if tag is not None:
+                return "".join(parts)
+            if not text:
+                return "".join(parts)
 
-    def make_name_delta(self, chunk: str):
-        function = ChoiceDeltaToolCallFunction(name=chunk)
-        tool = ChoiceDeltaToolCall(index=self.index, id=self.id, function=function)
-        self.id = None
+    def read_chunks(
+        self, make_delta=None, keep_tail: bool = False
+    ) -> Generator[object, None, None]:
+        """Like ``read_text``, but each piece becomes a delta right away.
+
+        Long text (a value) must go out as it arrives, or streaming would amount to
+        buffering the whole value first. Whole-string parsing drops these deltas.
+        """
+        while True:
+            text, tag, need_more = self.reader.take(keep_tail)
+            if text and make_delta is not None:
+                delta = make_delta(text)
+                if delta is not None:
+                    yield delta
+            if need_more:
+                yield READ_MORE
+                continue
+            if tag is not None or not text:
+                return
+
+    # ---- Content -------------------------------------------------------
+    def as_content(self, text: str) -> ChoiceDelta | None:
+        if not text:
+            return None
+        self.content += text
+        # Whole-string parsing needs no delta: building a pydantic model just to drop it
+        # is pure waste.
+        if not self.streaming:
+            return None
+        return ChoiceDelta(content=text)
+
+    # ---- Tool calls ----------------------------------------------------
+    def begin_function(self) -> None:
+        self.name = ""
+        self.arguments = ""
+        self.arg_count = 0
+        self._id = str(uuid.uuid4())
+        self.name_rejected = False
+
+    def make_name_delta(self, name: str) -> ChoiceDelta | None:
+        """The name is sent once, together with ``id``: the client groups the following
+        deltas of this call by it."""
+        if not self.streaming:
+            return None
+        tool = ChoiceDeltaToolCall(
+            index=self.index,
+            id=self._id or None,
+            function=ChoiceDeltaToolCallFunction(name=name),
+        )
+        self._id = ""
         return ChoiceDelta(tool_calls=[tool])
 
-    def make_arguments_delta(self, chunk: str):
-        function = ChoiceDeltaToolCallFunction(arguments=chunk)
-        tool = ChoiceDeltaToolCall(index=self.index, function=function)
+    def make_arguments_delta(self, text: str) -> ChoiceDelta | None:
+        if not self.streaming:
+            return None
+        tool = ChoiceDeltaToolCall(
+            index=self.index,
+            function=ChoiceDeltaToolCallFunction(arguments=text),
+        )
         return ChoiceDelta(tool_calls=[tool])
 
-    async def as_content(self, stream: AsyncIterable[str]):
-        async for chunk in stream:
-            yield self.make_content_delta(chunk)
+    def as_arguments(self, text: str) -> ChoiceDelta | None:
+        """The arguments are already one JSON object (Qwen3 / DeepSeek formats)."""
+        self.blob_arguments = True
+        if not text:
+            return None
+        self.arguments += text
+        return self.make_arguments_delta(text)
 
-    async def as_name(self, stream: AsyncIterable[str]):
-        string = ""
-        async for chunk in stream:
-            string += chunk
-        yield self.make_name_delta(string)
-        self.name = string
-
-    async def as_arguments(self, stream: AsyncIterable[str]):
-        string = ""
-        async for chunk in stream:
-            string += chunk
-            yield self.make_arguments_delta(chunk)
-        self.arguments = chunk
-        self.arg_count = None
-
-    async def as_arg_name(self, stream: AsyncIterable[str]):
+    def as_arg_name(self, name: str) -> ChoiceDelta | None:
         self.arg_count += 1
         prefix = ', "' if self.arg_count > 1 else '{"'
-        string = ""
-        is_first_chunk = True
-        async for chunk in stream:
-            string += chunk
-            # The key becomes part of the assembled arguments JSON: escape
-            # per chunk (json content escaping is stateless per character, so
-            # it composes over chunk boundaries; a no-op for JSON-safe
-            # names).
-            chunk = json.dumps(chunk)[1:-1]
-            if is_first_chunk:
-                chunk = prefix + chunk
-                is_first_chunk = False
-            yield self.make_arguments_delta(chunk)
-        self.arg_name = string
-        self.arguments += prefix + json.dumps(string)[1:-1]
+        self.arg_name = name
+        # The key becomes part of the assembled arguments JSON, so it is JSON-escaped. A
+        # plain tool name is JSON-safe and comes out unchanged; a format like K3 can have
+        # quotes or `&` in a key.
+        escaped = escape_json_content(name)
+        self.arguments += prefix + escaped
+        return self.make_arguments_delta(prefix + escaped)
 
-    async def as_arg_value(self, stream: AsyncIterable[str]):
-        prefix = '": '
-        string = ""
-        is_first_chunk = True
-        async for chunk in stream:
-            string += chunk
-            if is_first_chunk:
-                chunk = prefix + chunk
-                is_first_chunk = False
-            yield self.make_arguments_delta(chunk)
-        self.arguments += prefix + string
+    def as_arg_value(self, text: str, first: bool) -> ChoiceDelta | None:
+        """A non-string value is pasted as is: numbers, objects and arrays are already
+        valid JSON fragments."""
+        prefix = '": ' if first else ""
+        self.arguments += prefix + text
+        return self.make_arguments_delta(prefix + text)
 
-    async def as_arg_value_mapped(
-        self, stream: AsyncIterable[str], escape: EscapeFn
-    ) -> AsyncIterator[ChoiceDelta]:
-        """Stream a string argument value as an escaped JSON string.
+    def as_arg_value_mapped(
+        self, text: str, first: bool, escape: EscapeFn
+    ) -> ChoiceDelta | None:
+        """A string value, escaped piece by piece.
 
-        ``escape`` encodes string content to its JSON escape sequence(s) and
-        must be stateless and compose over chunk boundaries, i.e.
-        ``escape(a + b) == escape(a) + escape(b)``. JSON escaping has no
-        cross-chunk state, so every chunk can be encoded and yielded as soon
-        as it arrives instead of buffering the whole value.
+        JSON escaping is a stateless per-character map, so
+        ``escape(a + b) == escape(a) + escape(b)`` (see ``StringArgValueParser``): every
+        chunk can go out without waiting for the whole value.
         """
-        prefix = '": "'
-        is_first_chunk = True
-        async for chunk in stream:
-            text = escape(chunk)
-            if is_first_chunk:
-                text = prefix + text
-                is_first_chunk = False
-            if text:
-                yield self.make_arguments_delta(text)
-                self.arguments += text
+        prefix = '": "' if first else ""
+        escaped = escape(text)
+        if not prefix and not escaped:
+            return None
+        self.arguments += prefix + escaped
+        return self.make_arguments_delta(prefix + escaped)
 
-        # An empty value must still be emitted as a valid JSON string.
-        tail = (prefix if is_first_chunk else "") + '"'
-        yield self.make_arguments_delta(tail)
+    def close_arg_value_mapped(self, first: bool) -> ChoiceDelta | None:
+        """The closing quote of a string value; an empty value still gets its pair."""
+        tail = ('": "' if first else "") + '"'
         self.arguments += tail
+        return self.make_arguments_delta(tail)
 
-    async def end_function(self):
-        if self.arg_count == 0:
-            yield self.make_arguments_delta("{}")
-        elif self.arg_count is not None:
-            yield self.make_arguments_delta("}")
+    def end_function(self) -> ChoiceDelta | None:
+        delta = None
+        if self.blob_arguments:
+            pass
+        elif self.arg_count == 0:
+            self.arguments = "{}"
+            delta = self.make_arguments_delta("{}")
+        else:
+            self.arguments += "}"
+            delta = self.make_arguments_delta("}")
+        self.tools.append(
+            ChoiceToolCall(
+                id=self._id or str(uuid.uuid4()),
+                function=ChoiceToolCallFunction(
+                    name=self.name, arguments=self.arguments
+                ),
+            )
+        )
         self.index += 1
+        return delta
 
     def get_arg_type(self):
-        assert self.name and self.arg_name
+        if not self.name or not self.arg_name:
+            return None
         return self.tools_info.get_arg_type(self.name, self.arg_name)
