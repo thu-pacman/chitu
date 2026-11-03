@@ -426,7 +426,7 @@ for details.
 
 ### Argument `infer.pcp_layout`
 
-Token layout used by Prefill Context Parallel. Currently only "interleaved".
+Token layout used by Prefill Context Parallel: "interleaved" or "contiguous".
 
 *Default: `interleaved`.*
 

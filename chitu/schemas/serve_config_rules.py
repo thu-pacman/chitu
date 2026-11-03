@@ -130,6 +130,7 @@ class ServeConfigRules(Callback):
 
         self._check_linear_checkpoint_interval(config)
         self._check_linear_attention_impl(config)
+        self._check_pcp_layout(config)
         self._check_pcp_with_linear_attention(config)
 
     def _check_linear_attention_impl(self, config: DictConfig) -> None:
@@ -154,6 +155,15 @@ class ServeConfigRules(Callback):
                 f"linear_attention_impl={impl} cannot write the intermediate linear-attention "
                 'states that prefix caching needs; use "auto" (which falls back to the '
                 'torch impl when checkpoints are requested) or "torch"'
+            )
+
+    def _check_pcp_layout(self, config: DictConfig) -> None:
+        """Validate the token layout selected for prefill context parallelism."""
+        layout = config.infer.get("pcp_layout", "interleaved")
+        if layout not in {"interleaved", "contiguous"}:
+            self._exit_with_error(
+                "infer.pcp_layout must be one of "
+                f'["interleaved", "contiguous"], got {layout}'
             )
 
     def _check_linear_checkpoint_interval(self, config: DictConfig) -> None:
