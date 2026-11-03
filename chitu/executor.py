@@ -2035,6 +2035,17 @@ class Executor:
         if tasks is None:
             return
 
+        # The draft below replays the MTP layer, and that replay runs the MoE, so the dispatcher has
+        # to be prepared for the rows this draft will use. It sits above the empty/non-empty split
+        # because an empty batch needs it just as much: only the decode body prepares the dispatcher,
+        # and a step that carries no tasks never runs that body, so the dispatcher would keep the
+        # previous real step's sizing and the next real step would dispatch with stale state.
+        with step_timer("draft.moe_prepare"):
+            if Backend.model.moe_impl is not None:
+                Backend.model.moe_impl.prepare(
+                    TaskType.Decode, len(tasks.output_task_ids)
+                )
+
         if len(tasks.output_task_ids) == 0:
             Backend.model.draft(
                 tasks, torch.empty(0, dtype=torch.int64, device=self.device)
@@ -2060,12 +2071,6 @@ class Executor:
         for dispatcher in self.tensor_broadcast_dispatchers:
             last_tokens = dispatcher.broadcast_data(last_tokens)
         last_tokens = create_tensor(last_tokens, device=self.device, dtype=torch.int64)
-
-        with step_timer("draft.moe_prepare"):
-            if Backend.model.moe_impl is not None:
-                Backend.model.moe_impl.prepare(
-                    TaskType.Decode, len(tasks.output_task_ids)
-                )
 
         with step_timer("draft.mtp_hidden_states"):
             Backend.model.update_mtp_hidden_states(
