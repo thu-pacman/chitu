@@ -246,8 +246,15 @@ class PrometheusServerManager:
 
         :param metric_name: metric name, eg: chitu_total_generated_tokens
         :type metric_name: str
-        :param time_window: 1s means 10 seconds, 1m means 1 minutes
+        :param time_window: PromQL range selector, eg: "10s" is ten seconds, "1m" is one minute
         :type time_window: str
+
+        The window is also the divisor. Prometheus divides by the whole window even when it has
+        scraped less history than that, so reading too early returns a rate that is too low, with
+        no error: a "20s" window returned 0.8, 2.3, 3.8 ... for a steady 10 tokens/s, and
+        reached 10.0 only once a full window existed. Read after that much history, or read the
+        counter with `query_metric_latest_value_each_rank` and divide by the elapsed time.
+
         Returns:
             {(instance_id, dp_id, rank): metric_rate}
         """
@@ -282,12 +289,13 @@ class PrometheusServerManager:
         self, metric_name: str
     ) -> dict[tuple[str, str, str], str]:
         """
-        Query metric value for each dp rank
+        Query the latest value of a metric for each dp rank
 
         :param metric_name: metric name, eg: chitu_total_generated_tokens
         :type metric_name: str
-        :param time_window: 1s means 10 seconds, 1m means 1 minutes
-        :type time_window: str
+
+        Use this and divide by the elapsed time when the process may not live long enough for a rate
+        window; see `query_metric_rate_each_rank`.
 
         Returns:
             {(instance_id, dp_id, rank): metric_value}
