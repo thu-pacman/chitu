@@ -207,6 +207,11 @@ class ChatRequest(BaseModel):
         en="List of message objects composing the conversation.",
         zh="组成对话的消息对象列表。",
     )
+    @model_validator(mode="after")
+    def validate_messages_not_empty(self):
+        if not self.messages:
+            raise ValueError("messages must not be empty")
+        return self
     tools: list[dict] = DocField(
         [],
         en="Tool or function definitions available for the model to call.",
