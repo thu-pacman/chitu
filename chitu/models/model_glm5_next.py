@@ -1328,10 +1328,6 @@ class TransformerGLM5Next(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
                 raise ValueError("GLM-5.3-Flash requires params.vision_config")
             self.image_token_id = int(self.vision_config.image_token_id)
             self.visual = Glm5NextVisionTransformer(self.vision_config)
-        # Both dicts are maintained by `QwenVLMmCacheCoreMixin._mm_cache_cleanup`;
-        # this model has no MRoPE, so `_rope_delta_by_req` stays empty.
-        self._mm_req_cache: dict[str, dict[str, Any]] = {}
-        self._rope_delta_by_req: dict[str, torch.Tensor] = {}
         self.mm_cache: Optional[MMPagedKVCache] = cache_dict.get("multimodal")
 
     @override

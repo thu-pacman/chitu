@@ -26,6 +26,7 @@ MetadataSerializer 综合单元测试
 
 import pytest
 import msgpack
+import torch
 
 # ============================================================================
 # Fixtures
@@ -467,6 +468,60 @@ class TestDPDispatchWithTask:
             return s.serialize_metadata(packed, config=config)
 
         record_benchmark.run(benchmark_fn, num_tasks=1, impl="dp_prefill_first")
+
+    def test_dp_prefill_carries_multimodal_inputs(
+        self, prefill_task_factory, cleanup_task_pool
+    ):
+        """New prefill tasks carry pixel_values/grid_thw so DP worker ranks
+        (which reconstruct tasks from metadata alone) see the images."""
+        from chitu.metadata_serializer import MetadataSerializer, MetadataConfig
+        from chitu.task import PackedTasks, TaskPool
+
+        task = prefill_task_factory("000000dd", [10, 20, 30], consumed=0)
+        task.pixel_values = torch.randn(
+            24, 3 * 14 * 14, dtype=torch.float32, device="cpu"
+        )
+        task.grid_thw = torch.tensor([[1, 4, 6]], dtype=torch.int64, device="cpu")
+        packed = PackedTasks([], tasks=[task])
+
+        serializer = MetadataSerializer(mode="DP")
+        data = serializer.serialize_metadata(packed)
+
+        # The receiving side has no prior knowledge of the task.
+        TaskPool.remove("000000dd")
+        recv = MetadataSerializer(mode="DP")
+        _, out, _, _ = recv.deserialize_metadata(data)
+
+        assert out.pixel_values and out.pixel_values[0].shape == (24, 3 * 14 * 14)
+        torch.testing.assert_close(out.pixel_values[0], task.pixel_values)
+        torch.testing.assert_close(out.grid_thw[0], task.grid_thw)
+        assert out.grid_thw[0].dtype == torch.int64
+
+    def test_dp_prefill_multimodal_dedup(self, prefill_task_factory, cleanup_task_pool):
+        """Pixels ride only the FIRST transmission of a task (dedup); the
+        reconstructed task on the worker keeps them across chunks."""
+        from chitu.metadata_serializer import MetadataSerializer
+        from chitu.task import PackedTasks, TaskPool
+
+        task = prefill_task_factory("000000de", [10, 20, 30], consumed=0)
+        task.pixel_values = torch.randn(6, 588, dtype=torch.float32, device="cpu")
+        task.grid_thw = torch.tensor([[1, 2, 3]], dtype=torch.int64, device="cpu")
+        packed = PackedTasks([], tasks=[task])
+
+        serializer = MetadataSerializer(mode="DP")
+        first_data = serializer.serialize_metadata(packed)
+        first = msgpack.unpackb(first_data, raw=False)
+        assert "pixel_values" in first["tasks"][0]
+
+        # Second transmission (a later chunk): dedup drops the full info.
+        second = msgpack.unpackb(serializer.serialize_metadata(packed), raw=False)
+        assert "pixel_values" not in second["tasks"][0]
+
+        # The worker's reconstructed task (from the first transmission) keeps
+        # the pixels — a later chunk only updates progress fields.
+        TaskPool.remove("000000de")
+        _, out, _, _ = MetadataSerializer(mode="DP").deserialize_metadata(first_data)
+        assert out.pixel_values and out.pixel_values[0].shape == (6, 588)
 
 
 # ============================================================================

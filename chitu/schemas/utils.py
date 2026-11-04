@@ -93,6 +93,20 @@ class ModelConfigResolver:
             logger.warning(f"Failed to load config file: {e}")
             return None
 
+    @staticmethod
+    def _is_config_mapping(value: Any) -> bool:
+        """True for anything that behaves like a config mapping.
+
+        Plain dicts are the common case, but nested values may also be
+        ``StaticConfig`` (the wrapper ``set_global_args`` applies before this
+        resolver runs — its ``items()`` yields StaticConfig children, not
+        dicts) or ``DictConfig``. Without this, interpolations inside nested
+        blocks (e.g. ``models.vision_config``) would pass through unresolved.
+        """
+        return isinstance(value, dict) or (
+            hasattr(value, "items") and hasattr(value, "get")
+        )
+
     def process_config_dict(
         self, config_dict: Any, ckpt_dir: Optional[str] = None
     ) -> dict[str, Any]:
@@ -101,13 +115,13 @@ class ModelConfigResolver:
 
         processed_dict: dict[str, Any] = {}
         for key, value in config_dict.items():
-            if isinstance(value, dict):
+            if self._is_config_mapping(value):
                 processed_dict[key] = self.process_config_dict(value, ckpt_dir)
             elif isinstance(value, list):
                 processed_dict[key] = [
                     (
                         self.process_config_dict(item, ckpt_dir)
-                        if isinstance(item, dict)
+                        if self._is_config_mapping(item)
                         else self.resolve_config_value(item, ckpt_dir)
                     )
                     for item in value
