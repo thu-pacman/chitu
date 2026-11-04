@@ -30,7 +30,7 @@ def test_nvidia_topk_sm_scaled_grid_matches_h20_and_other_sm_counts(tmp_path):
     result = subprocess.run(
         [
             compiler,
-            "-std=c++17",
+            "-std=c++20",
             "-O2",
             "-D__host__=",
             "-D__device__=",
