@@ -324,6 +324,7 @@ class KimiK3LinearAttention(nn.Module):
                 state_checkpoints=conv_state_checkpoints,
                 checkpoint_cu_starts=ckpt_cu_starts,
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                seq_len_list=seq_len_delta.delta_lens_list,
             )
         q, k, v = torch.split(qkv, [self.local_qkv_dim] * 3, dim=-1)
         q, k, v = map(

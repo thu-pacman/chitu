@@ -5,19 +5,26 @@
 import torch
 import torch.nn.functional as F
 
-from chitu.device_type import has_accelerator
+from chitu.device_type import has_accelerator, is_hygon
 from chitu.ops.utils import check_checkpoint_args, make_op_dispatcher
 from chitu.utils import try_import_platform_dep
 from typing import Optional
 
 triton, has_triton = try_import_platform_dep("triton")
 has_triton_impl = has_triton and has_accelerator()
+boltops_conv, has_boltops_causal_conv = try_import_platform_dep(
+    "boltops.generic.triton.causal_conv1d"
+)
+has_boltops_causal_conv = has_boltops_causal_conv and has_triton_impl and is_hygon()
 
 if has_triton_impl:
     from chitu.ops.triton_ops import (
         causal_conv1d_update_triton,
         causal_conv1d_prefill_triton,
     )
+
+if has_boltops_causal_conv:
+    from chitu.ops.triton_ops.causal_conv import causal_conv1d_state_snapshots_triton
 
 
 @make_op_dispatcher
@@ -109,6 +116,42 @@ if has_triton_impl:
     )
 
 
+@causal_conv1d_update.register("boltops", available=has_boltops_causal_conv)
+def causal_conv1d_update_boltops(
+    this_hidden_states: torch.Tensor,
+    old_hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+):
+    """Adapt BoltOps' in-place 3-token history to Chitu's read-only 4-token state."""
+    assert this_hidden_states.ndim == 2
+    batch_size, hidden_size = this_hidden_states.shape
+    assert old_hidden_states.shape == (batch_size, hidden_size, 4)
+    assert weight.shape == (hidden_size, 1, 4)
+    assert this_hidden_states.is_cuda
+    assert this_hidden_states.device == old_hidden_states.device == weight.device
+    assert this_hidden_states.dtype == old_hidden_states.dtype
+    assert this_hidden_states.dtype in (torch.bfloat16, torch.float16, torch.float32)
+    assert weight.dtype in (this_hidden_states.dtype, torch.float32)
+    with torch.cuda.device(this_hidden_states.device):
+        if batch_size == 0:
+            return torch.empty_like(this_hidden_states), old_hidden_states.clone()
+        # [a,b,c,d] -> [b,b,c,d]. BoltOps slides the last three slots
+        # [b,c,d] -> [c,d,x], leaving the full result [b,c,d,x]. This private
+        # buffer preserves the caller's old state and needs no post-kernel copy.
+        new_hidden_states = torch.cat(
+            (old_hidden_states[..., 1:2], old_hidden_states[..., 1:]), dim=-1
+        )
+        outputs = boltops_conv.causal_conv1d_update(
+            this_hidden_states,
+            new_hidden_states[..., 1:],
+            weight.squeeze(1).contiguous(),
+            bias=None,
+            activation="silu",
+            backend="sglang",
+        )
+    return outputs, new_hidden_states
+
+
 @make_op_dispatcher
 def causal_conv1d_prefill(
     inputs: torch.Tensor,
@@ -119,13 +162,18 @@ def causal_conv1d_prefill(
     state_checkpoints: Optional[torch.Tensor] = None,
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    seq_len_list: Optional[list[int]] = None,
 ):
     """
     Args:
         inputs: (total_len, hidden_size)
         weight: (hidden_size, 1 conv_kernel_size)
         prefix_lens: (bsz,), prefix lengths of this inputs
-        impl: optional, triton,ref
+        impl: optional, triton,ref,boltops
+        seq_len_list: optional CPU sequence lengths. The BoltOps backend uses
+            these for launch sizing without reading prefix_lens back to CPU;
+            required during CUDA Graph capture. Must match prefix_lens. Passing
+            them opts supported Hygon width-4 calls into BoltOps under auto.
         state_checkpoints: checkpoint 的输出 buffer（prefix caching 用的 ckpt），shape
             (total_checkpoints, hidden_size, conv_kernel_size)。和其他用到 checkpoint 的
             算子（如 chunk_gated_delta_rule）保持同一套约定（对齐 flashinfer 的 gdn_prefill）：
@@ -138,7 +186,7 @@ def causal_conv1d_prefill(
             （默认）。位置从本 chunk 的起点往前数（本 chunk 的第 C、2C、... 个 token），
             所以只有 chunk 起点对齐到 C 时它才和 kv cache 按 seq 绝对位置判定的 checkpoint
             是同一批位置；cache 侧会先校验 chunk 起点对齐（见
-            SingletonPagedKVCache.ckpt_cu_starts）。目前只有 ref 实现支持。
+            SingletonPagedKVCache.ckpt_cu_starts）。ref/boltops 实现支持。
     Return:
         outputs: (total_len, hidden_size)
         conv_states: (bsz, hidden_size, conv_kernel_size)
@@ -148,17 +196,37 @@ def causal_conv1d_prefill(
 
 @causal_conv1d_prefill.register_auto
 def _auto_causal_conv1d_prefill(
+    inputs: Optional[torch.Tensor] = None,
+    conv_state: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+    prefix_lens: Optional[torch.Tensor] = None,
     *,
     state_checkpoints: Optional[torch.Tensor] = None,
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    seq_len_list: Optional[list[int]] = None,
 ):
+    # CPU lengths are already owned by the GLM scheduler; other callers keep
+    # their original routes. Do not synchronize device metadata to select an impl.
+    if (
+        has_boltops_causal_conv
+        and seq_len_list is not None
+        and inputs is not None
+        and inputs.is_cuda
+        and weight is not None
+        and weight.shape[-1] == 4
+        and conv_state is not None
+        and inputs.dtype == conv_state.dtype
+        and weight.dtype in (inputs.dtype, torch.float32)
+        and inputs.dtype in (torch.bfloat16, torch.float16, torch.float32)
+    ):
+        return "boltops"
     if (
         checkpoint_every_n_tokens > 0
         or state_checkpoints is not None
         or checkpoint_cu_starts is not None
     ):
-        # 目前只有 ref 实现支持 checkpoint
+        # Legacy callers without CPU lengths retain the checkpoint-capable ref.
         return "ref"
     if has_triton_impl:
         return "triton"
@@ -174,6 +242,7 @@ def causal_conv1d_prefill_ref(
     state_checkpoints: Optional[torch.Tensor] = None,
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    seq_len_list: Optional[list[int]] = None,
 ):
     C = checkpoint_every_n_tokens
     with_checkpoints = C > 0
@@ -257,6 +326,128 @@ def causal_conv1d_prefill_ref(
         new_conv_state, dim=0
     )  # (bsz,hidden_size,conv_kernel_size)
 
+    return outputs, new_conv_state
+
+
+@causal_conv1d_prefill.register("boltops", available=has_boltops_causal_conv)
+def causal_conv1d_prefill_boltops(
+    inputs: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    state_checkpoints: Optional[torch.Tensor] = None,
+    checkpoint_cu_starts: Optional[torch.Tensor] = None,
+    checkpoint_every_n_tokens: int = 0,
+    seq_len_list: Optional[list[int]] = None,
+):
+    """BoltOps convolution with Chitu's full-width, read-only state contract.
+
+    BoltOps consumes a private width-1 history. Final/full-width checkpoint
+    windows are gathered from raw inputs and the original state, not from its
+    shortened, in-place cache. No convolution or SiLU is replayed for snapshots.
+    """
+    total_len, hidden_size = inputs.shape
+    bsz = prefix_lens.numel() - 1
+    width = weight.shape[-1]
+    assert width == 4 and weight.shape == (
+        hidden_size,
+        1,
+        width,
+    ), "BoltOps causal_conv1d_prefill requires convolution width 4"
+    assert conv_state.shape == (bsz, hidden_size, width)
+    assert inputs.dtype == conv_state.dtype
+    assert weight.dtype in (inputs.dtype, torch.float32)
+    assert inputs.dtype in (torch.bfloat16, torch.float16, torch.float32)
+    assert inputs.device == conv_state.device == weight.device == prefix_lens.device
+    assert inputs.is_cuda and prefix_lens.ndim == 1 and bsz >= 0
+    assert prefix_lens.is_contiguous()
+    assert prefix_lens.dtype in (torch.int32, torch.int64)
+    C = checkpoint_every_n_tokens
+    assert isinstance(C, int) and C >= 0
+    assert (
+        C > 0 and state_checkpoints is not None and checkpoint_cu_starts is not None
+    ) or (C == 0 and state_checkpoints is None and checkpoint_cu_starts is None)
+    with torch.cuda.device(inputs.device):
+        capturing = torch.cuda.is_current_stream_capturing()
+        if seq_len_list is None:
+            if capturing:
+                raise ValueError(
+                    "BoltOps conv prefill requires seq_len_list during graph capture"
+                )
+            seq_len_list = prefix_lens.diff().tolist()
+        assert len(seq_len_list) == bsz and sum(seq_len_list) == total_len
+        assert all(isinstance(n, int) and n >= 0 for n in seq_len_list)
+        if C > 0:
+            n_checkpoints = sum(n // C for n in seq_len_list)
+            assert state_checkpoints.shape == (n_checkpoints, hidden_size, width)
+            assert (
+                state_checkpoints.device == checkpoint_cu_starts.device == inputs.device
+            )
+            assert checkpoint_cu_starts.shape == (bsz + 1,)
+            assert checkpoint_cu_starts.dtype == torch.int64
+            assert state_checkpoints.dtype in (
+                torch.float32,
+                torch.bfloat16,
+                torch.float16,
+            )
+            assert (
+                state_checkpoints.is_contiguous()
+                and checkpoint_cu_starts.is_contiguous()
+            )
+            assert all(
+                state_checkpoints.untyped_storage().data_ptr()
+                != tensor.untyped_storage().data_ptr()
+                for tensor in (
+                    inputs,
+                    conv_state,
+                    weight,
+                    prefix_lens,
+                    checkpoint_cu_starts,
+                )
+                if state_checkpoints.numel()
+            )
+        # The cache validates this metadata before capture; value checks require
+        # host synchronization, so only shape/dtype checks run during capture.
+        if not capturing:
+            check_checkpoint_args(
+                state_checkpoints,
+                checkpoint_cu_starts,
+                C,
+                seq_len_list,
+                (hidden_size, width),
+                "causal_conv1d_prefill(boltops)",
+            )
+        if bsz == 0 or total_len == 0:
+            return torch.empty_like(inputs), conv_state.clone()
+
+        # Keep channel-last physical storage even for a split merged-QKV view.
+        x = inputs.contiguous().transpose(0, 1)
+        history = conv_state[..., 1:].clone(memory_format=torch.contiguous_format)
+        use_vec8 = width == 4 and all(n == 0 or n >= 3 for n in seq_len_list)
+        outputs = boltops_conv.causal_conv1d_fn(
+            x,
+            weight.squeeze(1).contiguous(),
+            bias=None,
+            conv_states=history,
+            query_start_loc=prefix_lens,
+            seq_lens_cpu=seq_len_list,
+            has_initial_state=torch.ones(bsz, dtype=torch.bool, device=inputs.device),
+            activation="silu",
+            backend="sglang",
+            # The vec8 port's cache writeback assumes at least width-1 tokens.
+            vectorize=use_vec8,
+            # Only vec8 implements grouped chunks. The scalar port must keep
+            # one program per chunk, including mixed short/long batches.
+            chunks=0 if use_vec8 else 1,
+        ).transpose(0, 1)
+        new_conv_state = causal_conv1d_state_snapshots_triton(
+            inputs,
+            conv_state,
+            prefix_lens,
+            state_checkpoints,
+            checkpoint_cu_starts,
+            C,
+        )
     return outputs, new_conv_state
 
 

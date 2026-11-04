@@ -534,6 +534,102 @@ def test_kimi_delta_gate_beta_lazy(lower_bound):
 
 
 @pytest.mark.parametrize(
+    "impl,v_first",
+    [("torch", False), ("boltops_kda", False), ("boltops_kda", True), ("fla", False)],
+)
+def test_recurrent_kda_state_checkpoints(impl, v_first):
+    if (impl == "boltops_kda" and not has_boltops_kda) or (
+        impl == "fla" and not has_fla_kda
+    ):
+        pytest.skip(f"{impl} is unavailable")
+    torch.manual_seed(20261013)
+    B, T, H, K, V = 2, 3, 2, 128, 32
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn(B, T, H, V, device="cuda", dtype=q.dtype)
+    raw_beta = torch.randn(B, T, H, device="cuda", dtype=q.dtype)
+    g = _prepare_kimi_delta_gate(
+        raw_g=torch.randn_like(q),
+        raw_beta=raw_beta,
+        A_log=torch.zeros(H, device="cuda"),
+        dt_bias=torch.zeros(H, K, device="cuda"),
+        lower_bound=-5.0,
+    )
+    beta = _prepare_kimi_delta_beta(raw_beta=raw_beta)
+    k_first = torch.randn(B, H, K, V, device="cuda", dtype=q.dtype)
+    state = k_first.transpose(-1, -2).contiguous() if v_first else k_first
+    history = torch.empty(B, T, *state.shape[1:], device="cuda", dtype=q.dtype)
+    with AssertOpCalled("recurrent_kimi_delta_attention", impl):
+        out, omitted = recurrent_kimi_delta_attention(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state,
+            False,
+            use_qk_l2norm_in_kernel=True,
+            state_v_first=v_first,
+            state_checkpoints=history,
+            impl=impl,
+        )
+    assert omitted is None
+    ref_state, ref_out, ref_history = k_first, [], []
+    for token in range(T):
+        out_i, ref_state = recurrent_kimi_delta_attention_torch(
+            q[:, token : token + 1],
+            k[:, token : token + 1],
+            v[:, token : token + 1],
+            eval_lazy(g)[:, token : token + 1],
+            eval_lazy(beta)[:, token : token + 1],
+            ref_state,
+            True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        ref_out.append(out_i)
+        ref_history.append(ref_state)
+    expected_history = torch.stack(ref_history, dim=1)
+    if v_first:
+        expected_history = expected_history.transpose(-1, -2)
+    assert_close(out, torch.cat(ref_out, dim=1), atol=3e-3, rtol=3e-3)
+    assert_close(history, expected_history.to(history.dtype), atol=3e-3, rtol=3e-3)
+
+    with AssertOpCalled("recurrent_kimi_delta_attention", impl):
+        returned_out, returned_history = recurrent_kimi_delta_attention(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state,
+            True,
+            use_qk_l2norm_in_kernel=True,
+            state_v_first=v_first,
+            return_intermediate_states=True,
+            output_state_dtype=state.dtype,
+            impl=impl,
+        )
+    assert returned_history.dtype == state.dtype
+    assert returned_history.shape == history.shape
+    assert_close(returned_out, out, atol=0, rtol=0)
+    assert_close(returned_history, history, atol=0, rtol=0)
+    _, typed_final = recurrent_kimi_delta_attention(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        True,
+        use_qk_l2norm_in_kernel=True,
+        state_v_first=v_first,
+        output_state_dtype=state.dtype,
+        impl=impl,
+    )
+    assert typed_final.dtype == state.dtype
+    assert_close(typed_final, history[:, -1], atol=3e-3, rtol=3e-3)
+
+
+@pytest.mark.parametrize(
     "head_dim,lower_bound,has_raw_gates,requires_checkpoints",
     [
         (128, -5.0, True, False),
@@ -578,16 +674,11 @@ def test_chunk_kimi_delta_attention_dispatch(
         checkpoint_every_n_tokens=4 if requires_checkpoints else 0,
     )
     assert metadata_impl == runtime_impl
-    boltops_supported = (
-        head_dim == 128
-        and lower_bound is not None
-        and has_raw_gates
-        and not requires_checkpoints
-    )
-    if requires_checkpoints:
-        assert metadata_impl == "torch"
-    elif has_boltops_kda and boltops_supported:
+    boltops_supported = head_dim == 128 and lower_bound is not None and has_raw_gates
+    if has_boltops_kda and boltops_supported:
         assert metadata_impl == "boltops_kda"
+    elif requires_checkpoints:
+        assert metadata_impl == "torch"
     else:
         assert metadata_impl == ("fla" if has_fla_kda else "torch")
     if not boltops_supported:
@@ -598,8 +689,11 @@ def test_chunk_kimi_delta_attention_dispatch(
 
 
 @pytest.mark.skipif(not has_boltops_kda, reason="requires BoltOps on a Hygon device")
-@pytest.mark.parametrize("checkpoint_interval", [None, 32])
-def test_fixed_prefill_state_feeds_boltops_decode(checkpoint_interval):
+@pytest.mark.parametrize(
+    "prefill_impl,checkpoint_interval",
+    [("boltops_kda", None), ("boltops_kda", 32), ("boltops_kda", 64), ("torch", 32)],
+)
+def test_fixed_prefill_state_feeds_boltops_decode(prefill_impl, checkpoint_interval):
     """Both fixed prefill backends feed BoltOps decode in their native layouts."""
     torch.manual_seed(20261010)
     batch, prefill_tokens, heads, k_dim, v_dim = 1, 64, 2, 128, 32
@@ -630,7 +724,7 @@ def test_fixed_prefill_state_feeds_boltops_decode(checkpoint_interval):
     )
     A_log = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1
     dt_bias = torch.randn(heads, k_dim, device="cuda", dtype=torch.float32) * 0.1
-    state_v_first = checkpoint_interval is None
+    state_v_first = prefill_impl == "boltops_kda"
     state_dims = (v_dim, k_dim) if state_v_first else (k_dim, v_dim)
     initial_state = (
         torch.randn(batch, heads, *state_dims, device="cuda", dtype=torch.float32)
@@ -646,7 +740,6 @@ def test_fixed_prefill_state_feeds_boltops_decode(checkpoint_interval):
         lower_bound=-5.0,
     )
     beta = _prepare_kimi_delta_beta(raw_beta=raw_beta)
-    prefill_impl = "boltops_kda" if state_v_first else "torch"
     checkpoint_kwargs = {}
     if checkpoint_interval is not None:
         n_checkpoints = prefill_tokens // checkpoint_interval
@@ -675,7 +768,11 @@ def test_fixed_prefill_state_feeds_boltops_decode(checkpoint_interval):
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=cu_seqlens,
             seq_len_list=[prefill_tokens],
-            impl=prefill_impl,
+            impl=(
+                "auto"
+                if prefill_impl == "boltops_kda" and checkpoint_interval is not None
+                else prefill_impl
+            ),
             **checkpoint_kwargs,
         )
     assert g.is_evaluated() == (prefill_impl == "torch")
@@ -702,6 +799,24 @@ def test_fixed_prefill_state_feeds_boltops_decode(checkpoint_interval):
         atol=1e-2,
         rtol=1e-2,
     )
+
+    if checkpoint_interval is not None:
+        for i in range(1, prefill_tokens // checkpoint_interval + 1):
+            end = i * checkpoint_interval
+            _, expected_checkpoint = recurrent_kimi_delta_attention_torch(
+                query[:, :end],
+                key[:, :end],
+                value[:, :end],
+                eval_lazy(g)[:, :end],
+                eval_lazy(beta)[:, :end],
+                initial_state.transpose(-1, -2) if state_v_first else initial_state,
+                True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            checkpoint = checkpoint_kwargs["state_checkpoints"][i - 1 : i]
+            if state_v_first:
+                checkpoint = checkpoint.transpose(-1, -2)
+            assert_close(checkpoint, expected_checkpoint, atol=3e-3, rtol=3e-3)
 
     decode_query = torch.randn(
         batch, 1, heads, k_dim, device="cuda", dtype=torch.bfloat16

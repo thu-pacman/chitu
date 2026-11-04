@@ -339,6 +339,7 @@ def causal_conv1d_prefill_triton(
     state_checkpoints=None,
     checkpoint_cu_starts=None,
     checkpoint_every_n_tokens: int = 0,
+    seq_len_list=None,
 ):
     assert (
         checkpoint_every_n_tokens == 0
@@ -398,3 +399,101 @@ def causal_conv1d_prefill_triton(
     )
 
     return outputs, new_conv_state
+
+
+@triton.jit
+def _causal_conv1d_state_snapshots_kernel(
+    inputs,
+    old_state,
+    prefix_lens,
+    final_state,
+    checkpoints,
+    checkpoint_cu_starts,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    C: tl.constexpr,
+    stride_in_t: tl.constexpr,
+    stride_in_h: tl.constexpr,
+    stride_old_b: tl.constexpr,
+    stride_old_h: tl.constexpr,
+    stride_old_w: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    seq = tl.program_id(0)
+    h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    w = tl.arange(0, BLOCK_W)
+    mask = (h[:, None] < H) & (w[None, :] < W)
+    bos = tl.load(prefix_lens + seq)
+    length = tl.load(prefix_lens + seq + 1) - bos
+    old_base = old_state + seq * stride_old_b + h[:, None] * stride_old_h
+    offset = length - W + w[None, :]
+    old = tl.load(
+        old_base + (W + offset) * stride_old_w,
+        mask=mask & (offset < 0),
+        other=0,
+    )
+    new = tl.load(
+        inputs + (bos + offset) * stride_in_t + h[:, None] * stride_in_h,
+        mask=mask & (offset >= 0),
+        other=0,
+    )
+    tl.store(
+        final_state + (seq * H + h[:, None]) * W + w[None, :],
+        tl.where(offset >= 0, new, old),
+        mask=mask,
+    )
+    if C > 0:
+        first = tl.load(checkpoint_cu_starts + seq)
+        for i in range(length // C):
+            offset = (i + 1) * C - W + w[None, :]
+            old = tl.load(
+                old_base + (W + offset) * stride_old_w,
+                mask=mask & (offset < 0),
+                other=0,
+            )
+            new = tl.load(
+                inputs + (bos + offset) * stride_in_t + h[:, None] * stride_in_h,
+                mask=mask & (offset >= 0),
+                other=0,
+            )
+            tl.store(
+                checkpoints + ((first + i) * H + h[:, None]) * W + w[None, :],
+                tl.where(offset >= 0, new, old),
+                mask=mask,
+            )
+
+
+def causal_conv1d_state_snapshots_triton(
+    inputs,
+    conv_state,
+    prefix_lens,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens=0,
+):
+    """Gather full-width raw-input windows; never mutate input/cache state."""
+    bsz, hidden_size, width = conv_state.shape
+    final_state = torch.empty(
+        conv_state.shape, device=conv_state.device, dtype=conv_state.dtype
+    )
+    if bsz:
+        _causal_conv1d_state_snapshots_kernel[(bsz, triton.cdiv(hidden_size, 128))](
+            inputs,
+            conv_state,
+            prefix_lens,
+            final_state,
+            state_checkpoints,
+            checkpoint_cu_starts,
+            H=hidden_size,
+            W=width,
+            C=checkpoint_every_n_tokens,
+            stride_in_t=inputs.stride(0),
+            stride_in_h=inputs.stride(1),
+            stride_old_b=conv_state.stride(0),
+            stride_old_h=conv_state.stride(1),
+            stride_old_w=conv_state.stride(2),
+            BLOCK_H=128,
+            BLOCK_W=triton.next_power_of_2(width),
+        )
+    return final_state
