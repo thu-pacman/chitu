@@ -1477,6 +1477,7 @@ def _post_chat(monkeypatch, req, streaming):
         lambda: SimpleNamespace(
             models=SimpleNamespace(name="GLM-5.3"),
             serve=SimpleNamespace(model_alias=None),
+            infer=SimpleNamespace(max_concurrent_requests=None),
         ),
     )
 
@@ -2384,6 +2385,7 @@ def test_reasoning_usage_http_json_and_sse(
             lambda: SimpleNamespace(
                 models=SimpleNamespace(name="test-model"),
                 serve=SimpleNamespace(model_alias=None),
+                infer=SimpleNamespace(max_concurrent_requests=None),
             ),
         )
         monkeypatch.setattr(chat, "submit_request", submit)

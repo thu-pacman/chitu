@@ -49,7 +49,7 @@ POST /v1/chat/completions
 | `top_p` | `number` | `0.9` | 核采样阈值。 |
 | `top_k` | `integer` | `50` | Top-k 采样值。设为 -1（或 0）可禁用 top-k 过滤，在整个词表上采样（top_p 仍然生效）。top_k=1 等价于贪心解码，temperature=0 亦然。 |
 | `frequency_penalty` | `number` | `0.0` | 对重复 token 应用的频率惩罚。 |
-| `min_batch_size` | `integer` | `1` | 处理该请求时使用的最小 batch size。 |
+| `min_batch_size` | `integer` | `1` | 处理该请求时使用的最小 batch size。不能超过服务端准入容量（infer.max_concurrent_requests）。 |
 | `stop_with_eos` | `boolean` \| `null` | `null` | 是否在 EOS token 处停止生成。不能与 ignore_eos 冲突。 |
 | `ignore_eos` | `boolean` \| `null` | `null` | 兼容 vLLM 的 stop_with_eos 反向参数。不能与 stop_with_eos 冲突。 |
 | `chat_template_kwargs` | `object` | `{}` | 构造对话模板时使用的额外关键字参数。仅支持的键会被转发。 |
@@ -159,7 +159,7 @@ POST /v1/completions
 | `top_p` | `number` | `0.9` | 核采样阈值。 |
 | `top_k` | `integer` | `50` | Top-k 采样值。设为 -1（或 0）可禁用 top-k 过滤。top_k=1 等价于贪心解码，temperature=0 亦然。 |
 | `frequency_penalty` | `number` | `0.0` | 对重复 token 应用的频率惩罚。 |
-| `min_batch_size` | `integer` | `1` | 处理该请求时使用的最小 batch size。 |
+| `min_batch_size` | `integer` | `1` | 处理该请求时使用的最小 batch size。不能超过服务端准入容量（infer.max_concurrent_requests）。 |
 | `ignore_eos` | `boolean` \| `null` | `null` | 兼容 vLLM/SGLang 的 stop_with_eos 反向参数。ignore_eos=True 会强制生成到 max_tokens。 |
 | `stop_with_eos` | `boolean` \| `null` | `null` | 是否在 EOS token 处停止生成。不能与 ignore_eos 冲突。 |
 | `model` | `string` \| `null` | `null` | 已加载模型名或已配置的别名。省略时使用已加载模型名。 |

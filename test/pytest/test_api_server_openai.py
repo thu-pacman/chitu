@@ -84,9 +84,19 @@ async def unexpected_submit_request(_request):
     raise AssertionError("oversized request reached submit_request")
 
 
-def create_client(monkeypatch, *, max_seq_len=4, formatter=None, n_insts=1):
+def create_client(
+    monkeypatch,
+    *,
+    max_seq_len=4,
+    formatter=None,
+    n_insts=1,
+    max_concurrent_requests=None,
+):
     args = SimpleNamespace(
-        infer=SimpleNamespace(max_seq_len=max_seq_len, max_concurrent_requests=None),
+        infer=SimpleNamespace(
+            max_seq_len=max_seq_len,
+            max_concurrent_requests=max_concurrent_requests,
+        ),
         debug=SimpleNamespace(save_trace_dir=None),
         models=SimpleNamespace(name="test-model"),
         serve=SimpleNamespace(api_keys=[], validate_api_key=False),
@@ -152,6 +162,79 @@ def test_oversized_chat_prompt_returns_bad_request(monkeypatch):
         "detail": "prompt length(5) cannot be greater than max_seq_len(4)"
     }
     assert serve_common.min_batch_size == 1
+
+
+class _SubmitReached(Exception):
+    """Stops the handler at submit_request instead of waiting for a batch."""
+
+
+def post_min_batch_size(client, *, completion, value):
+    if completion:
+        return client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "hi",
+                "max_tokens": 1,
+                "min_batch_size": value,
+            },
+        )
+    return client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "min_batch_size": value,
+        },
+    )
+
+
+def record_submit_until_batch(monkeypatch):
+    submitted = []
+
+    async def record_submit(user_req):
+        submitted.append(user_req)
+        raise _SubmitReached
+
+    monkeypatch.setattr(openai_api, "submit_request", record_submit)
+    return submitted
+
+
+@pytest.mark.parametrize("completion", [False, True])
+def test_min_batch_size_above_admission_capacity_is_rejected(monkeypatch, completion):
+    client = create_client(monkeypatch, max_seq_len=64, max_concurrent_requests=1)
+
+    response = post_min_batch_size(client, completion=completion, value=2)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "min_batch_size"
+    # A rejected threshold must not reach the scheduler's global, or every later
+    # request would wait for a batch that admission can never let form.
+    assert serve_common.min_batch_size == 1
+
+
+@pytest.mark.parametrize("completion", [False, True])
+def test_min_batch_size_within_admission_capacity_reaches_submit(
+    monkeypatch, completion
+):
+    client = create_client(monkeypatch, max_seq_len=64, max_concurrent_requests=2)
+    submitted = record_submit_until_batch(monkeypatch)
+
+    post_min_batch_size(client, completion=completion, value=2)
+
+    assert len(submitted) == 1
+    assert serve_common.min_batch_size == 2
+
+
+@pytest.mark.parametrize("completion", [False, True])
+def test_min_batch_size_without_capacity_bound_reaches_submit(monkeypatch, completion):
+    client = create_client(monkeypatch, max_seq_len=64, max_concurrent_requests=None)
+    submitted = record_submit_until_batch(monkeypatch)
+
+    post_min_batch_size(client, completion=completion, value=4)
+
+    assert len(submitted) == 1
 
 
 @pytest.mark.parametrize("completion", [False, True])

@@ -16,7 +16,12 @@ from chitu.serve.api_server import (
     TokenizeRequest,
     DetokenizeRequest,
 )
-from chitu.serve.openai_api import ChatRequest, Message, StreamOptions
+from chitu.serve.openai_api import (
+    ChatRequest,
+    CompletionsRequest,
+    Message,
+    StreamOptions,
+)
 
 # ============================================================
 # Message model tests
@@ -363,6 +368,11 @@ class TestChatRequest:
         req = ChatRequest(min_batch_size=4, **self.MINIMAL_PAYLOAD)
         assert req.min_batch_size == 4
 
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_min_batch_size_rejects_non_positive(self, value):
+        with pytest.raises(ValidationError):
+            ChatRequest(min_batch_size=value, **self.MINIMAL_PAYLOAD)
+
     # --- Full request with all parameters ---
     def test_full_request(self):
         req = ChatRequest(
@@ -403,6 +413,18 @@ class TestChatRequest:
         assert req.max_tokens == 2048
         assert req.parallel_tool_calls is False
         assert req.min_batch_size == 2
+
+
+# ============================================================
+# CompletionsRequest model tests
+# ============================================================
+
+
+class TestCompletionsRequest:
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_min_batch_size_rejects_non_positive(self, value):
+        with pytest.raises(ValidationError):
+            CompletionsRequest(prompt="hi", min_batch_size=value)
 
 
 # ============================================================
