@@ -4,6 +4,7 @@ import types
 from collections import OrderedDict
 from unittest.mock import patch
 from dataclasses import dataclass, field
+import pytest
 from omegaconf import OmegaConf
 
 from chitu.dp_request_router import RequestRouter, SchedulerStats
@@ -11,7 +12,7 @@ from chitu.finish_reason import FinishReason
 from chitu.task import UserRequest
 from chitu.global_vars import set_global_args
 from chitu.schemas.serve_config import RouterConfig
-from chitu.kv_cache import BlockIdentity, NONE_BLK_HASH, BlockIdentityChainBuilder
+from chitu.kv_cache import BlockIdentityChainBuilder
 
 
 @dataclass
@@ -69,8 +70,8 @@ def test_hit_aware_select_scheduler_prefers_instance_with_more_prefix_hits():
     # prompt has to be long enough for the cache hit to be worth more than the
     # load the routed request itself puts on instance 0.
     req = MonkReq("req-hit", list(range(64)))
-    req_blocks = router.policy.build_req_token_blocks(req, local_instance_id=0)
-    assert len(req_blocks) == 16
+    req_block_hashes = router.policy.build_req_block_hashes(req, local_instance_id=0)
+    assert len(req_block_hashes) == 16
     # instance 0 hits every block; instance 1 hits zero.
     router.policy.remember_request(req, local_instance_id=0)
     router.policy.insert_req_blocks(req.request_id)
@@ -158,35 +159,34 @@ def test_local_evict_moves_hash_to_buffer():
     router.policy.instances_block_size[0] = 4
 
     req = MonkReq("req-evict", [1, 2, 3, 4, 5, 6, 7, 8])
-    req_blocks = router.policy.build_req_token_blocks(req, local_instance_id=0)
+    req_block_hashes = router.policy.build_req_block_hashes(req, local_instance_id=0)
     router.policy.remember_request(req, local_instance_id=0)
     router.policy.insert_req_blocks(req.request_id)
 
-    # first block should be evicted from cached_blocks and moved to recycle pool
-    assert req_blocks[0].blk_hash not in router.policy.cached_blocks[0]
-    assert req_blocks[0].blk_hash in router.policy.evict_buffer[0]
+    assert req_block_hashes[0] not in router.policy.cached_blocks[0]
+    assert req_block_hashes[0] in router.policy.evict_buffer[0]
 
 
 def test_apply_instance_evicts():
     router = _build_router(algorithm="prefix_cache_aware")
 
-    block = BlockIdentityChainBuilder.acquire(
-        manager_name="router", block_size=4
-    ).make_identity([1, 2, 3, 4], pre_blk_hash=NONE_BLK_HASH)
-
-    assert block.blk_hash is not None
+    router.policy.instances_block_size[0] = 4
+    (blk_hash,) = router.policy.build_req_block_hashes(
+        MonkReq("req-evict", [1, 2, 3, 4]), 0
+    )
+    assert blk_hash is not None
 
     # remove from cached_blocks
     router.policy.cached_blocks[0] = OrderedDict()
-    router.policy.cached_blocks[0][block.blk_hash] = block
-    router.policy.apply_instance_evicts(0, [block.blk_hash])
-    assert block.blk_hash not in router.policy.cached_blocks[0]
+    router.policy.cached_blocks[0][blk_hash] = None
+    router.policy.apply_instance_evicts(0, [blk_hash])
+    assert blk_hash not in router.policy.cached_blocks[0]
 
     # remove from evict_buffer
     router.policy.evict_buffer[0] = OrderedDict()
-    router.policy.evict_buffer[0][block.blk_hash] = 1.0
-    router.policy.apply_instance_evicts(0, [block.blk_hash])
-    assert block.blk_hash not in router.policy.evict_buffer[0]
+    router.policy.evict_buffer[0][blk_hash] = 1.0
+    router.policy.apply_instance_evicts(0, [blk_hash])
+    assert blk_hash not in router.policy.evict_buffer[0]
 
 
 def test_evict_buffer_keeps_fixed_capacity():

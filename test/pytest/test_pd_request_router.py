@@ -348,8 +348,8 @@ def test_pd_prefill_prefix_among_prefers_higher_hit_prefill_with_real_block_size
 
     req = MockReq("pick-best-prefix", block0 + block1 + block2 + block3)
 
-    assert policy.num_hit_blocks(0, policy.build_req_token_blocks(req, 0)) == 1
-    assert policy.num_hit_blocks(1, policy.build_req_token_blocks(req, 1)) == 3
+    assert policy.num_hit_blocks(0, policy.build_req_block_hashes(req, 0)) == 1
+    assert policy.num_hit_blocks(1, policy.build_req_block_hashes(req, 1)) == 3
     assert policy.select_scheduler(req) == 1
 
 
