@@ -42,39 +42,6 @@ namespace chitu {
 #else
 #define L2_CACHEHINT(size)
 #endif
-#define KERNEL_LAUNCH_CODE                                                     \
-    constexpr int NUM_WARPS =                                                  \
-        (CTA_M / WARP_M) * (CTA_N / WARP_N) * (CTA_K / WARP_K);                \
-    constexpr int SCALES_SMEM_SIZE = (G >= CTA_K)                              \
-                                         ? (CTA_N * STAGES * 2)                \
-                                         : (CTA_N * (CTA_K / G) * STAGES * 2); \
-    constexpr int kSmemByteSize =                                              \
-        ((CTA_M * (CTA_K + SMEM_PAD_A) + CTA_N * (CTA_K + SMEM_PAD_B) / 2) *   \
-             STAGES +                                                          \
-         SCALES_SMEM_SIZE) *                                                   \
-        sizeof(int8_t);                                                        \
-    if (kSmemByteSize >= 99 * 1024) {                                          \
-        printf(                                                                \
-            "This kernel requires %d Bytes of shared memory, which exceeds "   \
-            "device limit.\n",                                                 \
-            kSmemByteSize);                                                    \
-        return;                                                                \
-    }                                                                          \
-    int num_blocks_m = (num_out_feats + CTA_M - 1) / CTA_M;                    \
-    int num_blocks_n = num_out_channels / CTA_N / 1;                           \
-    const int log_tile = get_log_tile<8>((num_out_feats + CTA_M - 1) / CTA_M); \
-    const int tile_shift = 1 << log_tile;                                      \
-    dim3 num_blocks(num_blocks_n *tile_shift,                                  \
-                    (num_blocks_m + tile_shift - 1) / tile_shift);             \
-    dim3 threads_per_block(WARP_SIZE, NUM_WARPS);                              \
-    auto kernel_func =                                                         \
-        dense_kernel0<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>; \
-    cudaFuncSetAttribute(kernel_func,                                          \
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,          \
-                         kSmemByteSize);                                       \
-    kernel_func<<<num_blocks, threads_per_block, kSmemByteSize, stream>>>(     \
-        in_feats, kernel, zeros, scales_i8, wscales, ascales, out_feats,       \
-        num_in_feats, num_out_channels, num_in_channels);
 
 template <int N> __inline__ __host__ __device__ int get_log_tile(int n) {
     if (N >= 8 && n >= 6)
@@ -165,11 +132,9 @@ global_to_share_one_stage_A(int8_t *src, int8_t *dst, int global_ncols,
                             int cta_offset_m, int cta_offset_n,
                             int global_iter_k, int shared_iter_k, bool mask,
                             bool *preds) {
-    constexpr int total_global_iters = (CTA_M * CTA_K) / PACK_SIZE / CTA_SIZE;
-    constexpr int partial_global_iters = total_global_iters / SHARED_K_ITERS;
+    constexpr int partial_global_iters =
+        (CTA_M * CTA_K) / PACK_SIZE / CTA_SIZE / SHARED_K_ITERS;
     constexpr int cta_step_m_or_n = (CTA_SIZE * PACK_SIZE) / CTA_K;
-    constexpr int warp_step_m_or_n = (WARP_SIZE * PACK_SIZE) / CTA_K;
-    constexpr int threads_per_row = CTA_K / PACK_SIZE;
     constexpr int kSmemCol = CTA_K + SMEM_PAD_A;
     int8_t *dst_hoisted = dst;
     int8_t *src_hoisted = src + global_iter_k * CTA_K;
@@ -233,9 +198,7 @@ __device__ __inline__ void global_to_share_one_stage_zeros(
     constexpr int threads_needed = CTA_N / PACK_SIZE / 1;
     constexpr int threads_used =
         threads_needed < CTA_SIZE ? threads_needed : CTA_SIZE;
-    constexpr int total_global_iters = CTA_N / PACK_SIZE / threads_used;
     constexpr int threads_per_row = CTA_N / PACK_SIZE;
-    constexpr int kSmemCol = CTA_N;
     bool local_mask =
         mask & (threadIdx.y * WARP_SIZE + threadIdx.x < threads_used);
     int g_idx = global_iter_k * CTA_K / G;
@@ -336,16 +299,18 @@ __global__ void
 dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
               int8_t *__restrict__ zeros, int8_t *__restrict__ scales_i8,
               half2 *__restrict__ wscales, half *__restrict__ ascales,
-              half *__restrict__ C, int M, int64_t N, int64_t K) {
-    constexpr int SPLITK = 1;
+              half *__restrict__ C, int M, int64_t N, int64_t K)
+    requires(CTA_M % WARP_M == 0 && CTA_N % WARP_N == 0 &&
+             CTA_K % WARP_K == 0 && WARP_M % INTRIN_M == 0 &&
+             WARP_N % INTRIN_N == 0 && WARP_K % INTRIN_K == 0 &&
+             WARP_N % (PACK_SIZE * 2) == 0 && CTA_K % (PACK_SIZE * 2) == 0 &&
+             CTA_N % PACK_SIZE == 0 && (G % CTA_K == 0 || CTA_K % G == 0))
+{
     constexpr int NUM_WARPS_MN = CTA_M / WARP_M * CTA_N / WARP_N;
     constexpr int NUM_WARPS = NUM_WARPS_MN * CTA_K / WARP_K;
     constexpr int CTA_SIZE = NUM_WARPS * WARP_SIZE;
     constexpr int CTA_SIZE_MN = NUM_WARPS_MN * WARP_SIZE;
     constexpr int SLICES = CTA_K / WARP_K;
-    int num_blocks_n = (N + CTA_N - 1) / CTA_N;
-    int num_blocks_m = (M + CTA_M - 1) / CTA_M;
-
     int blockIdx_n = blockIdx.x;
     int blockIdx_m = blockIdx.y;
     const int log_tile = get_log_tile<8>((M + CTA_M - 1) / CTA_M);
@@ -362,8 +327,6 @@ dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
     constexpr int kSmemSizeA = kSmemSizeAPerStage * STAGES;
     constexpr int kSmemSizeB = kSmemSizeBPerStage * STAGES;
 
-    constexpr int scales_load_interval = G >= CTA_K ? G / CTA_K : 1;
-    constexpr int scales_per_load = G < CTA_K ? CTA_K / G : 1;
     constexpr int kSmemSizeScales = CTA_N * STAGES;
 
     extern __shared__ int8_t mem_shared[];
@@ -377,13 +340,11 @@ dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
     int8_t A_shared_warp_[2][WARP_M * WARP_K / WARP_SIZE];
     int8_t B_shared_warp_[2][WARP_N * WARP_K / WARP_SIZE];
     constexpr int A_total_global_iters = (CTA_M * CTA_K) / PACK_SIZE / CTA_SIZE;
-    constexpr int B_total_global_iters = (CTA_N * CTA_K) / PACK_SIZE / CTA_SIZE;
     constexpr int A_src_step_m = (CTA_SIZE * PACK_SIZE) / CTA_K;
     constexpr int A_warp_step_m = (WARP_SIZE * PACK_SIZE) / CTA_K;
     constexpr int A_threads_per_row = CTA_K / PACK_SIZE;
 
     constexpr int B_warps_per_row = CTA_K / 32;
-    constexpr int B_src_step_n = NUM_WARPS / B_warps_per_row;
 
     int cta_offset_m = blockIdx_m * CTA_M;
     int cta_offset_n = blockIdx_n * CTA_N;
@@ -651,6 +612,48 @@ dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
     }
 }
 
+// Launch `dense_kernel0` with a static tile configuration. The configuration
+// must satisfy the `requires` constraints on the kernel. Its shared-memory
+// footprint is a compile-time constant of the configuration, but the amount a
+// device actually allows is not, so the 99 KB bound is a runtime check.
+template <int CTA_M, int CTA_N, int CTA_K, int WARP_M, int WARP_N, int WARP_K,
+          int STAGES, int G>
+void launch_dense_kernel(int8_t *in_feats, int8_t *kernel, int8_t *zeros,
+                         int8_t *scales_i8, half2 *wscales, half *ascales,
+                         half *out_feats, int num_in_feats,
+                         int num_out_channels, int num_in_channels,
+                         int num_out_feats, cudaStream_t stream) {
+    constexpr int NUM_WARPS =
+        (CTA_M / WARP_M) * (CTA_N / WARP_N) * (CTA_K / WARP_K);
+    constexpr int SCALES_SMEM_SIZE = (G >= CTA_K)
+                                         ? (CTA_N * STAGES * 2)
+                                         : (CTA_N * (CTA_K / G) * STAGES * 2);
+    constexpr int kSmemByteSize =
+        ((CTA_M * (CTA_K + SMEM_PAD_A) + CTA_N * (CTA_K + SMEM_PAD_B) / 2) *
+             STAGES +
+         SCALES_SMEM_SIZE) *
+        sizeof(int8_t);
+    TORCH_CHECK(kSmemByteSize < 99 * 1024, "This kernel requires ",
+                kSmemByteSize,
+                " Bytes of shared memory, which exceeds the device limit.");
+
+    int num_blocks_m = (num_out_feats + CTA_M - 1) / CTA_M;
+    int num_blocks_n = num_out_channels / CTA_N;
+    const int log_tile = get_log_tile<8>((num_out_feats + CTA_M - 1) / CTA_M);
+    const int tile_shift = 1 << log_tile;
+    dim3 num_blocks(num_blocks_n * tile_shift,
+                    (num_blocks_m + tile_shift - 1) / tile_shift);
+    dim3 threads_per_block(WARP_SIZE, NUM_WARPS);
+    auto kernel_func =
+        dense_kernel0<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;
+    cudaFuncSetAttribute(kernel_func,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         kSmemByteSize);
+    kernel_func<<<num_blocks, threads_per_block, kSmemByteSize, stream>>>(
+        in_feats, kernel, zeros, scales_i8, wscales, ascales, out_feats,
+        num_in_feats, num_out_channels, num_in_channels);
+}
+
 #endif
 
 void w4a8_per_group_gemm_forward_cuda(
@@ -677,43 +680,27 @@ void w4a8_per_group_gemm_forward_cuda(
     constexpr int G = 128;
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (num_out_feats > 128) {
-        constexpr int CTA_M = 128;
-        constexpr int CTA_N = 64;
-        constexpr int CTA_K = 64;
-        constexpr int WARP_M = 64;
-        constexpr int WARP_N = 32;
-        constexpr int WARP_K = 64;
-        constexpr int STAGES = 4;
-        KERNEL_LAUNCH_CODE
-    } else if (num_out_feats >= 128) {
+        launch_dense_kernel<128, 64, 64, 64, 32, 64, 4, G>(
+            in_feats, kernel, zeros, scales_i8, wscales, ascales, out_feats,
+            num_in_feats, num_out_channels, num_in_channels, num_out_feats,
+            stream);
+    } else if (num_out_feats == 128) {
         if (num_in_channels <= 4096) {
-            constexpr int CTA_M = 64;
-            constexpr int CTA_N = 64;
-            constexpr int CTA_K = 64;
-            constexpr int WARP_M = 32;
-            constexpr int WARP_N = 32;
-            constexpr int WARP_K = 64;
-            constexpr int STAGES = 4;
-            KERNEL_LAUNCH_CODE
+            launch_dense_kernel<64, 64, 64, 32, 32, 64, 4, G>(
+                in_feats, kernel, zeros, scales_i8, wscales, ascales, out_feats,
+                num_in_feats, num_out_channels, num_in_channels, num_out_feats,
+                stream);
         } else {
-            constexpr int CTA_M = 64;
-            constexpr int CTA_N = 64;
-            constexpr int CTA_K = 128;
-            constexpr int WARP_M = 32;
-            constexpr int WARP_N = 32;
-            constexpr int WARP_K = 64;
-            constexpr int STAGES = 3;
-            KERNEL_LAUNCH_CODE
+            launch_dense_kernel<64, 64, 128, 32, 32, 64, 3, G>(
+                in_feats, kernel, zeros, scales_i8, wscales, ascales, out_feats,
+                num_in_feats, num_out_channels, num_in_channels, num_out_feats,
+                stream);
         }
     } else {
-        constexpr int CTA_M = 32;
-        constexpr int CTA_N = 64;
-        constexpr int CTA_K = 128;
-        constexpr int WARP_M = 32;
-        constexpr int WARP_N = 32;
-        constexpr int WARP_K = 64;
-        constexpr int STAGES = 3;
-        KERNEL_LAUNCH_CODE
+        launch_dense_kernel<32, 64, 128, 32, 32, 64, 3, G>(
+            in_feats, kernel, zeros, scales_i8, wscales, ascales, out_feats,
+            num_in_feats, num_out_channels, num_in_channels, num_out_feats,
+            stream);
     }
 
 #endif

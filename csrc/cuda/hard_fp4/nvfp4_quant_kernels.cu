@@ -20,6 +20,8 @@
 
 #include <cuda_fp8.h>
 
+#include "common.h"
+#include "dispatch_utils.h"
 #include "nvfp4_quant_entry.h"
 
 // Get type2 from type or vice versa (applied to half and bfloat16)
@@ -323,42 +325,6 @@ cvt_fp16_to_fp4(
 #endif
 }
 
-template <typename T>
-void invokeFP4Quantization(int m, int n, T const *input, float const *SFScale,
-                           int64_t *output, int32_t *SFOuput, bool useUE8M0,
-                           int multiProcessorCount, cudaStream_t stream) {
-    // Grid, Block size.
-    // Each thread converts 8 values.
-    dim3 block(std::min(int(n / ELTS_PER_THREAD), 512));
-    // Get number of blocks per SM (assume we can fully utilize the SM).
-    int const numBlocksPerSM = 2048 / block.x;
-    dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
-
-    // Launch the cvt kernel.
-    if (useUE8M0) {
-        cvt_fp16_to_fp4<T, true><<<grid, block, 0, stream>>>(
-            m, n, input, SFScale, reinterpret_cast<uint32_t *>(output),
-            reinterpret_cast<uint32_t *>(SFOuput));
-    } else {
-        cvt_fp16_to_fp4<T, false><<<grid, block, 0, stream>>>(
-            m, n, input, SFScale, reinterpret_cast<uint32_t *>(output),
-            reinterpret_cast<uint32_t *>(SFOuput));
-    }
-}
-
-// Instantiate the function.
-template void invokeFP4Quantization(int m, int n, half const *input,
-                                    float const *SFScale, int64_t *output,
-                                    int32_t *SFOuput, bool useUE8M0,
-                                    int multiProcessorCount,
-                                    cudaStream_t stream);
-
-template void invokeFP4Quantization(int m, int n, __nv_bfloat16 const *input,
-                                    float const *SFScale, int64_t *output,
-                                    int32_t *SFOuput, bool useUE8M0,
-                                    int multiProcessorCount,
-                                    cudaStream_t stream);
-
 void scaled_fp4_quant_sm100a(torch::Tensor const &output,
                              torch::Tensor const &input,
                              torch::Tensor const &output_sf,
@@ -380,27 +346,30 @@ void scaled_fp4_quant_sm100a(torch::Tensor const &output,
     // We don't support e8m0 scales at this moment.
     bool useUE8M0 = false;
 
-    switch (input.scalar_type()) {
-    case torch::kHalf: {
-        auto input_ptr = reinterpret_cast<half const *>(input.data_ptr());
-        invokeFP4Quantization(m, n, input_ptr, input_sf_ptr, output_ptr, sf_out,
-                              useUE8M0, multiProcessorCount, stream);
-        break;
-    }
-    case torch::kBFloat16: {
-        auto input_ptr =
-            reinterpret_cast<__nv_bfloat16 const *>(input.data_ptr());
-        invokeFP4Quantization(m, n, input_ptr, input_sf_ptr, output_ptr, sf_out,
-                              useUE8M0, multiProcessorCount, stream);
-        break;
-    }
-    default: {
-        std::cerr << "Observing: " << input.scalar_type()
-                  << " for the input datatype which is invalid";
-        throw std::runtime_error(
-            "Unsupported input data type for quantize_to_fp4.");
-    }
-    }
+    // Grid, Block size.
+    // Each thread converts 8 values.
+    dim3 block(std::min(int(n / ELTS_PER_THREAD), 512));
+    // Get number of blocks per SM (assume we can fully utilize the SM).
+    int const numBlocksPerSM = 2048 / block.x;
+    dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
+
+    chitu::dispatchToTypes<at::Half, at::BFloat16>(
+        input.scalar_type(), [&]<typename T>() {
+            using QuantT = typename chitu::map_to_cuda_type<T>::type;
+            auto input_ptr = reinterpret_cast<QuantT const *>(input.data_ptr());
+            // Launch the cvt kernel.
+            if (useUE8M0) {
+                cvt_fp16_to_fp4<QuantT, true><<<grid, block, 0, stream>>>(
+                    m, n, input_ptr, input_sf_ptr,
+                    reinterpret_cast<uint32_t *>(output_ptr),
+                    reinterpret_cast<uint32_t *>(sf_out));
+            } else {
+                cvt_fp16_to_fp4<QuantT, false><<<grid, block, 0, stream>>>(
+                    m, n, input_ptr, input_sf_ptr,
+                    reinterpret_cast<uint32_t *>(output_ptr),
+                    reinterpret_cast<uint32_t *>(sf_out));
+            }
+        });
 }
 
 void scaled_fp4_quant(torch::Tensor &output, torch::Tensor const &input,

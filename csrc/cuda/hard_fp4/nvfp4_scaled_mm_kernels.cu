@@ -23,6 +23,8 @@
 
 #include "cutlass/util/packed_stride.hpp"
 
+#include "dispatch_utils.h"
+
 using namespace cute;
 
 #define CHECK_TYPE(x, st, m)                                                   \
@@ -185,38 +187,15 @@ void runGemm(at::Tensor &D, at::Tensor const &A, at::Tensor const &B,
     CUTLASS_CHECK(gemm.run(arguments, workspace.data_ptr(), stream));
 }
 
-void cutlass_fp4_bf16_gemm_dispatch(torch::Tensor &D, torch::Tensor const &A,
-                                    torch::Tensor const &B,
-                                    torch::Tensor const &A_sf,
-                                    torch::Tensor const &B_sf,
-                                    torch::Tensor const &alpha, int m, int n,
-                                    int k, cudaStream_t stream) {
-    uint32_t const mp2 = std::max(static_cast<uint32_t>(16), next_pow_2(m));
-    if (mp2 <= 256) {
-        runGemm<Fp4GemmSm120<sm120_fp4_config_M256, cutlass::bfloat16_t>::Gemm>(
-            D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-    } else {
-        runGemm<
-            Fp4GemmSm120<sm120_fp4_config_default, cutlass::bfloat16_t>::Gemm>(
-            D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-    }
-}
-
-void cutlass_fp4_f16_gemm_dispatch(torch::Tensor &D, torch::Tensor const &A,
-                                   torch::Tensor const &B,
-                                   torch::Tensor const &A_sf,
-                                   torch::Tensor const &B_sf,
-                                   torch::Tensor const &alpha, int m, int n,
-                                   int k, cudaStream_t stream) {
-    uint32_t const mp2 = std::max(static_cast<uint32_t>(16), next_pow_2(m));
-    if (mp2 <= 256) {
-        runGemm<Fp4GemmSm120<sm120_fp4_config_M256, cutlass::half_t>::Gemm>(
-            D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-    } else {
-        runGemm<Fp4GemmSm120<sm120_fp4_config_default, cutlass::half_t>::Gemm>(
-            D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-    }
-}
+// Map ATen dtypes to the CUTLASS output element types used by the SM120 FP4
+// GEMM instantiations.
+template <typename T> struct CutlassOutType;
+template <> struct CutlassOutType<at::BFloat16> {
+    using type = cutlass::bfloat16_t;
+};
+template <> struct CutlassOutType<at::Half> {
+    using type = cutlass::half_t;
+};
 
 void cutlass_scaled_fp4_mm_sm120a(torch::Tensor &D, torch::Tensor const &A,
                                   torch::Tensor const &B,
@@ -271,20 +250,25 @@ void cutlass_scaled_fp4_mm_sm120a(torch::Tensor &D, torch::Tensor const &A,
                 "x", rounded_k, "), but got a shape (", B_sf.sizes()[0], "x",
                 B_sf.sizes()[1], ")");
 
-    auto out_dtype = D.dtype();
     const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
 
-    if (out_dtype == at::ScalarType::BFloat16) {
-        return cutlass_fp4_bf16_gemm_dispatch(D, A, B, A_sf, B_sf, alpha, m, n,
-                                              k, stream);
-    } else if (out_dtype == at::ScalarType::Half) {
-        return cutlass_fp4_f16_gemm_dispatch(D, A, B, A_sf, B_sf, alpha, m, n,
-                                             k, stream);
-    } else {
-        TORCH_CHECK(false, "Unsupported output data type of nvfp4 mm sm120 (",
-                    out_dtype, ")");
-    }
+    chitu::dispatchToTypes<at::BFloat16,
+                           at::Half>(D.scalar_type(), [&]<typename T>() {
+        using OutT = typename CutlassOutType<T>::type;
+        // The batch size M is rounded up to a power of two before
+        // choosing the tile config: up to 256 uses the M256-tuned config,
+        // anything larger uses the default config.
+        uint32_t const mp2 = std::max(static_cast<uint32_t>(16), next_pow_2(m));
+        if (mp2 <= 256) {
+            runGemm<typename Fp4GemmSm120<sm120_fp4_config_M256, OutT>::Gemm>(
+                D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+        } else {
+            runGemm<
+                typename Fp4GemmSm120<sm120_fp4_config_default, OutT>::Gemm>(
+                D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+        }
+    });
 #else
     TORCH_CHECK(false,
                 "Unsupported CUTLASS version. Set VLLM_CUTLASS_SRC_DIR to "

@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include "dispatch_utils.h"
 #include "nvidia_indexer_topk.h"
 #include "nvidia_indexer_topk_plan.h"
 #include <c10/cuda/CUDAGuard.h>
@@ -47,17 +48,22 @@ __global__ void gather_pages(const int32_t *indices, const int32_t *lengths,
 void nvidia_indexer_topk(const at::Tensor &scores, at::Tensor &output,
                          const std::optional<at::Tensor> &lengths,
                          const std::optional<at::Tensor> &row_starts) {
-    switch (variant(scores, true, true)) {
-    case 0:
-        return t1024_c1536::nvidia_indexer_topk(scores, output, lengths,
+    // `variant` only ever returns 0, 1 or 2 (the nvidia_topk_plan tables
+    // contain no other values). The dispatcher turns any other value into an
+    // error instead of guessing a kernel.
+    dispatchToStaticInts<0, 1, 2>(
+        variant(scores, true, true), [&]<int VARIANT>() {
+            if constexpr (VARIANT == 0) {
+                t1024_c1536::nvidia_indexer_topk(scores, output, lengths,
+                                                 row_starts);
+            } else if constexpr (VARIANT == 1) {
+                t1024_c3072::nvidia_indexer_topk(scores, output, lengths,
+                                                 row_starts);
+            } else {
+                t512_c3072::nvidia_indexer_topk(scores, output, lengths,
                                                 row_starts);
-    case 1:
-        return t1024_c3072::nvidia_indexer_topk(scores, output, lengths,
-                                                row_starts);
-    default:
-        return t512_c3072::nvidia_indexer_topk(scores, output, lengths,
-                                               row_starts);
-    }
+            }
+        });
 }
 
 void nvidia_indexer_topk_with_workspace(
@@ -66,20 +72,21 @@ void nvidia_indexer_topk_with_workspace(
     const std::optional<at::Tensor> &lengths,
     const std::optional<at::Tensor> &row_starts, bool prefill) {
     // Decode's choice depends on rows only, never on device lengths or P.
-    switch (variant(scores, prefill)) {
-    case 0:
-        return t1024_c1536::nvidia_indexer_topk_with_workspace(
-            scores, output, candidates, completion, plan_parts, lengths,
-            row_starts, prefill);
-    case 1:
-        return t1024_c3072::nvidia_indexer_topk_with_workspace(
-            scores, output, candidates, completion, plan_parts, lengths,
-            row_starts, prefill);
-    default:
-        return t512_c3072::nvidia_indexer_topk_with_workspace(
-            scores, output, candidates, completion, plan_parts, lengths,
-            row_starts, prefill);
-    }
+    dispatchToStaticInts<0, 1, 2>(variant(scores, prefill), [&]<int VARIANT>() {
+        if constexpr (VARIANT == 0) {
+            t1024_c1536::nvidia_indexer_topk_with_workspace(
+                scores, output, candidates, completion, plan_parts, lengths,
+                row_starts, prefill);
+        } else if constexpr (VARIANT == 1) {
+            t1024_c3072::nvidia_indexer_topk_with_workspace(
+                scores, output, candidates, completion, plan_parts, lengths,
+                row_starts, prefill);
+        } else {
+            t512_c3072::nvidia_indexer_topk_with_workspace(
+                scores, output, candidates, completion, plan_parts, lengths,
+                row_starts, prefill);
+        }
+    });
 }
 
 int32_t nvidia_indexer_topk_plan_parts(const std::vector<int32_t> &old_lengths,

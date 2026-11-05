@@ -15,7 +15,12 @@ namespace chitu {
 // FIXME: set it as a template parameter according to the device
 #define WARP_SIZE 32
 
-template <typename T, typename U>
+// Apply rotary position embedding to one (query, key) head pair.
+//
+// `INTERLEAVED` selects how the two rotated components of a position pair are
+// laid out: interleaved keeps them in adjacent elements (2t, 2t+1), separated
+// keeps them in the two halves of the head (t, t + n_hidden/2).
+template <bool INTERLEAVED, typename T, typename U>
 __global__ void rotary_pos_emb_llama_kernel(
     const T *q, const T *k, const U *__restrict__ freqs_cis_cos,
     const U *__restrict__ freqs_cis_sin, T *q_out, T *k_out, size_t batch_size,
@@ -30,60 +35,7 @@ __global__ void rotary_pos_emb_llama_kernel(
     // This block calculate q[i, j]
     size_t i = blockIdx.x;
     size_t j = blockIdx.y;
-    // Each thread calculates the values of two adjacent positions at once
-    for (size_t t = tid; t < n_hidden / 2; t += blockDim.x) {
-        size_t cos_sin_idx = i * cos_sin_stride + t;
-
-        float c = to_scalar<float>(freqs_cis_cos[cos_sin_idx]);
-        float s = to_scalar<float>(freqs_cis_sin[cos_sin_idx]);
-
-        if (j < q_n_heads) {
-            size_t q_in_offset = i * q_batch_stride + j * q_head_stride;
-            size_t q_out_offset =
-                i * q_out_batch_stride + j * q_out_head_stride;
-            size_t q1_idx = q_in_offset + t * 2;
-            size_t q2_idx = q1_idx + 1;
-            size_t q1_out_idx = q_out_offset + t * 2;
-            size_t q2_out_idx = q1_out_idx + 1;
-            float q1 = to_scalar<float>(q[q1_idx]);
-            float q2 = to_scalar<float>(q[q2_idx]);
-            q_out[q1_out_idx] = to_scalar<T>(q1 * c - q2 * s);
-            q_out[q2_out_idx] = to_scalar<T>(q2 * c + q1 * s);
-        }
-
-        if (j < k_n_heads) {
-            size_t k_in_offset = i * k_batch_stride + j * k_head_stride;
-            size_t k_out_offset =
-                i * k_out_batch_stride + j * k_out_head_stride;
-            size_t k1_idx = k_in_offset + t * 2;
-            size_t k2_idx = k1_idx + 1;
-            size_t k1_out_idx = k_out_offset + t * 2;
-            size_t k2_out_idx = k1_out_idx + 1;
-            float k1 = to_scalar<float>(k[k1_idx]);
-            float k2 = to_scalar<float>(k[k2_idx]);
-            k_out[k1_out_idx] = to_scalar<T>(k1 * c - k2 * s);
-            k_out[k2_out_idx] = to_scalar<T>(k2 * c + k1 * s);
-        }
-    }
-}
-
-template <typename T, typename U>
-__global__ void rotary_pos_emb_separated_kernel(
-    const T *q, const T *k, const U *__restrict__ freqs_cis_cos,
-    const U *__restrict__ freqs_cis_sin, T *q_out, T *k_out, size_t batch_size,
-    size_t q_n_heads, size_t k_n_heads, size_t n_hidden, size_t q_batch_stride,
-    size_t k_batch_stride, size_t q_head_stride, size_t k_head_stride,
-    size_t q_out_batch_stride, size_t k_out_batch_stride,
-    size_t q_out_head_stride, size_t k_out_head_stride, size_t cos_sin_stride) {
-    // NOTE: No restrict pointers because `q` may be alias to `q_out` and `k`
-    // may be alias to `k_out`
-
-    const size_t tid = threadIdx.x;
-    // This block calculate q[i, j]
-    size_t i = blockIdx.x;
-    size_t j = blockIdx.y;
-
-    size_t half_dim = n_hidden / 2;
+    const size_t half_dim = n_hidden / 2;
     // Each thread calculates the values of two adjacent positions at once
     for (size_t t = tid; t < half_dim; t += blockDim.x) {
         size_t cos_sin_idx = i * cos_sin_stride + t;
@@ -95,10 +47,18 @@ __global__ void rotary_pos_emb_separated_kernel(
             size_t q_in_offset = i * q_batch_stride + j * q_head_stride;
             size_t q_out_offset =
                 i * q_out_batch_stride + j * q_out_head_stride;
-            size_t q1_idx = q_in_offset + t;
-            size_t q2_idx = q1_idx + half_dim;
-            size_t q1_out_idx = q_out_offset + t;
-            size_t q2_out_idx = q1_out_idx + half_dim;
+            size_t q1_idx, q2_idx, q1_out_idx, q2_out_idx;
+            if constexpr (INTERLEAVED) {
+                q1_idx = q_in_offset + t * 2;
+                q2_idx = q1_idx + 1;
+                q1_out_idx = q_out_offset + t * 2;
+                q2_out_idx = q1_out_idx + 1;
+            } else {
+                q1_idx = q_in_offset + t;
+                q2_idx = q1_idx + half_dim;
+                q1_out_idx = q_out_offset + t;
+                q2_out_idx = q1_out_idx + half_dim;
+            }
             float q1 = to_scalar<float>(q[q1_idx]);
             float q2 = to_scalar<float>(q[q2_idx]);
             q_out[q1_out_idx] = to_scalar<T>(q1 * c - q2 * s);
@@ -109,10 +69,18 @@ __global__ void rotary_pos_emb_separated_kernel(
             size_t k_in_offset = i * k_batch_stride + j * k_head_stride;
             size_t k_out_offset =
                 i * k_out_batch_stride + j * k_out_head_stride;
-            size_t k1_idx = k_in_offset + t;
-            size_t k2_idx = k1_idx + half_dim;
-            size_t k1_out_idx = k_out_offset + t;
-            size_t k2_out_idx = k1_out_idx + half_dim;
+            size_t k1_idx, k2_idx, k1_out_idx, k2_out_idx;
+            if constexpr (INTERLEAVED) {
+                k1_idx = k_in_offset + t * 2;
+                k2_idx = k1_idx + 1;
+                k1_out_idx = k_out_offset + t * 2;
+                k2_out_idx = k1_out_idx + 1;
+            } else {
+                k1_idx = k_in_offset + t;
+                k2_idx = k1_idx + half_dim;
+                k1_out_idx = k_out_offset + t;
+                k2_out_idx = k1_out_idx + half_dim;
+            }
             float k1 = to_scalar<float>(k[k1_idx]);
             float k2 = to_scalar<float>(k[k2_idx]);
             k_out[k1_out_idx] = to_scalar<T>(k1 * c - k2 * s);
@@ -172,48 +140,42 @@ void rotary_pos_emb_llama_impl(torch::Tensor q, torch::Tensor k,
     size_t shared_mem_size = 0;
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    if (rotary_type == "separated") {
-        rotary_pos_emb_separated_kernel<<<grid_dim, block_dim, shared_mem_size,
-                                          stream>>>(
-            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
-                q.data_ptr<T>()),
-            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
-                k.data_ptr<T>()),
-            reinterpret_cast<typename map_to_cuda_type<U>::type *>(
-                freqs_cis_cos.data_ptr<U>()),
-            reinterpret_cast<typename map_to_cuda_type<U>::type *>(
-                freqs_cis_sin.data_ptr<U>()),
-            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
-                q_out.data_ptr<T>()),
-            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
-                k_out.data_ptr<T>()),
-            q_shape[0], q_shape[1], k_shape[1], q_shape[2], q.stride(0),
-            k.stride(0), q.stride(1), k.stride(1), q_out.stride(0),
-            k_out.stride(0), q_out.stride(1), k_out.stride(1),
-            freqs_cis_cos.stride(0));
-    } else if (rotary_type == "interleaved") {
-        rotary_pos_emb_llama_kernel<<<grid_dim, block_dim, shared_mem_size,
-                                      stream>>>(
-            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
-                q.data_ptr<T>()),
-            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
-                k.data_ptr<T>()),
-            reinterpret_cast<typename map_to_cuda_type<U>::type *>(
-                freqs_cis_cos.data_ptr<U>()),
-            reinterpret_cast<typename map_to_cuda_type<U>::type *>(
-                freqs_cis_sin.data_ptr<U>()),
-            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
-                q_out.data_ptr<T>()),
-            reinterpret_cast<typename map_to_cuda_type<T>::type *>(
-                k_out.data_ptr<T>()),
-            q_shape[0], q_shape[1], k_shape[1], q_shape[2], q.stride(0),
-            k.stride(0), q.stride(1), k.stride(1), q_out.stride(0),
-            k_out.stride(0), q_out.stride(1), k_out.stride(1),
-            freqs_cis_cos.stride(0));
+    bool interleaved;
+    if (rotary_type == "interleaved") {
+        interleaved = true;
+    } else if (rotary_type == "separated") {
+        interleaved = false;
     } else {
         ASSERTWITH(false,
                    "Unsupported rotary_type: " + rotary_type +
                        ". Only 'separated' and 'interleaved' are supported.");
+        return;
+    }
+
+    const auto launch = [&]<bool INTERLEAVED>() {
+        rotary_pos_emb_llama_kernel<INTERLEAVED>
+            <<<grid_dim, block_dim, shared_mem_size, stream>>>(
+                reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                    q.data_ptr<T>()),
+                reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                    k.data_ptr<T>()),
+                reinterpret_cast<typename map_to_cuda_type<U>::type *>(
+                    freqs_cis_cos.data_ptr<U>()),
+                reinterpret_cast<typename map_to_cuda_type<U>::type *>(
+                    freqs_cis_sin.data_ptr<U>()),
+                reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                    q_out.data_ptr<T>()),
+                reinterpret_cast<typename map_to_cuda_type<T>::type *>(
+                    k_out.data_ptr<T>()),
+                q_shape[0], q_shape[1], k_shape[1], q_shape[2], q.stride(0),
+                k.stride(0), q.stride(1), k.stride(1), q_out.stride(0),
+                k_out.stride(0), q_out.stride(1), k_out.stride(1),
+                freqs_cis_cos.stride(0));
+    };
+    if (interleaved) {
+        launch.template operator()<true>();
+    } else {
+        launch.template operator()<false>();
     }
 }
 

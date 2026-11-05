@@ -9,6 +9,7 @@
 #include <cub/util_type.cuh>
 
 #include "common.h"
+#include "dispatch_utils.h"
 #include "moe_kernel.h"
 
 namespace chitu {
@@ -72,19 +73,20 @@ struct alignas(Alignment) StoreArray {
     T data[N];
 };
 
-template <typename T, int EXPERTS, int BYTES_PER_LDG> struct TopkConstants {
-    static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
-    static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 ||
-                      EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0,
-                  "");
-    // Use ternary instead of std::max for HIP constexpr compatibility
-    static constexpr int VECs_PER_THREAD =
-        (EXPERTS / (ELTS_PER_LDG * WARP_SIZE) > 0)
-            ? (EXPERTS / (ELTS_PER_LDG * WARP_SIZE))
-            : 1;
-    static constexpr int VPT = VECs_PER_THREAD * ELTS_PER_LDG;
+template <typename T, int EXPERTS, int BYTES_PER_LDG,
+          int _ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T),
+          int _VECs_PER_THREAD = (EXPERTS / (_ELTS_PER_LDG * WARP_SIZE) > 0)
+                                     ? (EXPERTS / (_ELTS_PER_LDG * WARP_SIZE))
+                                     : 1,
+          int _VPT = _VECs_PER_THREAD * _ELTS_PER_LDG>
+    requires((EXPERTS / (_ELTS_PER_LDG * WARP_SIZE) == 0 ||
+              EXPERTS % (_ELTS_PER_LDG * WARP_SIZE) == 0) &&
+             EXPERTS >= _VPT)
+struct TopkConstants {
+    static constexpr int ELTS_PER_LDG = _ELTS_PER_LDG;
+    static constexpr int VECs_PER_THREAD = _VECs_PER_THREAD;
+    static constexpr int VPT = _VPT;
     static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
-    //   static const int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
 };
 
 __device__ __forceinline__ float sqrt_softplus(float x) {
@@ -106,7 +108,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
                               const int batchSize, const int n_groups,
                               const int topK_groups, int topInGroup,
                               int *expertsIds, T *selectedExpertsWeights,
-                              const BIAS_T *bias) {
+                              const BIAS_T *bias)
+    requires(NUM_EXPERTS >= VPT)
+{
     static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
     static constexpr int ELTS_PER_LDG_BIAS = BYTES_PER_LDG / sizeof(BIAS_T);
     static constexpr int ELTS_PER_ROW = NUM_EXPERTS;
@@ -234,8 +238,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     }
 
     // ===== Second, find the topK_groups. =====
-    const int threadIdInexpertsGroup =
-        threadIdInGroup % (experts_per_group / VPT);
     // Simply consider that topK is greater than or equal topK_groups
     BIAS_T topK_groups_weights[topK];
     int topK_groups_id[topK];
@@ -411,127 +413,54 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     }
 }
 
-template <typename T, typename BIAS_T, int EXPERTS, bool NORMALIZE_TOPK,
-          int BYTES_PER_LDG = 16>
-void fused_gate_dispatcher(const T *input, const int score_fun,
-                           const int batchSize, const int n_groups,
-                           const int topK_groups, int topInGroup,
-                           int *expertsIds, T *selectedExpertsWeights,
-                           const int topK, const BIAS_T *bias,
-                           cudaStream_t stream) {
-    static constexpr int BLOCK_SIZE = 256;
-
-    using Constants = TopkConstants<T, EXPERTS, BYTES_PER_LDG>;
-
-    static constexpr int THREADS_PER_ROW = Constants::THREADS_PER_ROW;
-    static constexpr int VPT = Constants::VPT;
-    const int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
-
-    const int numWarps = (batchSize + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
-    const int numBlocks =
-        (numWarps + BLOCK_SIZE / WARP_SIZE - 1) / (BLOCK_SIZE / WARP_SIZE);
-
-    dim3 block_dim(WARP_SIZE, BLOCK_SIZE / WARP_SIZE);
-
-#define LAUNCH_FUSED_TOPK(TOPK)                                                \
-    fused_sigmoid_topk_kernel<T, BIAS_T, VPT, EXPERTS, BLOCK_SIZE,             \
-                              BYTES_PER_LDG, TOPK, NORMALIZE_TOPK>             \
-        <<<numBlocks, block_dim, 0, stream>>>(                                 \
-            input, score_fun, batchSize, n_groups, topK_groups, topInGroup,    \
-            expertsIds, selectedExpertsWeights, bias);
-    switch (topK) {
-    case 6:
-        LAUNCH_FUSED_TOPK(6);
-        break;
-    case 8:
-        LAUNCH_FUSED_TOPK(8);
-        break;
-
-    default:
-        assert(false &&
-               "Unsupported topK value, just 6 and 8 are supported now.");
-        break;
-    }
-}
-
-#define LAUNCH_GATE(NUM_EXPERTS)                                               \
-    fused_gate_dispatcher<T, BIAS_T, NUM_EXPERTS, NORMALIZE_TOPK>(             \
-        input, score_fun, batchSize, n_groups, topK_groups, topInGroup,        \
-        expertsIds, selectedExpertsWeights, topK, bias, stream)
-
-#define LAUNCH_GATE_LDG(NUM_EXPERTS, BYTES_PER_LDG)                            \
-    fused_gate_dispatcher<T, BIAS_T, NUM_EXPERTS, NORMALIZE_TOPK,              \
-                          BYTES_PER_LDG>(                                      \
-        input, score_fun, batchSize, n_groups, topK_groups, topInGroup,        \
-        expertsIds, selectedExpertsWeights, topK, bias, stream)
-
+// Launch the fused sigmoid/sqrtsoftplus gate kernel for a whole gate tensor.
+// `bias` may be absent, in which case the kernel reads null.
 template <typename T, typename BIAS_T, bool NORMALIZE_TOPK>
-void fused_gate_launcher(const T *input, int score_fun, const int batchSize,
-                         const int n_groups, const int topK_groups,
-                         int topInGroup, int *expertsIds,
-                         T *selectedExpertsWeights, const int topK,
-                         const int numExperts, const BIAS_T *bias,
+void fused_gate_launcher(const torch::Tensor &input, int score_fun,
+                         const int batchSize, const int n_groups,
+                         const int topK_groups, int topInGroup,
+                         torch::Tensor &expertsIds,
+                         torch::Tensor &selectedExpertsWeights, const int topK,
+                         const int numExperts,
+                         c10::optional<torch::Tensor> bias,
                          cudaStream_t stream) {
-    switch (numExperts) {
-    case 384:
-        // 384 is not a power of two. With 8-byte vector loads, each row uses
-        // 32 threads, so warp-shuffle reductions still have a power-of-two
-        // width.
-        LAUNCH_GATE_LDG(384, 8);
-        break;
-    case 256:
-        LAUNCH_GATE(256);
-        break;
-    case 128:
-        LAUNCH_GATE(128);
-        break;
-    case 64:
-        LAUNCH_GATE(64);
-        break;
-    case 32:
-        LAUNCH_GATE(32);
-        break;
-    case 16:
-        LAUNCH_GATE(16);
-        break;
-    case 8:
-        LAUNCH_GATE(8);
-        break;
-    case 4:
-        LAUNCH_GATE(4);
-        break;
-    case 2:
-        LAUNCH_GATE(2);
-        break;
-
-    default:
-        assert(
-            false &&
-            "fused_softmax_topK num_experts must be a power of 2 and <= 256.");
-        break;
-    }
-}
-
-template <typename T, typename BIAS_T, bool NORMALIZE_TOPK>
-void fused_gate_launcher_wrapper(const torch::Tensor &input, int score_fun,
-                                 const int batchSize, const int n_groups,
-                                 const int topK_groups, int topInGroup,
-                                 torch::Tensor &expertsIds,
-                                 torch::Tensor &selectedExpertsWeights,
-                                 const int topK, const int numExperts,
-                                 c10::optional<torch::Tensor> bias,
-                                 cudaStream_t stream) {
-    T *input_ptr = reinterpret_cast<T *>(input.data_ptr());
+    const T *input_ptr = reinterpret_cast<const T *>(input.data_ptr());
     int *expertsIds_ptr = reinterpret_cast<int *>(expertsIds.data_ptr());
     T *selectedExpertsWeights_ptr =
         reinterpret_cast<T *>(selectedExpertsWeights.data_ptr());
-    BIAS_T *bias_ptr = bias.has_value()
-                           ? reinterpret_cast<BIAS_T *>(bias.value().data_ptr())
-                           : nullptr;
-    fused_gate_launcher<T, BIAS_T, NORMALIZE_TOPK>(
-        input_ptr, score_fun, batchSize, n_groups, topK_groups, topInGroup,
-        expertsIds_ptr, selectedExpertsWeights_ptr, topK, numExperts, bias_ptr,
-        stream);
+    const BIAS_T *bias_ptr =
+        bias.has_value()
+            ? reinterpret_cast<const BIAS_T *>(bias.value().data_ptr())
+            : nullptr;
+
+    dispatchToStaticInts<8, 16, 32, 64, 128, 256, 384>(
+        numExperts, [&]<int EXPERTS>() {
+            // 384 is not a power of two. With 8-byte vector loads, each row
+            // uses 32 threads, so warp-shuffle reductions still have a
+            // power-of-two width.
+            constexpr int BYTES_PER_LDG = EXPERTS == 384 ? 8 : 16;
+            constexpr int BLOCK_SIZE = 256;
+
+            using Constants = TopkConstants<T, EXPERTS, BYTES_PER_LDG>;
+            constexpr int THREADS_PER_ROW = Constants::THREADS_PER_ROW;
+            constexpr int VPT = Constants::VPT;
+            const int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
+
+            const int numWarps =
+                (batchSize + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+            const int numBlocks = (numWarps + BLOCK_SIZE / WARP_SIZE - 1) /
+                                  (BLOCK_SIZE / WARP_SIZE);
+            dim3 block_dim(WARP_SIZE, BLOCK_SIZE / WARP_SIZE);
+
+            dispatchToStaticInts<6, 8>(topK, [&]<int TOPK>() {
+                fused_sigmoid_topk_kernel<T, BIAS_T, VPT, EXPERTS, BLOCK_SIZE,
+                                          BYTES_PER_LDG, TOPK, NORMALIZE_TOPK>
+                    <<<numBlocks, block_dim, 0, stream>>>(
+                        input_ptr, score_fun, batchSize, n_groups, topK_groups,
+                        topInGroup, expertsIds_ptr, selectedExpertsWeights_ptr,
+                        bias_ptr);
+            });
+        });
 }
 
 template <bool NORMALIZE_TOPK>
@@ -571,19 +500,19 @@ void route_gate_impl(torch::Tensor &linear_output, int score_fun, int batchSize,
         using kernel_t = typename map_to_cuda_type<input_t>::type;
         if (bias.has_value()) {
             if (bias.value().scalar_type() == at::ScalarType::Float) {
-                fused_gate_launcher_wrapper<kernel_t, float, NORMALIZE_TOPK>(
+                fused_gate_launcher<kernel_t, float, NORMALIZE_TOPK>(
                     linear_output, score_fun, batchSize, n_groups, topK_groups,
                     topInGroup, expertsIds, selectedExpertsWeights, topK,
                     num_experts, bias, stream);
             } else {
                 using bias_t = typename map_to_cuda_type<input_t>::type;
-                fused_gate_launcher_wrapper<kernel_t, bias_t, NORMALIZE_TOPK>(
+                fused_gate_launcher<kernel_t, bias_t, NORMALIZE_TOPK>(
                     linear_output, score_fun, batchSize, n_groups, topK_groups,
                     topInGroup, expertsIds, selectedExpertsWeights, topK,
                     num_experts, bias, stream);
             }
         } else {
-            fused_gate_launcher_wrapper<kernel_t, kernel_t, NORMALIZE_TOPK>(
+            fused_gate_launcher<kernel_t, kernel_t, NORMALIZE_TOPK>(
                 linear_output, score_fun, batchSize, n_groups, topK_groups,
                 topInGroup, expertsIds, selectedExpertsWeights, topK,
                 num_experts, bias, stream);

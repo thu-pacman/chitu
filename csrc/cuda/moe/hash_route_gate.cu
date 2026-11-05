@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include "common.h"
+#include "dispatch_utils.h"
 #include "moe_kernel.h"
 
 namespace chitu {
@@ -86,56 +87,45 @@ __global__ void hash_route_gate_kernel(
     }
 }
 
-template <typename X_T, typename W_T, typename ID_T>
-void launch_hash_route_gate(torch::Tensor &x, torch::Tensor &weight,
-                            torch::Tensor &input_ids, torch::Tensor &tid2eid,
-                            torch::Tensor &experts_ids,
-                            torch::Tensor &selected_experts_weights, int topK,
-                            cudaStream_t stream) {
-    const int batch_size = x.size(0);
-    const int hidden_size = x.size(1);
-    const int vocab_size = tid2eid.size(0);
-    if (batch_size == 0) {
-        return;
-    }
-
-    dim3 block_dim(WARP_SIZE, WARPS_PER_BLOCK);
-    hash_route_gate_kernel<X_T, W_T, ID_T, 6>
-        <<<batch_size, block_dim, 0, stream>>>(
-            reinterpret_cast<X_T *>(x.data_ptr()),
-            reinterpret_cast<W_T *>(weight.data_ptr()),
-            reinterpret_cast<ID_T *>(input_ids.data_ptr()),
-            reinterpret_cast<int *>(tid2eid.data_ptr()),
-            reinterpret_cast<int *>(experts_ids.data_ptr()),
-            reinterpret_cast<float *>(selected_experts_weights.data_ptr()),
-            batch_size, hidden_size, vocab_size);
-}
-
 } // namespace
 
 void hash_route_gate(torch::Tensor &x, torch::Tensor &weight,
                      torch::Tensor &input_ids, torch::Tensor &tid2eid,
                      torch::Tensor &expertsIds,
                      torch::Tensor &selectedExpertsWeights, int topK) {
-    TORCH_CHECK(topK == 6, "hash_route_gate only supports topK=6.");
-
+    const int batch_size = x.size(0);
+    const int hidden_size = x.size(1);
+    const int vocab_size = tid2eid.size(0);
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    dim3 block_dim(WARP_SIZE, WARPS_PER_BLOCK);
 
     DISPATCH_FLOAT_TYPES(x.scalar_type(), "hash_route_gate_x", [&] {
         using x_t = typename map_to_cuda_type<scalar_t>::type;
         DISPATCH_FLOAT_TYPES(
             weight.scalar_type(), "hash_route_gate_weight", [&] {
                 using w_t = typename map_to_cuda_type<scalar_t>::type;
-                if (input_ids.dtype() == torch::kInt64) {
-                    launch_hash_route_gate<x_t, w_t, int64_t>(
-                        x, weight, input_ids, tid2eid, expertsIds,
-                        selectedExpertsWeights, topK, stream);
-                } else {
-                    launch_hash_route_gate<x_t, w_t, int32_t>(
-                        x, weight, input_ids, tid2eid, expertsIds,
-                        selectedExpertsWeights, topK, stream);
-                }
+                dispatchToTypes<int32_t, int64_t>(
+                    input_ids.scalar_type(), [&]<typename id_t>() {
+                        dispatchToStaticInts<6>(topK, [&]<int TOPK>() {
+                            // Nothing to launch for an empty batch.
+                            if (batch_size == 0) {
+                                return;
+                            }
+                            hash_route_gate_kernel<x_t, w_t, id_t, TOPK>
+                                <<<batch_size, block_dim, 0, stream>>>(
+                                    reinterpret_cast<x_t *>(x.data_ptr()),
+                                    reinterpret_cast<w_t *>(weight.data_ptr()),
+                                    reinterpret_cast<id_t *>(
+                                        input_ids.data_ptr()),
+                                    reinterpret_cast<int *>(tid2eid.data_ptr()),
+                                    reinterpret_cast<int *>(
+                                        expertsIds.data_ptr()),
+                                    reinterpret_cast<float *>(
+                                        selectedExpertsWeights.data_ptr()),
+                                    batch_size, hidden_size, vocab_size);
+                        });
+                    });
             });
     });
 }

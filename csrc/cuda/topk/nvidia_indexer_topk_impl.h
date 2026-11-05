@@ -7,6 +7,8 @@
 #include "nvidia_indexer_topk.h"
 #include "nvidia_indexer_topk_plan.h"
 
+#include "dispatch_utils.h"
+
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -2212,99 +2214,50 @@ int32_t max_uniform_float_parts(int64_t rows, int64_t width,
     return nvidia_topk_plan::max_parts(rows, width, prefill);
 }
 
-template <int MaxParts>
-void launch_uniform_float_static_stride(const TopKFloatParams &params,
-                                        uint64_t *candidates,
-                                        uint32_t *completion,
-                                        const int32_t *plan_parts, int32_t rows,
-                                        cudaStream_t stream) {
-    const auto logical_tasks = static_cast<uint64_t>(rows) * MaxParts;
-    TORCH_CHECK(logical_tasks <= UINT32_MAX,
-                "FP32 TopK static task count exceeds uint32");
-    // The caller holds the scores' device guard. PyTorch caches properties
-    // per device; graph replay does not execute this host-side lookup.
-    const auto num_sms =
-        at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    TORCH_CHECK(num_sms > 0, "NVIDIA TopK requires a positive device SM count");
-    const auto physical_blocks = nvidia_topk_plan::grid_blocks(
-        nvidia_topk_plan::config(rows, params.max_length, params.prefill), rows,
-        MaxParts, num_sms);
-    nvidia_indexer_topk_float_uniform_device_plan<MaxParts>
-        <<<physical_blocks, kThreads, 0, stream>>>(params, plan_parts, rows,
-                                                   candidates, completion);
-}
-
 void launch_uniform_float_static_stride(const TopKFloatParams &params,
                                         uint64_t *candidates,
                                         uint32_t *completion,
                                         const int32_t *plan_parts, int32_t rows,
                                         int32_t max_parts,
                                         cudaStream_t stream) {
-    switch (max_parts) {
-    case 2:
-        launch_uniform_float_static_stride<2>(params, candidates, completion,
-                                              plan_parts, rows, stream);
-        break;
-    case 4:
-        launch_uniform_float_static_stride<4>(params, candidates, completion,
-                                              plan_parts, rows, stream);
-        break;
-    case 8:
-        launch_uniform_float_static_stride<8>(params, candidates, completion,
-                                              plan_parts, rows, stream);
-        break;
-    case 16:
-        launch_uniform_float_static_stride<16>(params, candidates, completion,
-                                               plan_parts, rows, stream);
-        break;
-    default:
-        TORCH_CHECK(false, "unsupported FP32 TopK MaxParts: ", max_parts);
-    }
-}
-
-template <int MaxParts>
-void launch_uniform_16_static_stride(const TopKParams &params,
-                                     uint64_t *candidates, uint32_t *completion,
-                                     const int32_t *plan_parts, int32_t rows,
-                                     cudaStream_t stream) {
-    const auto logical_tasks = static_cast<uint64_t>(rows) * MaxParts;
-    TORCH_CHECK(logical_tasks <= UINT32_MAX,
-                "16-bit TopK static task count exceeds uint32");
-    const auto num_sms =
-        at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    TORCH_CHECK(num_sms > 0, "NVIDIA TopK requires a positive device SM count");
-    const auto physical_blocks = nvidia_topk_plan::grid_blocks(
-        nvidia_topk_plan::config(rows, params.max_length, params.prefill), rows,
-        MaxParts, num_sms);
-    nvidia_indexer_topk_16_uniform_device_plan<MaxParts>
-        <<<physical_blocks, kThreads, 0, stream>>>(params, plan_parts, rows,
-                                                   candidates, completion);
+    dispatchToStaticInts<2, 4, 8, 16>(max_parts, [&]<int MaxParts>() {
+        const auto logical_tasks = static_cast<uint64_t>(rows) * MaxParts;
+        TORCH_CHECK(logical_tasks <= UINT32_MAX,
+                    "FP32 TopK static task count exceeds uint32");
+        // The caller holds the scores' device guard. PyTorch caches properties
+        // per device; graph replay does not execute this host-side lookup.
+        const auto num_sms =
+            at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+        TORCH_CHECK(num_sms > 0,
+                    "NVIDIA TopK requires a positive device SM count");
+        const auto physical_blocks = nvidia_topk_plan::grid_blocks(
+            nvidia_topk_plan::config(rows, params.max_length, params.prefill),
+            rows, MaxParts, num_sms);
+        nvidia_indexer_topk_float_uniform_device_plan<MaxParts>
+            <<<physical_blocks, kThreads, 0, stream>>>(params, plan_parts, rows,
+                                                       candidates, completion);
+    });
 }
 
 void launch_uniform_16_static_stride(const TopKParams &params,
                                      uint64_t *candidates, uint32_t *completion,
                                      const int32_t *plan_parts, int32_t rows,
                                      int32_t max_parts, cudaStream_t stream) {
-    switch (max_parts) {
-    case 2:
-        launch_uniform_16_static_stride<2>(params, candidates, completion,
-                                           plan_parts, rows, stream);
-        break;
-    case 4:
-        launch_uniform_16_static_stride<4>(params, candidates, completion,
-                                           plan_parts, rows, stream);
-        break;
-    case 8:
-        launch_uniform_16_static_stride<8>(params, candidates, completion,
-                                           plan_parts, rows, stream);
-        break;
-    case 16:
-        launch_uniform_16_static_stride<16>(params, candidates, completion,
-                                            plan_parts, rows, stream);
-        break;
-    default:
-        TORCH_CHECK(false, "unsupported 16-bit TopK MaxParts: ", max_parts);
-    }
+    dispatchToStaticInts<2, 4, 8, 16>(max_parts, [&]<int MaxParts>() {
+        const auto logical_tasks = static_cast<uint64_t>(rows) * MaxParts;
+        TORCH_CHECK(logical_tasks <= UINT32_MAX,
+                    "16-bit TopK static task count exceeds uint32");
+        const auto num_sms =
+            at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+        TORCH_CHECK(num_sms > 0,
+                    "NVIDIA TopK requires a positive device SM count");
+        const auto physical_blocks = nvidia_topk_plan::grid_blocks(
+            nvidia_topk_plan::config(rows, params.max_length, params.prefill),
+            rows, MaxParts, num_sms);
+        nvidia_indexer_topk_16_uniform_device_plan<MaxParts>
+            <<<physical_blocks, kThreads, 0, stream>>>(params, plan_parts, rows,
+                                                       candidates, completion);
+    });
 }
 
 void launch_topk16_direct(const TopKParams &params, int64_t rows,
