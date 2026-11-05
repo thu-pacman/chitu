@@ -2,12 +2,39 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import shutil
+import sys
 import os
 
 import torch
 from torch.utils.cpp_extension import CUDAExtension
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+def get_version_from_gplusplus_executable(gplusplus_executable):
+    return int(os.popen(gplusplus_executable + " -dumpversion").read().strip())
+
+
+def find_gplusplus_version(version_high_bound):
+    """
+    Find the command of g++ version <= version_high_bound
+
+    The reason of this version bound is from the fact that mxcc is based on clang++, while
+    clang++ uses libstdc++ from g++, and clang++ from mxcc is too old for some new versions
+    of libstdc++.
+    """
+
+    candidates = ["g++"]
+    for v in range(version_high_bound, 1, -1):
+        candidates.append(f"g++-{v}")
+    for candidate in candidates:
+        if shutil.which(candidate):
+            if (
+                version := get_version_from_gplusplus_executable(candidate)
+            ) <= version_high_bound:
+                return version
+    return None
 
 
 def generate_files():
@@ -146,6 +173,15 @@ def get_extensions():
     if hygon_build == "1":
         cxx_extra_args += ["-DCHITU_HYGON_BUILD=1"]
         nvcc_extra_args += ["-DCHITU_HYGON_BUILD=1"]
+    if muxi_build == "1":
+        # Work around a mxcc problem on C++20
+        if (gcc_version := find_gplusplus_version(version_high_bound=11)) is not None:
+            nvcc_extra_args += [f"--gcc-version={gcc_version}"]
+        else:
+            print(
+                f"WARNING: Failed to find g++ <= {version_high_bound}, which may not be compatible with mxcc.",
+                file=sys.stderr,
+            )
 
     extra_link_args = [] if hygon_build == "1" else ["-lcuda"]
 
@@ -154,8 +190,8 @@ def get_extensions():
             name="chitu_backend",
             sources=base_sources + extra_sources,
             extra_compile_args={
-                "cxx": ["-std=c++17"] + cxx_extra_args,
-                "nvcc": ["-std=c++17"] + nvcc_extra_args,
+                "cxx": ["-std=c++20"] + cxx_extra_args,
+                "nvcc": ["-std=c++20"] + nvcc_extra_args,
             },
             extra_link_args=extra_link_args,
             define_macros=[

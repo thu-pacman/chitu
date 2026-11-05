@@ -451,8 +451,14 @@ def normalize_dialog(dialog):
     return new_dialog
 
 
-def _collect_images_from_dialog(dialog):
-    """Collect PIL images from dialog messages that contain image content."""
+def _collect_images_from_dialog(dialog, convert_rgb: bool = True):
+    """Collect PIL images from dialog messages that contain image content.
+
+    ``convert_rgb=False`` keeps the raw (possibly lazy, possibly RGBA) image so
+    the model's own media processor can apply its transparent-background
+    compositing (Kimi-K3); ``convert_rgb=True`` matches the historical Qwen-VL
+    behavior.
+    """
     from PIL import Image
 
     images = []
@@ -461,7 +467,8 @@ def _collect_images_from_dialog(dialog):
         if isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "image":
-                    images.append(Image.open(item["image"]).convert("RGB"))
+                    img = Image.open(item["image"])
+                    images.append(img.convert("RGB") if convert_rgb else img)
     return images
 
 
@@ -501,6 +508,40 @@ def _encode_kimi_vl(hf_proc, dialog, chat_template_kwargs):
     return _extract_vision_outputs(result)
 
 
+def _encode_kimi_k3_vl(hf_proc, dialog, chat_template_kwargs):
+    """Two-step encoding for Kimi K3 VL.
+
+    K3's chat template renders one ``<|kimi_image_placeholder|>`` per image. The
+    processor's ``preprocess_medias`` substitutes a resolution-aware media
+    prompt (original WxH, one ``<|media_pad|>``) for each; we then expand every
+    pad to the image's post-merge token count so the model can scatter
+    per-token features onto the pad positions.
+    """
+    images = _collect_images_from_dialog(dialog, convert_rgb=False)
+    medias = [{"type": "image", "image": img} for img in images]
+
+    _, image_prompts = hf_proc.preprocess_medias(medias)
+    text = hf_proc.apply_chat_template(
+        dialog,
+        tokenize=False,
+        add_generation_prompt=True,
+        image_prompts=image_prompts,
+        **chat_template_kwargs,
+    )
+
+    media_pad = "<|media_pad|>"
+    for media in medias:
+        num_tokens = hf_proc.media_processor.media_tokens_calculator(media)
+        text = text.replace(media_pad, media_pad * num_tokens, 1)
+
+    # The whole rendered text is tokenized with special tokens allowed (the
+    # tokenizer's own default), matching the official processor's
+    # ``self.tokenizer(text)`` path.
+    text_inputs = hf_proc.tokenizer(text, return_tensors="pt")
+    preprocessed = hf_proc.media_processor.preprocess(medias, return_tensors="pt")
+    return _extract_vision_outputs({**text_inputs, **preprocessed.data})
+
+
 class ChatFormatHF:
     def __init__(self, tokenizer: TokenizerHF, processor: Processor):
         self.tokenizer = tokenizer
@@ -527,6 +568,19 @@ class ChatFormatHF:
     ):
         if self.processor:
             normalized = normalize_dialog(dialog)
+
+            # Kimi style (K2.5/K3): the processor's apply_chat_template only
+            # tokenizes text, so images need a dedicated two-step encoding.
+            hf_proc = self.processor.processor
+            if hasattr(hf_proc, "media_processor") and _collect_images_from_dialog(
+                normalized, convert_rgb=False
+            ):
+                # K3's processor renders <|kimi_image_placeholder|> (it defines
+                # ``image_placeholder``); K2.5's renders <|media_pad|> directly.
+                if hasattr(hf_proc, "image_placeholder"):
+                    return _encode_kimi_k3_vl(hf_proc, normalized, chat_template_kwargs)
+                return _encode_kimi_vl(hf_proc, normalized, chat_template_kwargs)
+
             inputs = self.processor.apply_chat_template(
                 normalized,
                 tokenize=True,
@@ -539,14 +593,6 @@ class ChatFormatHF:
             # Qwen VL style: apply_chat_template returns pixel_values directly.
             if "pixel_values" in inputs:
                 return _extract_vision_outputs(inputs)
-
-            # Kimi K2.5 style: apply_chat_template only tokenizes text.
-            # Need a second pass to process images via media_processor.
-            hf_proc = self.processor.processor
-            if hasattr(hf_proc, "media_processor") and _collect_images_from_dialog(
-                normalized
-            ):
-                return _encode_kimi_vl(hf_proc, normalized, chat_template_kwargs)
 
             return inputs["input_ids"].reshape(-1).tolist()
 

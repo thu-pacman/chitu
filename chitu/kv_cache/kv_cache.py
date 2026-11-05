@@ -1928,10 +1928,11 @@ class MMPagedKVCache(PagedKVCache):
     def finalize_cache_all_decode(self, tasks: "PackedTasksBase"):
         KVCacheBase.finalize_cache_all_decode(self, tasks)
         for tid in tasks.task_ids:
-            if tid not in self.tid_to_cached_len:
-                return
+            # NOTE: no tid_to_cached_len check here, because the base call just
+            # popped it.
             if tid not in self.tid_to_multimodal_len:
-                return
+                # text-only request
+                continue
             if tid in self.block_table:
                 self.free_req_cache_blocks(tid)
             self.req_len.pop(tid, None)

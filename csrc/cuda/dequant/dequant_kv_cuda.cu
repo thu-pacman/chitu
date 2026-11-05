@@ -13,6 +13,7 @@
 
 #include "common.h"
 #include "dequant_kv_impl.h"
+#include "dispatch_utils.h"
 
 namespace chitu::detail {
 
@@ -131,24 +132,6 @@ __global__ void dsa_fp8_paged_kvcache_read_dequant_kernel(
     }
 }
 
-template <typename index_t>
-void launch_paged_cuda(const torch::Tensor &kv_fp8,
-                       const torch::Tensor &page_table,
-                       const torch::Tensor &position_ids,
-                       const torch::Tensor &seq_ids, torch::Tensor &out) {
-    const int64_t num_tokens = position_ids.numel();
-    const int64_t page_size = kv_fp8.size(1);
-    const int64_t pages_per_sample = page_table.size(1);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    dsa_fp8_paged_kvcache_read_dequant_kernel<index_t>
-        <<<num_tokens, kThreadsPerBlock, 0, stream>>>(
-            reinterpret_cast<const uint8_t *>(kv_fp8.data_ptr()),
-            page_table.data_ptr<index_t>(), position_ids.data_ptr<index_t>(),
-            seq_ids.data_ptr<index_t>(),
-            reinterpret_cast<nv_bfloat16 *>(out.data_ptr<at::BFloat16>()),
-            num_tokens, page_size, pages_per_sample);
-}
-
 } // namespace
 
 void launch_dsa_fp8_kvcache_dequant_cuda(const torch::Tensor &kv_fp8,
@@ -165,12 +148,23 @@ void launch_dsa_fp8_paged_kvcache_read_dequant_cuda(
     const torch::Tensor &kv_fp8, const torch::Tensor &page_table,
     const torch::Tensor &position_ids, const torch::Tensor &seq_ids,
     torch::Tensor &out) {
-    if (page_table.scalar_type() == at::ScalarType::Int) {
-        launch_paged_cuda<int>(kv_fp8, page_table, position_ids, seq_ids, out);
-    } else {
-        launch_paged_cuda<int64_t>(kv_fp8, page_table, position_ids, seq_ids,
-                                   out);
-    }
+    const int64_t num_tokens = position_ids.numel();
+    const int64_t page_size = kv_fp8.size(1);
+    const int64_t pages_per_sample = page_table.size(1);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    chitu::dispatchToTypes<int32_t, int64_t>(
+        page_table.scalar_type(), [&]<typename index_t>() {
+            dsa_fp8_paged_kvcache_read_dequant_kernel<index_t>
+                <<<num_tokens, kThreadsPerBlock, 0, stream>>>(
+                    reinterpret_cast<const uint8_t *>(kv_fp8.data_ptr()),
+                    page_table.data_ptr<index_t>(),
+                    position_ids.data_ptr<index_t>(),
+                    seq_ids.data_ptr<index_t>(),
+                    reinterpret_cast<nv_bfloat16 *>(
+                        out.data_ptr<at::BFloat16>()),
+                    num_tokens, page_size, pages_per_sample);
+        });
 }
 
 } // namespace chitu::detail

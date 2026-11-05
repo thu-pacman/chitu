@@ -19,7 +19,6 @@ __global__ void frequencyPenaltyKernel(float *logits, int64_t *logits_index,
                                        int64_t *response_lens, int vocab_size,
                                        int batch_size, int logits_stride_0,
                                        int logits_stride_1) {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
     int batch_idx = blockIdx.x;
     if (batch_idx >= batch_size)
         return;

@@ -17,7 +17,6 @@ namespace chitu {
 
 __global__ void change_layout_kernel(uint32_t *W, uint32_t *C, const int N,
                                      const int K, const int B) {
-    const int blockid = blockIdx.x * gridDim.y + blockIdx.y;
     const int num_element_per_fetch = 4;
     const int thread_num_k = BLOCK_K_SIZE / 2 / num_element_per_fetch;
     const int tid_n = threadIdx.x / thread_num_k;
@@ -85,6 +84,11 @@ torch::Tensor weight_layout_change(torch::Tensor weight) {
             reinterpret_cast<uint32_t *>(C.data_ptr()), N, K, B);
         return C;
     }
+    ASSERTWITH(false, "Unsupported weight dimension: ", weight.dim(),
+               ". Only 2D and 3D weights are supported.");
+    // ASSERTWITH terminates the process; the return only satisfies the
+    // compiler's non-void requirement.
+    return torch::Tensor();
 }
 
 } // namespace chitu

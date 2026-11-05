@@ -24,7 +24,6 @@ from chitu.kv_cache import (
     MMPagedKVCache,
     PagedKVCacheAccessor,
 )
-from chitu.lazy import eval_lazy
 from chitu.models.model import (
     LayerNorm,
     RMSNorm,
@@ -1039,6 +1038,7 @@ class Glm5NextLinearAttention(nn.Module):
                 state_checkpoints=conv_state_checkpoints,
                 checkpoint_cu_starts=ckpt_cu_starts,
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                seq_len_list=seq_len_delta.delta_lens_list,
             )
             # prefill 只写每个 seq 的第 0 个 in-place block，所以这里不需要为 mtp_size 复制
         q, k, v = torch.split(qkv, [self.local_qkv_dim] * 3, dim=-1)
@@ -1074,30 +1074,20 @@ class Glm5NextLinearAttention(nn.Module):
                 lambda x: x.view(-1, self.mtp_size, *x.shape[1:]).contiguous(),
                 [q, k, v],
             )
-            # LazyTensor has no token slicing; materialize once before the loop.
-            g_mtp, beta_mtp = eval_lazy(g), eval_lazy(beta)
-
-            out_mtp = torch.empty_like(q_mtp)
-            last_state = torch.empty(
-                (q_mtp.shape[0], self.mtp_size, *recurrent_state.shape[1:]),
-                device=q_mtp.device,
-                dtype=recurrent_state.dtype,
+            out_mtp, last_state = recurrent_kimi_delta_attention(
+                q_mtp,
+                k_mtp,
+                v_mtp,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+                state_v_first=self.kda_state_v_first,
+                return_intermediate_states=True,
+                output_state_dtype=recurrent_state.dtype,
+                impl=self.decode_impl,
             )
-            for step in range(self.mtp_size):
-                out_step, recurrent_state = recurrent_kimi_delta_attention(
-                    q_mtp[:, step : step + 1],
-                    k_mtp[:, step : step + 1],
-                    v_mtp[:, step : step + 1],
-                    g=g_mtp[:, step : step + 1],
-                    beta=beta_mtp[:, step : step + 1],
-                    initial_state=recurrent_state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                    state_v_first=self.kda_state_v_first,
-                    impl=self.decode_impl,
-                )
-                out_mtp[:, step] = out_step.squeeze(1)
-                last_state[:, step] = recurrent_state
             out = out_mtp.view(-1, self.n_local_heads, self.head_dim)
         else:
             out, last_state = chunk_kimi_delta_attention(
@@ -1338,10 +1328,6 @@ class TransformerGLM5Next(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
                 raise ValueError("GLM-5.3-Flash requires params.vision_config")
             self.image_token_id = int(self.vision_config.image_token_id)
             self.visual = Glm5NextVisionTransformer(self.vision_config)
-        # Both dicts are maintained by `QwenVLMmCacheCoreMixin._mm_cache_cleanup`;
-        # this model has no MRoPE, so `_rope_delta_by_req` stays empty.
-        self._mm_req_cache: dict[str, dict[str, Any]] = {}
-        self._rope_delta_by_req: dict[str, torch.Tensor] = {}
         self.mm_cache: Optional[MMPagedKVCache] = cache_dict.get("multimodal")
 
     @override

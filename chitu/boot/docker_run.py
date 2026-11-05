@@ -120,7 +120,19 @@ def docker_run(
             logger.info(f"Image {image_name} already exists in docker")
 
     hosts_tmp_file = None
-    docker_cmd = ["docker", "run", "--rm", "--network", "host", "--pid=host"]
+    # `docker run` is only a client, so a container outlives the process that started it when that
+    # client is killed. `docker-orphan-warden` fixes that by recording the owner in container labels
+    # (its `run` subcommand adds them and then execs docker, so pid/signals/exit codes pass
+    # through), and a watching reaper stops the containers whose owner is gone. Use it when it is
+    # installed; without it the argv stays exactly as before.
+    if shutil.which("docker-orphan-warden") is not None:
+        uses_orphan_warden = True
+        docker_cmd = ["docker-orphan-warden", "run"]
+        logger.info("Using docker-orphan-warden to guard the container lifetime")
+    else:
+        uses_orphan_warden = False
+        docker_cmd = ["docker", "run"]
+    docker_cmd += ["--rm", "--network", "host", "--pid=host"]
 
     # Select the platform and add the corresponding Docker arguments.
     platform = resolve_platform(
@@ -267,6 +279,10 @@ def docker_run(
 
     on_ready_thread = None
     on_ready_error = []
+    # The on_ready thread is defined before the service is spawned, so it cannot just close over
+    # the local `proc` below (it assigns its own `proc` while shutting down, which would shadow the
+    # outer one). A one-element list carries the process across that scope instead.
+    service_proc = []
     if on_ready_args is not None:
         http_host = host_on_this_node(cfg.serve.host)
         status_url = f"http://{http_host}:{cfg.serve.port}/server_status"
@@ -294,38 +310,98 @@ def docker_run(
             finally:
                 if cfg.boot.on_ready_shutdown:
                     logger.error("Terminating the main service")
-                    requests.post(
-                        f"http://{http_host}:{cfg.serve.port}/terminate_engine",
-                        json={"confirm": True},
-                    )
+                    proc = service_proc[0] if service_proc else None
+                    # A service that already exited (e.g. `on_ready_allow_crash`) has nothing left
+                    # to shut down, and asking over HTTP would only fail with a refusal.
+                    if proc is not None and proc.poll() is None:
+                        # Ask the engine to shut down. This is a real step, not a nicety: when the
+                        # request fails, the shutdown has failed, and the job should say so instead
+                        # of surfacing only the exit code of the client we end up killing.
+                        graceful = False
+                        try:
+                            response = requests.post(
+                                f"http://{http_host}:{cfg.serve.port}/terminate_engine",
+                                json={"confirm": True},
+                                timeout=10,
+                            )
+                            response.raise_for_status()
+                            graceful = True
+                        except Exception as e:
+                            logger.error(
+                                f"Failed to terminate the service over HTTP: {e}"
+                            )
+                            if not on_ready_error:
+                                on_ready_error.append(e)
+
+                        # A requested shutdown needs a bounded wait: if the service accepts the
+                        # request but never exits, waiting forever would hold the job until the CI
+                        # job timeout. Without a request there is nothing to wait for at all.
+                        if graceful:
+                            try:
+                                proc.wait(timeout=60)
+                            except subprocess.TimeoutExpired:
+                                if not on_ready_error:
+                                    on_ready_error.append(
+                                        RuntimeError(
+                                            "the service did not stop within 60 seconds after "
+                                            "terminate_engine"
+                                        )
+                                    )
+                        if proc.poll() is None:
+                            # The container is not ours to stop any more: with
+                            # `docker-orphan-warden` in front of `docker run`, the container carries
+                            # this process's pid in a label, so once this process is gone the reaper
+                            # stops it. Killing the client only ends the wait above, so the job can
+                            # fail instead of hanging.
+                            if uses_orphan_warden:
+                                logger.error(
+                                    "The service did not stop; leaving the container to "
+                                    "docker-orphan-warden"
+                                )
+                            else:
+                                logger.error(
+                                    "The service did not stop and docker-orphan-warden is not "
+                                    "installed, so the container may keep holding its GPUs"
+                                )
+                            proc.kill()
+                            try:
+                                proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                pass
 
         on_ready_thread = threading.Thread(target=wait_and_run_on_ready, daemon=True)
-        on_ready_thread.start()
 
     logger.info(f"Running: {service_docker_cmd}")
     proc = subprocess.Popen(service_docker_cmd)
     if _proc_registry is not None:
         _proc_registry.append(proc)
+    if on_ready_thread is not None:
+        service_proc.append(proc)
+        on_ready_thread.start()
     allow_crash = cfg.boot.on_ready is not None and getattr(
         cfg.boot, "on_ready_allow_crash", False
     )
     ret = proc.wait()
-    try:
-        if ret != 0 and not allow_crash:
-            raise subprocess.CalledProcessError(ret, service_docker_cmd)
-    finally:
-        if hosts_tmp_file is not None:
-            try:
-                os.unlink(hosts_tmp_file)
-            except OSError as e:
-                logger.warning(
-                    f"Failed to remove temporary hosts file {hosts_tmp_file}: {e}"
-                )
+    if hosts_tmp_file is not None:
+        try:
+            os.unlink(hosts_tmp_file)
+        except OSError as e:
+            logger.warning(
+                f"Failed to remove temporary hosts file {hosts_tmp_file}: {e}"
+            )
 
+    if on_ready_error:
+        # on_ready is the verdict of this run: report its error (e.g. the launch timeout) rather
+        # than the exit code that stopping the container produced.
+        if on_ready_thread is not None:
+            on_ready_thread.join()
+        raise on_ready_error[0]
+    if ret != 0 and not allow_crash:
+        # The service exited on its own; fail fast instead of joining on_ready, which would only
+        # keep polling a server that is already gone.
+        raise subprocess.CalledProcessError(ret, service_docker_cmd)
     if on_ready_thread is not None:
         on_ready_thread.join()
-    if on_ready_error:
-        raise on_ready_error[0]
     if ret != 0:
         # Crash allowed: raise to fail-fast siblings; the on_ready marker is the verdict.
         raise subprocess.CalledProcessError(ret, service_docker_cmd)

@@ -42,8 +42,8 @@ def _global_args():
 
 from chitu.task import UserRequest
 from chitu.kv_cache.prefix_caching import (
-    BlockIdentity,
-    BlockIdentityChainBuilder,
+    NONE_BLK_HASH,
+    hash_fn_cached,
 )
 from chitu.metrics import start_prometheus_server_and_metrics_monitor
 from chitu.metrics.prometheus_collector import (
@@ -105,8 +105,6 @@ from chitu.schemas.serve_config import RouterConfig as ServeRouterConfig
 NUM_ESTIMATED_TOKENS_PER_REQ = 100
 PENDING_TOKENS_WEIGHT = 1 / NUM_ESTIMATED_TOKENS_PER_REQ  # 0.01
 
-# Router-side prefix scoring shares BlockIdentityChainBuilder with this logical name.
-ROUTER_BLOCK_IDENTITY_MANAGER_NAME = "router"
 TERMINATE_ENGINE_MESSAGE_TYPE = "terminate_engine"
 FLUSH_CACHE_MESSAGE_TYPE = "flush_cache"
 ABORT_REQUEST_MESSAGE_TYPE = "abort_request"
@@ -465,22 +463,22 @@ class PrefixCacheAwarePolicy(LoadBalancer):
 
         # Router-side per-instance shadow cache (LRU by block hash).
         # The element lifecycle of the LRU :
-        #  - insert BlockIdentities of the request at SELECT time (remember_request),
+        #  - insert block hashes of the request at SELECT time (remember_request),
         #    so same-burst requests see prior placements; refreshed at first token.
-        #  - evict the earlist BlockIdenty when out lru capacity.
-        self.cached_blocks: dict[int, OrderedDict[str, BlockIdentity]] = {}
+        #  - evict the oldest hash when over LRU capacity.
+        self.cached_blocks: dict[int, OrderedDict[str, None]] = {}
 
         # Per-instance cache metadata from stats channel.
         self.instances_num_total_blocks: dict[int, int] = {}
         self.instances_block_size: dict[int, int] = {}
 
-        # Remember routed requests until first token; blocks are built lazily in
+        # Remember routed requests until first token; hashes are built lazily in
         # ``insert_req_blocks`` so shadow-cache insert sees ``block_size`` from stats
         # even when routing happened before the first prefill stats heartbeat.
         self.req_to_request: dict[str, UserRequest] = {}
         self.req_to_scheduler: dict[str, int] = {}
 
-        # Router evicted block buffer temporarily holds cache blocks evicted from the router's cached_blocks.
+        # Remember hashes evicted from the shadow LRU until instance eviction reports arrive.
         self.evict_buffer: dict[int, OrderedDict[str, float]] = {}
         self.evict_buffer_size = max(
             1, int(getattr(config, "router_evict_buffer_size", 64))
@@ -503,13 +501,13 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             self.instances_block_size[stats.local_instance_id] = stats.block_size
         self.apply_instance_evicts(stats.local_instance_id, stats.evicted_blk_hashes)
 
-    def build_req_token_blocks(
+    def build_req_block_hashes(
         self,
         request: UserRequest,
         local_instance_id: int,
         *,
         include_generated_tokens: bool = False,
-    ) -> list[BlockIdentity]:
+    ) -> list[Optional[str]]:
         block_size = self.instances_block_size.get(local_instance_id)
         if not block_size or block_size <= 0:
             return []
@@ -519,22 +517,28 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         if not prompt_tokens:
             return []
 
-        return BlockIdentityChainBuilder.acquire(
-            ROUTER_BLOCK_IDENTITY_MANAGER_NAME, block_size
-        ).make_identity_chain_from_tokens(prompt_tokens)
+        block_hashes: list[Optional[str]] = []
+        pre_blk_hash = NONE_BLK_HASH
+        for start in range(0, len(prompt_tokens), block_size):
+            tokens = tuple(prompt_tokens[start : start + block_size])
+            if len(tokens) < block_size:
+                block_hashes.append(None)
+                break
+            pre_blk_hash = hash_fn_cached((pre_blk_hash, tokens))
+            block_hashes.append(pre_blk_hash)
+        return block_hashes
 
     def num_hit_blocks(
-        self, local_instance_id: int, req_blocks: list[BlockIdentity]
+        self, local_instance_id: int, req_block_hashes: list[Optional[str]]
     ) -> int:
         # Count contiguous prefix hits from the beginning of block chain.
-        if not req_blocks:
+        if not req_block_hashes:
             return 0
         lru = self.cached_blocks.get(local_instance_id)
         num_hits = 0
         if not lru:
             return num_hits
-        for block in req_blocks:
-            blk_hash = block.blk_hash
+        for blk_hash in req_block_hashes:
             if not blk_hash:
                 break
             if blk_hash not in lru:
@@ -549,11 +553,11 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         block_size = self.instances_block_size.get(local_instance_id)
         if not block_size:
             return len(prompt_tokens)
-        req_blocks = self.build_req_token_blocks(request, local_instance_id)
+        req_block_hashes = self.build_req_block_hashes(request, local_instance_id)
         return max(
             0,
             len(prompt_tokens)
-            - self.num_hit_blocks(local_instance_id, req_blocks) * block_size,
+            - self.num_hit_blocks(local_instance_id, req_block_hashes) * block_size,
         )
 
     def select_scheduler(
@@ -605,12 +609,18 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         best_scheduler = eligible_ids[0]
         best_num_hits = -1
         best_total = 0
+        hashes_by_block_size: dict[Optional[int], list[Optional[str]]] = {}
         for sid in eligible_ids:
-            req_blocks = self.build_req_token_blocks(request, sid)
-            num_hits = self.num_hit_blocks(sid, req_blocks)
+            block_size = self.instances_block_size.get(sid)
+            if block_size not in hashes_by_block_size:
+                hashes_by_block_size[block_size] = self.build_req_block_hashes(
+                    request, sid
+                )
+            req_block_hashes = hashes_by_block_size[block_size]
+            num_hits = self.num_hit_blocks(sid, req_block_hashes)
             if num_hits > best_num_hits:
                 best_num_hits = num_hits
-                best_total = len(req_blocks)
+                best_total = len(req_block_hashes)
                 best_scheduler = sid
 
         match_rate = (best_num_hits / best_total) if best_total > 0 else 0.0
@@ -650,7 +660,7 @@ class PrefixCacheAwarePolicy(LoadBalancer):
     def insert_req_blocks(
         self, request_id: str, *, include_generated_tokens: bool = False
     ) -> None:
-        """Refresh one request's cacheable prefix blocks in the shadow LRU."""
+        """Refresh one request's cacheable prefix hashes in the shadow LRU."""
         local_instance_id = self.req_to_scheduler.get(request_id)
         request = self.req_to_request.get(request_id)
         if local_instance_id is None or request is None:
@@ -658,7 +668,7 @@ class PrefixCacheAwarePolicy(LoadBalancer):
                 f"[REQUEST_ROUTER] skip insert_req_blocks for unknown request_id={request_id}"
             )
             return
-        req_blocks = self.build_req_token_blocks(
+        req_block_hashes = self.build_req_block_hashes(
             request,
             local_instance_id,
             include_generated_tokens=include_generated_tokens,
@@ -667,15 +677,14 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         cap = self.instances_num_total_blocks.get(local_instance_id, 0)
         if cap <= 0:
             return
-        for block in req_blocks:
-            blk_hash = block.blk_hash
+        for blk_hash in req_block_hashes:
             if not blk_hash:
                 # Prefix-cache hit chain must be contiguous;
                 break
             if blk_hash in lru:
                 lru.move_to_end(blk_hash, last=True)
             else:
-                lru[blk_hash] = block
+                lru[blk_hash] = None
             while len(lru) > cap:
                 # Router local LRU eviction (shadow cache only).
                 evicted_hash, _ = lru.popitem(last=False)

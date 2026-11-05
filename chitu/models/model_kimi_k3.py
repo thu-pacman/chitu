@@ -29,15 +29,19 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing_extensions import override
 
-from chitu.attn_backend import AttnBackend
+from chitu.attn_backend import AttnBackend, FlashAttnBackend, RefAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.cp_utils import get_cp_context
+from chitu.device_type import has_accelerator
 from chitu.global_vars import get_global_args
 from chitu.kv_cache import KVCacheBase
 from chitu.lazy import eval_lazy
+from chitu.models.mm_cache_mixin_qwen_vl import QwenVLMmCacheCoreMixin
 from chitu.models.model import (
     RMSNorm,
     TransformerBlock,
@@ -53,6 +57,12 @@ from chitu.models.model_glm5_next import (
     Glm5NextForgetGate,
     Glm5NextRMSNormGated,
 )
+from chitu.models.model_kimi_k25 import (
+    _apply_rope_2d,
+    _get_1d_sincos_pos_embed,
+    _tpool_patch_merger,
+    Rope2DPosEmbRepeated,
+)
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import (
     attn_res_mix,
@@ -66,6 +76,367 @@ from chitu.ops import (
 from chitu.quantization import QuantizationRegistry
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear, RowParallelLinear
 from chitu.distributed.parallel_state import get_tp_size
+from chitu.utils import try_import_opt_dep
+
+_flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
+
+
+# ---------------------------------------------------------------------------
+# Multimodal part
+# ---------------------------------------------------------------------------
+
+
+class KimiK3VisionPosEmb(nn.Module):
+    """Learnable 2D positional embedding with interpolation + time embedding.
+
+    Port of ``Learnable2DInterpPosEmbDivided_fixed`` (pos_emb_type
+    "divided_fixed"): the ``[height, width, dim]`` table is interpolated to the
+    actual patch grid; frames beyond the first add a fixed sinusoidal time
+    embedding. The time table is a non-persistent buffer (not in checkpoints).
+    """
+
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        dim: int,
+        interpolation_mode: str,
+    ):
+        super().__init__()
+        self.height = height
+        self.width = width
+        self.dim = dim
+        self.interpolation_mode = interpolation_mode
+        self.weight = nn.Parameter(torch.empty(height, width, dim))
+        self.register_buffer(
+            "time_weight",
+            torch.from_numpy(_get_1d_sincos_pos_embed(dim, num_frames))
+            .float()
+            .unsqueeze(1),
+            persistent=False,
+        )
+
+    def _interpolate(self, h: int, w: int) -> torch.Tensor:
+        return (
+            F.interpolate(
+                self.weight.permute(2, 0, 1).unsqueeze(0),
+                size=(h, w),
+                mode=self.interpolation_mode,
+            )
+            .squeeze(0)
+            .permute(1, 2, 0)
+            .flatten(end_dim=1)
+        )
+
+    def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
+        pos_embs = []
+        for t, h, w in grid_thws.tolist():
+            if t > self.time_weight.shape[0]:
+                raise ValueError(
+                    f"temporal size {t} exceeds the positional embedding's "
+                    f"num_frames {self.time_weight.shape[0]}"
+                )
+            if (h, w) == (self.height, self.width):
+                pos_emb_2d = self.weight.flatten(end_dim=1)
+            else:
+                pos_emb_2d = self._interpolate(h, w)
+            if t == 1:
+                pos_emb_3d = pos_emb_2d
+            else:
+                pos_emb_3d = (
+                    pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[0:t]
+                )
+            pos_embs.append(pos_emb_3d.reshape(-1, self.dim))
+        return x + torch.cat(pos_embs)
+
+
+class KimiK3VisionPatchEmbed(nn.Module):
+    """Conv2d patch projection + the interpolated 2D positional embedding."""
+
+    def __init__(self, config):
+        super().__init__()
+        patch_size = int(config.patch_size)
+        self.proj = nn.Conv2d(
+            3,
+            int(config.hidden_size),
+            kernel_size=(patch_size, patch_size),
+            stride=(patch_size, patch_size),
+            bias=bool(config.patch_embed_proj_bias),
+        )
+        if str(config.pos_emb_type) != "divided_fixed":
+            raise NotImplementedError(
+                f"Unsupported Kimi-K3 pos_emb_type: {config.pos_emb_type}"
+            )
+        self.pos_emb = KimiK3VisionPosEmb(
+            height=int(config.init_pos_emb_height),
+            width=int(config.init_pos_emb_width),
+            num_frames=int(config.init_pos_emb_time),
+            dim=int(config.hidden_size),
+            interpolation_mode=str(config.pos_emb_interpolation_mode),
+        )
+
+    def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
+        # x: (num_patches, C, patch_h, patch_w), already patchified by the processor.
+        x = self.proj(x).view(x.size(0), -1)
+        return self.pos_emb(x, grid_thws)
+
+
+class KimiK3VisionMLP(nn.Module):
+    """MLP2: fc0 → activation → fc1 (gelu_pytorch_tanh in the official config)."""
+
+    def __init__(self, config):
+        super().__init__()
+        if str(config.mlp_type) != "mlp2":
+            raise NotImplementedError(
+                f"Unsupported Kimi-K3 mlp_type: {config.mlp_type}"
+            )
+        activation_func = str(config.activation_func)
+        if activation_func == "gelu_pytorch_tanh":
+            self.activation = lambda x: F.gelu(x, approximate="tanh")
+        else:
+            raise NotImplementedError(
+                f"Unsupported Kimi-K3 vision activation_func: {activation_func}"
+            )
+        self.fc0 = LocalLinear(
+            int(config.hidden_size),
+            int(config.intermediate_size),
+            has_bias=bool(config.linear_bias),
+            checkpoint_prefix="fc0",
+        )
+        self.fc1 = LocalLinear(
+            int(config.intermediate_size),
+            int(config.hidden_size),
+            has_bias=bool(config.linear_bias),
+            checkpoint_prefix="fc1",
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc1(self.activation(self.fc0(x)))
+
+
+class KimiK3VisionEncoderLayer(nn.Module):
+    """One MoonViT-V2 encoder block.
+
+    ``wqkv``/``wo`` live directly on the layer (matching the checkpoint keys
+    ``blocks.N.wqkv.weight`` / ``blocks.N.wo.weight``). ``qkv_hidden_size`` may
+    differ from ``hidden_size`` (K3: 1536 vs 1024), so the head dim is
+    ``qkv_hidden_size // num_heads`` — NOT hidden/heads.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        hidden_dim = int(config.hidden_size)
+        norm_type = str(config.norm_type)
+        if norm_type == "rmsnorm":
+            # torch's nn.RMSNorm with the default eps matches the reference
+            # (both the checkpoint's modeling file and vLLM use it verbatim).
+            self.norm0 = nn.RMSNorm(hidden_dim)
+            self.norm1 = nn.RMSNorm(hidden_dim)
+        else:
+            raise NotImplementedError(f"Unsupported Kimi-K3 norm_type: {norm_type}")
+
+        self.num_heads = int(config.num_attention_heads)
+        self.qkv_hidden_size = int(config.qkv_hidden_size)
+        self.head_dim = self.qkv_hidden_size // self.num_heads
+        self.scaling = self.head_dim**-0.5
+        self.use_flash_attn = has_flash_attn
+        self.attn_backend = (
+            FlashAttnBackend() if self.use_flash_attn else RefAttnBackend()
+        )
+        self.wqkv = LocalLinear(
+            hidden_dim,
+            self.qkv_hidden_size * 3,
+            has_bias=bool(config.attn_bias),
+            checkpoint_prefix="wqkv",
+        )
+        self.wo = LocalLinear(
+            self.qkv_hidden_size,
+            hidden_dim,
+            has_bias=bool(config.attn_bias),
+            checkpoint_prefix="wo",
+        )
+        self.mlp = KimiK3VisionMLP(config)
+
+    def _attention(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rope_freqs_cis: torch.Tensor,
+    ) -> torch.Tensor:
+        """Packed non-causal attention over per-image patch sequences."""
+        seq_length = hidden_states.shape[0]
+        q, k, v = (
+            self.wqkv(hidden_states)
+            .view(seq_length, 3, self.num_heads, self.head_dim)
+            .permute(1, 0, 2, 3)
+            .unbind(0)
+        )
+        q, k = _apply_rope_2d(q, k, rope_freqs_cis)
+
+        if self.use_flash_attn:
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            seq_len_delta = BatchedSeqLenDelta(
+                [0] * len(lengths),
+                lengths,
+                device=hidden_states.device,
+                use_prefix_lens_static_tensor=True,
+                use_position_ids_static_tensor=False,
+                use_delta_position_ids_static_tensor=False,
+                use_delta_seq_ids_static_tensor=False,
+            )
+            attn_output = self.attn_backend.prefill_ragged_qkvo(
+                q,
+                k,
+                v,
+                seq_len_delta,
+                causal=False,
+                softmax_scale=self.scaling,
+            )
+        else:
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            splits = [torch.split(t, lengths.tolist(), dim=0) for t in (q, k, v)]
+            attn_outputs = [
+                self.attn_backend.prefill_ragged_qkvo(
+                    qi,
+                    ki,
+                    vi,
+                    BatchedSeqLenDelta(
+                        [0],
+                        [qi.size(0)],
+                        device=hidden_states.device,
+                        use_prefix_lens_static_tensor=True,
+                        use_position_ids_static_tensor=False,
+                        use_delta_position_ids_static_tensor=False,
+                        use_delta_seq_ids_static_tensor=False,
+                    ),
+                    causal=False,
+                    softmax_scale=self.scaling,
+                )
+                for qi, ki, vi in zip(*splits)
+            ]
+            attn_output = torch.cat(attn_outputs, dim=0)
+
+        attn_output = attn_output.view(seq_length, -1).contiguous()
+        return self.wo(attn_output)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rope_freqs_cis: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self._attention(
+            self.norm0(hidden_states), cu_seqlens, rope_freqs_cis
+        )
+        hidden_states = hidden_states + self.mlp(self.norm1(hidden_states))
+        return hidden_states
+
+
+class KimiK3VisionEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden_dim = int(config.hidden_size)
+        self.rope_2d = Rope2DPosEmbRepeated(
+            int(config.qkv_hidden_size) // int(config.num_attention_heads),
+            512,
+            512,
+        )
+        self.blocks = nn.ModuleList(
+            [
+                KimiK3VisionEncoderLayer(config)
+                for _ in range(int(config.num_hidden_layers))
+            ]
+        )
+        norm_type = str(config.norm_type)
+        if norm_type == "rmsnorm":
+            self.final_layernorm = nn.RMSNorm(hidden_dim)
+        else:
+            raise NotImplementedError(f"Unsupported Kimi-K3 norm_type: {norm_type}")
+
+    def forward(
+        self, hidden_states: torch.Tensor, grid_thws: torch.Tensor
+    ) -> torch.Tensor:
+        rope_freqs_cis = self.rope_2d.get_freqs_cis(
+            grid_thws, device=hidden_states.device
+        )
+        # One attention sequence per image: all t*h*w patches attend to each other.
+        lengths = torch.cat(
+            [
+                torch.zeros(1, dtype=grid_thws.dtype, device=grid_thws.device),
+                grid_thws.prod(dim=-1),
+            ]
+        )
+        cu_seqlens = lengths.cumsum(dim=0).to(
+            dtype=torch.int32, device=hidden_states.device
+        )
+        for block in self.blocks:
+            hidden_states = block(hidden_states, cu_seqlens, rope_freqs_cis)
+        return self.final_layernorm(hidden_states)
+
+
+class KimiK3VisionTower(nn.Module):
+    """MoonViT-V2: patch embed → encoder → temporal-pool + spatial-merge."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.patch_embed = KimiK3VisionPatchEmbed(config)
+        self.encoder = KimiK3VisionEncoder(config)
+        self.merge_kernel_size = tuple(int(k) for k in config.merge_kernel_size)
+        self.merge_type = str(config.merge_type)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.patch_embed.proj.weight.dtype
+
+    def forward(
+        self, pixel_values: torch.Tensor, grid_thws: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Returns one ``[n_tokens, kh*kw, hidden]`` tensor per image."""
+        if self.merge_type != "sd2_tpool":
+            raise NotImplementedError(
+                f"Unsupported Kimi-K3 merge_type: {self.merge_type}"
+            )
+        hidden_states = self.patch_embed(pixel_values, grid_thws)
+        hidden_states = self.encoder(hidden_states, grid_thws)
+        return _tpool_patch_merger(hidden_states, grid_thws, self.merge_kernel_size)
+
+
+class KimiK3PatchMergerProjector(nn.Module):
+    """PatchMergerMLPV2: flatten the merged patches, MLP, RMSNorm.
+
+    ``proj`` is an ``nn.Sequential`` so the checkpoint keys
+    ``mm_projector.proj.{0,2}.weight`` load directly.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        if str(config.mm_projector_type) != "patchmergerv2":
+            raise NotImplementedError(
+                f"Unsupported Kimi-K3 mm_projector_type: {config.mm_projector_type}"
+            )
+        merge_h, merge_w = (int(k) for k in config.merge_kernel_size)
+        self.hidden_size = int(config.mm_hidden_size) * merge_h * merge_w
+        self.proj = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size, bias=False),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, int(config.text_hidden_size), bias=False),
+        )
+        self.post_norm = nn.RMSNorm(
+            int(config.text_hidden_size), eps=float(config.projector_ln_eps)
+        )
+
+    def forward(self, image_features: list[torch.Tensor]) -> list[torch.Tensor]:
+        """[n_tokens, kh*kw, mm_hidden] per image → [n_tokens, text_hidden] per image."""
+        lengths = [t.shape[0] for t in image_features]
+        x = torch.cat([t.view(t.shape[0], -1) for t in image_features], dim=0)
+        x = self.post_norm(self.proj(x))
+        return list(torch.split(x, lengths, dim=0))
+
+
+# ---------------------------------------------------------------------------
+# Main model (text) part
+# ---------------------------------------------------------------------------
 
 
 class AttentionKimiK3(AttentionDeepSeekV3):
@@ -324,6 +695,7 @@ class KimiK3LinearAttention(nn.Module):
                 state_checkpoints=conv_state_checkpoints,
                 checkpoint_cu_starts=ckpt_cu_starts,
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                seq_len_list=seq_len_delta.delta_lens_list,
             )
         q, k, v = torch.split(qkv, [self.local_qkv_dim] * 3, dim=-1)
         q, k, v = map(
@@ -626,11 +998,14 @@ class TransformerBlockKimiK3(TransformerBlock):
 
 
 @register_model(ModelType.KIMI_K3)
-class TransformerKimiK3(TransformerDeepSeekV3):
-    """Kimi-K3 text backbone with TP/DP/EP/PP (no CP/MTP).
+class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
+    """Kimi-K3 text backbone with TP/DP/EP/PP (no CP/MTP), plus the optional
+    MoonViT-V2 vision tower + PatchMergerMLPV2 projector for multimodal runs.
 
     PP carries the running stream and only the AttnRes blocks produced before
-    the next stage.
+    the next stage. The vision modules live on PP stage 0 (same stage as
+    embed_tokens); the multimodal cache stages per-request image features so
+    chunked prefill can consume them across chunk boundaries.
     """
 
     _CKPT_TEXT_PREFIX = "language_model."
@@ -646,6 +1021,13 @@ class TransformerKimiK3(TransformerDeepSeekV3):
         mla_absorb: str,
         **kwargs,
     ):
+        self.vision_config = getattr(params, "vision_config", None)
+        # Text-only runs (infer.language_model_only=True) never build the vision
+        # modules, the multimodal cache or the processor.
+        self.enable_vision = (
+            self.vision_config is not None
+            and not get_global_args().infer.language_model_only
+        )
         if get_cp_context().pcp_size > 1:
             raise NotImplementedError("Kimi-K3 v1 does not support context parallelism")
         if int(get_global_args().infer.mtp_size) > 1:
@@ -668,6 +1050,23 @@ class TransformerKimiK3(TransformerDeepSeekV3):
             mla_absorb=mla_absorb,
             **kwargs,
         )
+
+        self.mm_cache = cache_dict.get("multimodal")
+        if self.enable_vision and self.pp_stage == 0:
+            if self.mm_cache is None:
+                raise ValueError(
+                    "Kimi-K3 multimodal requires the 'multimodal' cache "
+                    "(missing from cache_dict)"
+                )
+            self.vision_tower = KimiK3VisionTower(self.vision_config)
+            self.mm_projector = KimiK3PatchMergerProjector(self.vision_config)
+            self.vision_tower.eval()
+            self.vision_tower.requires_grad_(False)
+            self.media_placeholder_token_id = int(
+                self.vision_config.media_placeholder_token_id
+            )
+        else:
+            self.vision_tower = None
 
     @override
     def _init_layers(self, cache_dict: dict[str, KVCacheBase], attn_backend, op_impl):
@@ -861,12 +1260,170 @@ class TransformerKimiK3(TransformerDeepSeekV3):
         return self._post_layers(h).float()
 
     # ------------------------------------------------------------------
+    # Multimodal: vision features → mm cache → embedding scatter
+    # ------------------------------------------------------------------
+
+    def get_image_features(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Vision tower + projector → per-image ``[n_tokens, text_hidden]`` features."""
+        patch_size = int(self.vision_config.patch_size)
+        if pixel_values.ndim == 2:
+            # vision_tensor_broadcast flattens (N, C, ph, pw) to (N, C*ph*pw).
+            pixel_values = pixel_values.unflatten(1, (3, patch_size, patch_size))
+        pixel_values = pixel_values.to(dtype=self.vision_tower.dtype)
+        merged = self.vision_tower(pixel_values, grid_thw)
+        return self.mm_projector(merged)
+
+    def _write_image_features_once(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        curr_tids: list[str],
+        seq_ids: torch.Tensor,
+        input_ids_flat: torch.Tensor,
+    ) -> None:
+        """Run the vision tower + projector and stage the features in the mm cache.
+
+        The write is gated per request: chunked prefill re-delivers the same
+        pixels on every chunk, but the features are staged exactly once.
+        """
+        # Requests that own image features in this batch: those already staged
+        # (later chunks) or with media pads in this chunk (first chunk).
+        req_indices: list[int] = []
+        for req_idx, rid in enumerate(curr_tids):
+            has_cache = self.mm_cache.get_consumption_progress(rid, "vision_embeds") > 0
+            has_pads = bool(
+                torch.any(
+                    (seq_ids == int(req_idx))
+                    & (input_ids_flat == self.media_placeholder_token_id)
+                ).item()
+            )
+            if has_cache or has_pads:
+                req_indices.append(req_idx)
+
+        write_key = self._mm_write_done_key("image")
+        if req_indices and all(
+            bool(self._mm_state_get(curr_tids[req_idx], {}).get(write_key, False))
+            for req_idx in req_indices
+        ):
+            # Every destination request is already staged — a later chunk.
+            return
+
+        feature_splits = self.get_image_features(pixel_values, grid_thw)
+
+        # Map per-image features to requests. Ambiguous packings are rejected
+        # rather than guessed (same rules as the Qwen3-VL path): single request
+        # with N images, N images mapped to the requests that need them, or a
+        # batch with exactly one image per request.
+        if len(curr_tids) == 1:
+            mapping = [0] * len(feature_splits)
+        elif len(feature_splits) == len(req_indices) and len(req_indices) > 0:
+            mapping = list(req_indices)
+        elif len(feature_splits) == len(curr_tids):
+            mapping = list(range(len(curr_tids)))
+        else:
+            raise ValueError(
+                f"Chunked multimodal prefill needs an unambiguous mapping from "
+                f"images to requests: batch_size={len(curr_tids)}, "
+                f"images={len(feature_splits)}, candidate_requests={len(req_indices)}. "
+                f"Supported: single request with N images, images mapped to the "
+                f"requests that need them in this chunk, or one image per request."
+            )
+
+        per_req_feats: dict[str, list[torch.Tensor]] = {}
+        for split_idx, req_idx in enumerate(mapping):
+            per_req_feats.setdefault(curr_tids[req_idx], []).append(
+                feature_splits[split_idx]
+            )
+
+        self._write_vision_to_mm_cache(
+            kind="image", per_req_feats=per_req_feats, per_req_ds={}
+        )
+
+    @override
+    @torch.inference_mode()
+    def _pre_layers(
+        self,
+        h,
+        *,
+        pixel_values: Optional[torch.Tensor] = None,
+        grid_thw: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        input_ids_flat = h.reshape(-1)
+        inputs_embeds = super()._pre_layers(input_ids_flat)
+        if self.vision_tower is None:
+            return inputs_embeds
+
+        # CUDA-graph decode capture: decode steps never carry pixels, and the
+        # mm-cache staging below uses dynamic-shape ops forbidden in capture.
+        try:
+            if has_accelerator() and torch.cuda.is_current_stream_capturing():
+                return inputs_embeds
+        except Exception:
+            pass
+
+        self._mm_cache_cleanup()
+
+        if pixel_values is None or grid_thw is None:
+            # Decode steps and text-only prefill chunks never carry pixels; any
+            # prefill chunk of an image-carrying task does (the pixels ride the
+            # task), so there is nothing to stage or consume here.
+            return inputs_embeds
+
+        curr_tids = getattr(self.cache_dict["main"], "curr_tids", None) or []
+        if len(curr_tids) == 0:
+            return inputs_embeds
+        seq_ids = self.cache_dict["main"].seq_len_delta.delta_seq_ids_tensor_device.to(
+            device=input_ids_flat.device
+        )
+        if seq_ids.numel() != input_ids_flat.numel():
+            raise ValueError(
+                f"seq_ids length mismatch: seq_ids={seq_ids.numel()} "
+                f"tokens={input_ids_flat.numel()}"
+            )
+
+        self._write_image_features_once(
+            pixel_values, grid_thw, curr_tids, seq_ids, input_ids_flat
+        )
+
+        # Consume the staged features for this chunk's media-pad positions
+        # (features are read back across chunk boundaries from the mm cache).
+        # Every prefill chunk of an image-carrying task re-delivers its
+        # pixels, so pads never appear in a chunk without them.
+        vis_pos, vis_cat, _ = self._read_vision_from_mm_cache(
+            kind="image",
+            token_id=self.media_placeholder_token_id,
+            req_ids=list(curr_tids),
+            seq_ids=seq_ids,
+            input_ids_flat=input_ids_flat,
+            tensor_keys=["vision_embeds"],
+        )
+        if vis_pos is not None and vis_pos.numel() > 0:
+            if vis_cat is None or vis_cat.shape[0] != vis_pos.numel():
+                n_feat = "None" if vis_cat is None else str(vis_cat.shape[0])
+                raise ValueError(
+                    f"Image features ({n_feat}) do not match the media-pad "
+                    f"positions in this chunk ({vis_pos.numel()}); check the "
+                    "media_pad expansion vs the vision token count"
+                )
+            inputs_embeds = inputs_embeds.clone()
+            inputs_embeds[vis_pos, :] = vis_cat.to(
+                device=inputs_embeds.device, dtype=inputs_embeds.dtype
+            )
+        return inputs_embeds
+
+    # ------------------------------------------------------------------
     # Checkpoint layout: prefix mappings
     # ------------------------------------------------------------------
 
     @override
     def _get_pre_layer_prefixes(self) -> list[str]:
-        return ["embed_tokens."]
+        prefixes = ["embed_tokens."]
+        if self.enable_vision and self.pp_stage == 0:
+            prefixes += ["vision_tower.", "mm_projector."]
+        return prefixes
 
     @override
     def _get_post_layer_prefixes(self) -> list[str]:
@@ -882,6 +1439,11 @@ class TransformerKimiK3(TransformerDeepSeekV3):
         prefix_mappings = []
         if self.pp_stage == 0:
             prefix_mappings.append((f"{p}model.embed_tokens.", "embed_tokens."))
+            if self.enable_vision:
+                # Vision weights are top-level in the checkpoint and our module
+                # names match the checkpoint keys, so the mapping is identity.
+                prefix_mappings.append(("vision_tower.", "vision_tower."))
+                prefix_mappings.append(("mm_projector.", "mm_projector."))
         if self.pp_stage == self.pp_end_stage:
             prefix_mappings.extend(
                 [

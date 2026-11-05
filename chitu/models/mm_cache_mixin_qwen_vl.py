@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import logging
 
 import torch
+from typing_extensions import override
 
 from chitu.kv_cache import MMPagedKVCache
 from chitu.ops import append_to_paged_kv_cache
@@ -30,6 +31,16 @@ class QwenVLMmCacheCoreMixin:
             )
         return mm_cache
 
+    def _prune_inactive_request_state(self, active_req_ids: set[str]) -> None:
+        """Drop per-request multimodal state of requests outside ``active_req_ids``.
+
+        Called by ``_mm_cache_cleanup`` with the request ids still active in the
+        main KV cache; state of requests that finished or were evicted must go.
+        The base implementation is a no-op — models that keep per-request
+        multimodal state override this (the Qwen family's MRoPE cursor and
+        rope deltas do so via ``get_qwen_vl_mm_cache_class``).
+        """
+
     def _mm_cache_cleanup(self) -> None:
         """Drop multimodal caches for requests that are no longer active in KV cache."""
         try:
@@ -44,24 +55,16 @@ class QwenVLMmCacheCoreMixin:
 
         mm_cache = self._require_mm_cache()
 
+        # Model-specific per-request state (e.g. the Qwen family's MRoPE
+        # cursor). An empty active set prunes every request's state.
+        self._prune_inactive_request_state(active)
+
+        # Imported lazily: chitu.task imports chitu.backend, which imports the
+        # model registry and would cycle back to this mixin at module level.
         from chitu.task import PackedTasksBase
 
-        if not active:
-            self._mm_req_cache.clear()
-            self._rope_delta_by_req.clear()
-
-            task_ids = list(getattr(mm_cache, "tid_to_multimodal_len", {}).keys())
-            tasks = PackedTasksBase(num_tasks=len(task_ids), task_ids=task_ids)
-            mm_cache.finalize_cache_all_decode(tasks)
-            return
-
-        for rid in list(self._mm_req_cache.keys()):
-            if rid not in active:
-                del self._mm_req_cache[rid]
-        for rid in list(self._rope_delta_by_req.keys()):
-            if rid not in active:
-                del self._rope_delta_by_req[rid]
-
+        # Release the staged image features of requests that left the KV
+        # cache; with no active request left, that is every staged request.
         mm_active = set(getattr(mm_cache, "tid_to_multimodal_len", {}).keys())
         task_ids = list(mm_active - active)
         tasks = PackedTasksBase(num_tasks=len(task_ids), task_ids=task_ids)
@@ -280,7 +283,24 @@ class QwenVLMmCacheCoreMixin:
 
 
 def get_qwen_vl_mm_cache_class(base_class: type):
+    """Compose the Qwen-VL multimodal behavior onto a transformer base class.
+
+    The result carries the shared multimodal-cache core (staging image
+    features and consuming them across prefill chunks) plus the Qwen-family
+    per-request MRoPE state eviction: models built with this factory keep
+    ``_mm_req_cache`` (the chunked-MRoPE cursor) and ``_rope_delta_by_req``
+    (the decode-time rope offset), created in their ``__init__``.
+    """
+
     class QwenVLMmCacheImpl(QwenVLMmCacheCoreMixin, base_class):
-        pass
+        _mm_req_cache: dict[str, dict[str, Any]]
+        _rope_delta_by_req: dict[str, torch.Tensor]
+
+        @override
+        def _prune_inactive_request_state(self, active_req_ids: set[str]) -> None:
+            for table in (self._mm_req_cache, self._rope_delta_by_req):
+                for rid in list(table):
+                    if rid not in active_req_ids:
+                        del table[rid]
 
     return QwenVLMmCacheImpl

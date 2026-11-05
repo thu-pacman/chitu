@@ -176,6 +176,10 @@ def apptainer_run(
 
     on_ready_thread = None
     on_ready_error = []
+    # The on_ready thread is defined before the service is spawned, so it cannot just close over
+    # the local `proc` below (it assigns its own `proc` while shutting down, which would shadow the
+    # outer one). A one-element list carries the process across that scope instead.
+    service_proc = []
     if on_ready_args is not None:
         http_host = host_on_this_node(cfg.serve.host)
         status_url = f"http://{http_host}:{cfg.serve.port}/server_status"
@@ -198,27 +202,82 @@ def apptainer_run(
             finally:
                 if cfg.boot.on_ready_shutdown:
                     logger.error("Terminating the main service")
-                    requests.post(
-                        f"http://{http_host}:{cfg.serve.port}/terminate_engine",
-                        json={"confirm": True},
-                    )
+                    proc = service_proc[0] if service_proc else None
+                    # A service that already exited (e.g. `on_ready_allow_crash`) has nothing left
+                    # to shut down, and asking over HTTP would only fail with a refusal.
+                    if proc is not None and proc.poll() is None:
+                        # Ask the engine to shut down. This is a real step, not a nicety: when the
+                        # request fails, the shutdown has failed, and the job should say so instead
+                        # of surfacing only the exit code of the client we end up killing.
+                        graceful = False
+                        try:
+                            response = requests.post(
+                                f"http://{http_host}:{cfg.serve.port}/terminate_engine",
+                                json={"confirm": True},
+                                timeout=10,
+                            )
+                            response.raise_for_status()
+                            graceful = True
+                        except Exception as e:
+                            logger.error(
+                                f"Failed to terminate the service over HTTP: {e}"
+                            )
+                            if not on_ready_error:
+                                on_ready_error.append(e)
+
+                        # A requested shutdown needs a bounded wait: if the service accepts the
+                        # request but never exits, waiting forever would hold the job until the CI
+                        # job timeout. Without a request there is nothing to wait for at all.
+                        if graceful:
+                            try:
+                                proc.wait(timeout=60)
+                            except subprocess.TimeoutExpired:
+                                if not on_ready_error:
+                                    on_ready_error.append(
+                                        RuntimeError(
+                                            "the service did not stop within 60 seconds after "
+                                            "terminate_engine"
+                                        )
+                                    )
+                        if proc.poll() is None:
+                            # apptainer has no daemon: the client is the parent of the workload, so
+                            # killing the client takes the workload with it (measured on the h20
+                            # nodes with SIGTERM and with SIGKILL).
+                            logger.error(
+                                "The service did not stop; killing the apptainer client, which "
+                                "also stops the workload"
+                            )
+                            proc.kill()
+                            try:
+                                proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                pass
 
         on_ready_thread = threading.Thread(target=wait_and_run_on_ready, daemon=True)
-        on_ready_thread.start()
 
     logger.info(f"Running: {service_apptainer_cmd}")
     proc = subprocess.Popen(service_apptainer_cmd)
     if _proc_registry is not None:
         _proc_registry.append(proc)
+    if on_ready_thread is not None:
+        service_proc.append(proc)
+        on_ready_thread.start()
     allow_crash = cfg.boot.on_ready is not None and getattr(
         cfg.boot, "on_ready_allow_crash", False
     )
     ret = proc.wait()
+    if on_ready_error:
+        # on_ready is the verdict of this run: report its error (e.g. the launch timeout) rather
+        # than the exit code that stopping the service produced.
+        if on_ready_thread is not None:
+            on_ready_thread.join()
+        raise on_ready_error[0]
     if ret != 0 and not allow_crash:
+        # The service exited on its own; fail fast instead of joining on_ready, which would only
+        # keep polling a server that is already gone.
         raise subprocess.CalledProcessError(ret, service_apptainer_cmd)
     if on_ready_thread is not None:
         on_ready_thread.join()
-    if on_ready_error:
-        raise on_ready_error[0]
     if ret != 0:
+        # Crash allowed: raise to fail-fast siblings; the on_ready marker is the verdict.
         raise subprocess.CalledProcessError(ret, service_apptainer_cmd)

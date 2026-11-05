@@ -11,6 +11,8 @@ from typing import Optional, List, Dict, Set, Literal, Union, Any
 from dataclasses import dataclass
 from logging import getLogger
 
+import torch
+
 from chitu.global_vars import is_classic_pd_disagg, is_independent_multi_inst
 from chitu.task import (
     Task,
@@ -25,6 +27,27 @@ from chitu.task import (
 from chitu.tool_call.type_def import ToolCallParams, ResponseFormatParams
 
 logger = getLogger(__name__)
+
+
+def _tensor_to_msg(tensor: "torch.Tensor") -> Dict[str, Any]:
+    """Serialize a CPU tensor into a msgpack-friendly dict (shape/dtype/bytes)."""
+    import numpy as np
+
+    arr = tensor.detach().cpu().numpy()
+    return {
+        "shape": list(arr.shape),
+        "dtype": str(arr.dtype),
+        "data": arr.tobytes(),
+    }
+
+
+def _tensor_from_msg(msg: Dict[str, Any]) -> "torch.Tensor":
+    import numpy as np
+
+    arr = np.frombuffer(msg["data"], dtype=np.dtype(msg["dtype"])).reshape(msg["shape"])
+    # frombuffer returns a read-only view over the message bytes; copy so the
+    # tensor owns its storage.
+    return torch.from_numpy(arr.copy())
 
 
 @dataclass
@@ -344,6 +367,12 @@ class MetadataSerializer:
                     if config.include_tokens:
                         task_data["tokens"] = list(task.prefix_tokens)
                         task_data["standard_tokens"] = task._test_standard_tokens
+                        # Multimodal inputs: new prefill tasks carry the pixel data
+                        if task.pixel_values is not None:
+                            task_data["pixel_values"] = _tensor_to_msg(
+                                task.pixel_values
+                            )
+                            task_data["grid_thw"] = _tensor_to_msg(task.grid_thw)
                     # Grammar constraint params (tool call or response_format):
                     # new tasks must carry them, and they must not be tied to
                     # include_tokens — configs like full-prefix-hit-to-Decode
@@ -566,6 +595,9 @@ class MetadataSerializer:
         task._test_flag = task_data.get("_test_flag")
         task._test_standard_tokens = task_data.get("standard_tokens")
         task.pd_prefill_engine_rank = task_data.get("pd_prefill_engine_rank")
+        if "pixel_values" in task_data:
+            task.pixel_values = _tensor_from_msg(task_data["pixel_values"])
+            task.grid_thw = _tensor_from_msg(task_data["grid_thw"])
         if task_type in (TaskType.Prefill, TaskType.Decode):
             task.task_type = task_type
         return task

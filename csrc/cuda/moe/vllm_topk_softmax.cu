@@ -40,6 +40,7 @@
 #include <cub/util_type.cuh>
 #include <torch/all.h>
 
+#include "dispatch_utils.h"
 #include "moe_kernel.h"
 
 #define WARP_SIZE 32
@@ -60,7 +61,6 @@
     __shfl_xor_sync(VLLM_SHFL_MASK, var, lane_mask, width)
 #endif
 
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 #if CUDA_VERSION >= 13000
@@ -225,7 +225,9 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
     void topkGatingSoftmax(const float *input, const bool *finished,
                            float *output, const int num_rows, IndType *indices,
                            int *source_rows, const int k,
-                           const int start_expert, const int end_expert) {
+                           const int start_expert, const int end_expert)
+    requires(NUM_EXPERTS >= VPT)
+{
     // We begin by enforcing compile time assertions and setting up compile time
     // constants.
     static_assert(VPT == (VPT & -VPT), "VPT must be power of 2");
@@ -455,47 +457,23 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
 namespace detail {
 // Constructs some constants needed to partition the work across threads at
 // compile time.
-template <int EXPERTS, int BYTES_PER_LDG> struct TopkConstants {
-    static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(float);
-    static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 ||
-                      EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0,
-                  "");
-    static constexpr int VECs_PER_THREAD =
-        MAX(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
-    static constexpr int VPT = VECs_PER_THREAD * ELTS_PER_LDG;
+template <int EXPERTS, int BYTES_PER_LDG,
+          int _ELTS_PER_LDG = BYTES_PER_LDG / sizeof(float),
+          int _VECs_PER_THREAD = (EXPERTS / (_ELTS_PER_LDG * WARP_SIZE) > 0)
+                                     ? (EXPERTS / (_ELTS_PER_LDG * WARP_SIZE))
+                                     : 1,
+          int _VPT = _VECs_PER_THREAD * _ELTS_PER_LDG>
+    requires((EXPERTS / (_ELTS_PER_LDG * WARP_SIZE) == 0 ||
+              EXPERTS % (_ELTS_PER_LDG * WARP_SIZE) == 0) &&
+             EXPERTS >= _VPT)
+struct TopkConstants {
+    static constexpr int ELTS_PER_LDG = _ELTS_PER_LDG;
+    static constexpr int VECs_PER_THREAD = _VECs_PER_THREAD;
+    static constexpr int VPT = _VPT;
     static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
     static constexpr int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
 };
 } // namespace detail
-
-template <int EXPERTS, int WARPS_PER_TB, typename IndType>
-void topkGatingSoftmaxLauncherHelper(const float *input, const bool *finished,
-                                     float *output, IndType *indices,
-                                     int *source_row, const int num_rows,
-                                     const int k, const int start_expert,
-                                     const int end_expert,
-                                     cudaStream_t stream) {
-    static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
-
-    static constexpr int BYTES_PER_LDG =
-        MIN(MAX_BYTES_PER_LDG, sizeof(float) * EXPERTS);
-    using Constants = detail::TopkConstants<EXPERTS, BYTES_PER_LDG>;
-    static constexpr int VPT = Constants::VPT;
-    static constexpr int ROWS_PER_WARP = Constants::ROWS_PER_WARP;
-    const int num_warps = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
-    const int num_blocks = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
-
-    dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
-    topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG>
-        <<<num_blocks, block_dim, 0, stream>>>(input, finished, output,
-                                               num_rows, indices, source_row, k,
-                                               start_expert, end_expert);
-}
-
-#define LAUNCH_SOFTMAX(NUM_EXPERTS, WARPS_PER_TB)                              \
-    topkGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB>(                \
-        gating_output, nullptr, topk_weights, topk_indicies,                   \
-        token_expert_indices, num_tokens, topk, 0, num_experts, stream);
 
 template <typename IndType>
 void topkGatingSoftmaxKernelLauncher(
@@ -503,47 +481,45 @@ void topkGatingSoftmaxKernelLauncher(
     int *token_expert_indices, float *softmax_workspace, const int num_tokens,
     const int num_experts, const int topk, cudaStream_t stream) {
     static constexpr int WARPS_PER_TB = 4;
-    switch (num_experts) {
-    case 1:
-        LAUNCH_SOFTMAX(1, WARPS_PER_TB);
-        break;
-    case 2:
-        LAUNCH_SOFTMAX(2, WARPS_PER_TB);
-        break;
-    case 4:
-        LAUNCH_SOFTMAX(4, WARPS_PER_TB);
-        break;
-    case 8:
-        LAUNCH_SOFTMAX(8, WARPS_PER_TB);
-        break;
-    case 16:
-        LAUNCH_SOFTMAX(16, WARPS_PER_TB);
-        break;
-    case 32:
-        LAUNCH_SOFTMAX(32, WARPS_PER_TB);
-        break;
-    case 64:
-        LAUNCH_SOFTMAX(64, WARPS_PER_TB);
-        break;
-    case 128:
-        LAUNCH_SOFTMAX(128, WARPS_PER_TB);
-        break;
-    case 256:
-        LAUNCH_SOFTMAX(256, WARPS_PER_TB);
-        break;
-    default: {
-        TORCH_CHECK(
-            softmax_workspace != nullptr,
-            "softmax_workspace must be provided for num_experts that are "
-            "not a power of 2.");
-        static constexpr int TPB = 256;
-        moeSoftmax<TPB><<<num_tokens, TPB, 0, stream>>>(
-            gating_output, nullptr, softmax_workspace, num_experts);
-        moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
-            softmax_workspace, nullptr, topk_weights, topk_indicies,
-            token_expert_indices, num_experts, topk, 0, num_experts);
+
+    const bool is_pow_2 =
+        (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
+    if (is_pow_2 && num_experts <= 256) {
+        dispatchToStaticInts<1, 2, 4, 8, 16, 32, 64, 128, 256>(
+            num_experts, [&]<int EXPERTS>() {
+                // Cap the vector-load width at the row width in bytes, so a
+                // single load never spans more than one row.
+                constexpr int BYTES_PER_LDG =
+                    MIN(16, int(sizeof(float) * EXPERTS));
+                using Constants = detail::TopkConstants<EXPERTS, BYTES_PER_LDG>;
+                constexpr int VPT = Constants::VPT;
+                constexpr int ROWS_PER_WARP = Constants::ROWS_PER_WARP;
+                const int num_warps =
+                    (num_tokens + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+                const int num_blocks =
+                    (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
+
+                dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
+                topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG>
+                    <<<num_blocks, block_dim, 0, stream>>>(
+                        gating_output, nullptr, topk_weights, num_tokens,
+                        topk_indicies, token_expert_indices, topk, 0,
+                        num_experts);
+            });
+        return;
     }
-    }
+
+    // Non-power-of-two (or too large) expert counts go through a generic
+    // two-kernel path that needs a softmax workspace.
+    TORCH_CHECK(softmax_workspace != nullptr,
+                "softmax_workspace must be provided for num_experts that are "
+                "not a power of 2.");
+    static constexpr int TPB = 256;
+    moeSoftmax<TPB><<<num_tokens, TPB, 0, stream>>>(
+        gating_output, nullptr, softmax_workspace, num_experts);
+    moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
+        softmax_workspace, nullptr, topk_weights, topk_indicies,
+        token_expert_indices, num_experts, topk, 0, num_experts);
 }
 
 void topk_softmax(torch::Tensor &topk_weights,         // [num_tokens, topk]

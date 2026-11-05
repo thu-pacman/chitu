@@ -506,11 +506,13 @@ def _build_multimodal_cache(
         ModelType.HF_QWEN3_VL_MOE,
         ModelType.HF_QWEN3_5,
         ModelType.GLM_5_NEXT,
+        ModelType.KIMI_K3,
     }:
         return None
 
     if (
-        args.models.type in [ModelType.HF_QWEN3_5, ModelType.GLM_5_NEXT]
+        args.models.type
+        in [ModelType.HF_QWEN3_5, ModelType.GLM_5_NEXT, ModelType.KIMI_K3]
         and args.infer.language_model_only
     ):
         return None
@@ -793,6 +795,9 @@ def _build_kimi_k3_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
             main_block_size=_main_cache_block_size(main_cache),
         ),
     }
+    mm_cache = _build_multimodal_cache(args, main_cache)
+    if mm_cache is not None:
+        cache_dict[MULTIMODAL_CACHE_NAME] = mm_cache
     return CacheBuildBundle(
         cache_type=args.infer.cache_type,
         cache_dict=cache_dict,

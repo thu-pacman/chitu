@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - _self_
+
+name: Kimi-K3
+type: kimi-k3
+source: "https://huggingface.co/moonshotai/Kimi-K3" # Just for displaying. No automatic download.
+tokenizer_type: "hf" # Internally actually TikTokenTokenizer via trust_remote_code
+processor_path: null
+
+# Only the routed experts are MXFP4-quantized (compressed-tensors). Everything
+# else (attention, shared experts, dense MLP, latent projections, lm_head) is bf16.
+quant_config:
+  quant:
+    - model: "."
+      rules:
+        - regex: "\\.mlp\\.experts\\."
+          type: mxfp4
+
+vocab_size: "$(config.json:text_config.vocab_size)"
+dim: "$(config.json:text_config.hidden_size)"
+inter_dim: "$(config.json:text_config.intermediate_size)"
+moe_inter_dim: "$(config.json:text_config.moe_intermediate_size)"
+n_layers: "$(config.json:text_config.num_hidden_layers)"
+n_dense_layers: "$(config.json:text_config.first_k_dense_replace)"
+n_heads: "$(config.json:text_config.num_attention_heads)"
+n_kv_heads: "$(config.json:text_config.num_key_value_heads)"
+n_routed_experts: "$(config.json:text_config.num_experts)"
+n_shared_experts: "$(config.json:text_config.num_shared_experts)"
+n_activated_experts: "$(config.json:text_config.num_experts_per_token)"
+n_expert_groups: "$(config.json:text_config.num_expert_group)"
+n_limited_groups: "$(config.json:text_config.topk_group)"
+route_scale: "$(config.json:text_config.routed_scaling_factor)"
+score_func: sigmoid
+norm_topk_prob: "$(config.json:text_config.moe_renormalize)"
+
+# Gated MLA (DeepSeek-V3-shaped) with NoPE and a sigmoid output gate.
+q_lora_rank: "$(config.json:text_config.q_lora_rank)"
+kv_lora_rank: "$(config.json:text_config.kv_lora_rank)"
+qk_nope_head_dim: "$(config.json:text_config.qk_nope_head_dim)"
+qk_rope_head_dim: "$(config.json:text_config.qk_rope_head_dim)"
+v_head_dim: "$(config.json:text_config.v_head_dim)"
+mla_use_output_gate: "$(config.json:text_config.mla_use_output_gate)"
+mla_apply_rope: false # NoPE: the rope dims exist but are never rotated
+
+# Placeholders read by precompute_freqs_cis. Unused because of NoPE.
+rope_theta: 10000
+rope_factor: 1
+
+# Hybrid attention layout.
+layer_types: [linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, linear_attention, linear_attention, linear_attention, full_attention, full_attention]
+
+# KDA (Kimi Delta Attention) layers.
+linear_head_dim: "$(config.json:text_config.linear_attn_config.head_dim)"
+linear_num_heads: "$(config.json:text_config.linear_attn_config.num_heads)"
+linear_n_v_heads: "$(config.json:text_config.linear_attn_config.num_heads)"
+linear_n_qk_heads: "$(config.json:text_config.linear_attn_config.num_heads)"
+linear_conv_kernel_dim: "$(config.json:text_config.linear_attn_config.short_conv_kernel_size)"
+linear_lower_bound: "$(config.json:text_config.linear_attn_config.gate_lower_bound)"
+linear_conv_impl: auto
+linear_attention_impl: auto
+
+# Attention Residuals.
+attn_res_block_size: "$(config.json:text_config.attn_res_block_size)"
+
+# Stable LatentMoE.
+routed_expert_hidden_size: "$(config.json:text_config.routed_expert_hidden_size)"
+latent_moe_use_norm: "$(config.json:text_config.latent_moe_use_norm)"
+
+# Situ activation (used by the dense MLP, shared experts and routed experts).
+hidden_act: "$(config.json:text_config.hidden_act)"
+activation_situ_beta: "$(config.json:text_config.activation_situ_beta)"
+activation_situ_linear_beta: "$(config.json:text_config.activation_situ_linear_beta)"
+
+rms_norm_eps: "$(config.json:text_config.rms_norm_eps)"
+eos_token_id: [163585, 163586] # [EOS], <|end_of_msg|>
+bos_token_id: 163584
+
+vision_config:
+  hidden_size: "$(config.json:vision_config.vt_hidden_size)"
+  num_hidden_layers: "$(config.json:vision_config.vt_num_hidden_layers)"
+  num_attention_heads: "$(config.json:vision_config.vt_num_attention_heads)"
+  intermediate_size: "$(config.json:vision_config.vt_intermediate_size)"
+  # qkv hidden width differs from hidden_size: head_dim = qkv_hidden_size /
+  # num_attention_heads (128), NOT hidden_size / num_attention_heads.
+  qkv_hidden_size: "$(config.json:vision_config.qkv_hidden_size)"
+  patch_size: "$(config.json:vision_config.patch_size)"
+  init_pos_emb_height: "$(config.json:vision_config.init_pos_emb_height)"
+  init_pos_emb_width: "$(config.json:vision_config.init_pos_emb_width)"
+  init_pos_emb_time: "$(config.json:vision_config.init_pos_emb_time)"
+  pos_emb_type: "$(config.json:vision_config.pos_emb_type)"
+  pos_emb_interpolation_mode: "$(config.json:vision_config.pos_emb_interpolation_mode)"
+  patch_embed_proj_bias: "$(config.json:vision_config.patch_embed_proj_bias)"
+  norm_type: "$(config.json:vision_config.norm_type)"
+  mlp_type: "$(config.json:vision_config.mlp_type)"
+  activation_func: "$(config.json:vision_config.activation_func)"
+  attn_bias: "$(config.json:vision_config.attn_bias)"
+  linear_bias: "$(config.json:vision_config.linear_bias)"
+  merge_kernel_size: "$(config.json:vision_config.merge_kernel_size)"
+  merge_type: "$(config.json:vision_config.merge_type)"
+  mm_projector_type: "$(config.json:vision_config.mm_projector_type)"
+  mm_hidden_size: "$(config.json:vision_config.mm_hidden_size)"
+  projector_ln_eps: "$(config.json:vision_config.projector_ln_eps)"
+  text_hidden_size: "$(config.json:vision_config.text_hidden_size)"
+  media_placeholder_token_id: "$(config.json:media_placeholder_token_id)"
+  # Multimodal-cache sizing bound: image tokens per request. 16384 = one
+  # maximal image under the processor's in_patch_limit (65536 patches / 4).
+  max_vision_tokens: 16384
+
+# Reasoning / output / tools structure (see chitu/output_parser/).
+#
+# NOTE:
+# - Delimiters are matched as EXACT contiguous token sequences.
+# - Kimi-K3 has tools separated from output, just like reasoning separated
+#   from output.
+#
+tool_parser: KimiK3ToolParser
+separated_tool_calling: true
+#
+# The think→response channel switch, verbatim:
+#   <|close|>think<|sep|><|open|>response<|sep|>
+reasoning_type: switchable
+reasoning_end_delimiter_ids: [163588, 39964, 163589, 163587, 12092, 163589]
+# The response-channel close: <|close|>response<|sep|>
+output_end_delimiter_ids: [163588, 12092, 163589]
+# The tools channel: <|open|>tools<|sep|> ... <|close|>tools<|sep|>
+tool_call_start_delimiter_ids: [163587, 25385, 163589]
+tool_call_end_delimiter_ids: [163588, 25385, 163589]
+# The whole message (the whole turn) close: <|close|>message<|sep|>.
+#
+# NOTE: The final <|end_of_msg|> is NOT part of any delimiter. The task layer
+# intercepts it.
+message_end_delimiter_ids: [163588, 2778, 163589]
