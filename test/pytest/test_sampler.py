@@ -860,13 +860,23 @@ class TestSampleDraftTokens:
     (probs, token_ids) top-k pair = the exact distribution the draft was sampled
     from (verify consumes it directly, without a full-vocab scatter)."""
 
-    def test_all_greedy_returns_none(self, sampler, global_args):
-        """All-greedy fast path: p' is not needed (exact-match verify) -> None."""
+    def test_all_greedy_returns_onehot_proposal(self, sampler, global_args):
+        """All-greedy fast path: p' is a one-slot one-hot at the draft token.
+
+        Acceptance for a greedy row is exact match and never reads p', but the proposal still comes
+        back. An absent proposal would make the verify rebuild the draft rows on the host, which is
+        the round trip the sync-free decode path avoids.
+        """
         sampler.all_greedy = True
         V = global_args.models.vocab_size
         logits = torch.randn(2, V)
         token, p_prime = sampler.sample_draft_tokens(logits)
-        assert p_prime is None
+
+        assert p_prime is not None
+        probs, token_ids = p_prime
+        assert probs.shape == (2, 1)
+        assert torch.all(probs == 1.0)
+        assert torch.equal(token_ids[:, 0], token)
         assert torch.equal(token, torch.argmax(logits, dim=-1))
 
     def test_non_greedy_returns_sampling_distribution(self, sampler, global_args):
