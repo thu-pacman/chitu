@@ -29,6 +29,7 @@ if not DOC_GENERATION:
     from chitu.serve.common import (
         require_reportable,
         set_min_batch_size,
+        min_batch_size_error,
         submit_request,
         build_chat_template_kwargs,
     )
@@ -287,8 +288,11 @@ class ChatRequest(BaseModel):
     )
     min_batch_size: int = DocField(
         1,
-        en="Minimum batch size for processing this request.",
-        zh="处理该请求时使用的最小 batch size。",
+        ge=1,
+        en="Minimum batch size for processing this request. Cannot exceed the server's "
+        "admission capacity (infer.max_concurrent_requests).",
+        zh="处理该请求时使用的最小 batch size。不能超过服务端准入容量"
+        "（infer.max_concurrent_requests）。",
     )
     stop_with_eos: Optional[bool] = DocField(
         None,
@@ -736,6 +740,20 @@ def _model_not_found_error(error: ValueError) -> JSONResponse:
     )
 
 
+def _invalid_min_batch_size_error(message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": "min_batch_size",
+                "code": "invalid_min_batch_size",
+            }
+        },
+    )
+
+
 async def handle_chat_completion(
     request: ChatRequest,
     priority: int,
@@ -771,6 +789,12 @@ async def handle_chat_completion(
         )
         if error is not None:
             return _response_format_error(error, status_code=422)
+    error = min_batch_size_error(
+        request.min_batch_size,
+        getattr(args.infer, "max_concurrent_requests", None),
+    )
+    if error is not None:
+        return _invalid_min_batch_size_error(error)
     set_min_batch_size(request.min_batch_size)
     await submit_request(user_req)
     rsp = AsyncResponse(user_req, response_model=response_model, created=created)
@@ -846,8 +870,11 @@ class CompletionsRequest(BaseModel):
     )
     min_batch_size: int = DocField(
         1,
-        en="Minimum batch size for processing this request.",
-        zh="处理该请求时使用的最小 batch size。",
+        ge=1,
+        en="Minimum batch size for processing this request. Cannot exceed the server's "
+        "admission capacity (infer.max_concurrent_requests).",
+        zh="处理该请求时使用的最小 batch size。不能超过服务端准入容量"
+        "（infer.max_concurrent_requests）。",
     )
     # vLLM/SGLang compatibility. ignore_eos=True forces generation to max_tokens.
     ignore_eos: Optional[bool] = DocField(
@@ -1071,6 +1098,12 @@ async def handle_completion(
         user_req = await build_completion_user_request(request, priority, arrival_ts)
     except PromptTooLongError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    error = min_batch_size_error(
+        request.min_batch_size,
+        getattr(args.infer, "max_concurrent_requests", None),
+    )
+    if error is not None:
+        return _invalid_min_batch_size_error(error)
     set_min_batch_size(request.min_batch_size)
     await submit_request(user_req)
     rsp = CompletionAsyncResponse(user_req, response_model=response_model)

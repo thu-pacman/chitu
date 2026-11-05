@@ -14,6 +14,7 @@ def args(alias="alias"):
     return SimpleNamespace(
         models=SimpleNamespace(name="internal-model"),
         serve=SimpleNamespace(model_alias=alias),
+        infer=SimpleNamespace(max_concurrent_requests=None),
     )
 
 

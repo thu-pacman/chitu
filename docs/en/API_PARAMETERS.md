@@ -49,7 +49,7 @@ Creates a model response for the given chat conversation.
 | `top_p` | `number` | `0.9` | Nucleus sampling threshold. |
 | `top_k` | `integer` | `50` | Top-k sampling value. Use -1 (or 0) to disable top-k filtering and sample over the full vocabulary (top_p still applies). top_k=1 is greedy decoding, as is temperature=0. |
 | `frequency_penalty` | `number` | `0.0` | Frequency penalty applied to repeated tokens. |
-| `min_batch_size` | `integer` | `1` | Minimum batch size for processing this request. |
+| `min_batch_size` | `integer` | `1` | Minimum batch size for processing this request. Cannot exceed the server's admission capacity (infer.max_concurrent_requests). |
 | `stop_with_eos` | `boolean` \| `null` | `null` | Whether generation should stop at the EOS token. Cannot conflict with ignore_eos. |
 | `ignore_eos` | `boolean` \| `null` | `null` | vLLM-compatible inverse of stop_with_eos. Cannot conflict with stop_with_eos. |
 | `chat_template_kwargs` | `object` | `{}` | Additional keyword arguments for chat template construction. Only supported keys are forwarded. |
@@ -159,7 +159,7 @@ Completes the user's raw sequence without treating it as chat, so no chat templa
 | `top_p` | `number` | `0.9` | Nucleus sampling threshold. |
 | `top_k` | `integer` | `50` | Top-k sampling value. Use -1 (or 0) to disable top-k filtering. top_k=1 is greedy decoding, as is temperature=0. |
 | `frequency_penalty` | `number` | `0.0` | Frequency penalty applied to repeated tokens. |
-| `min_batch_size` | `integer` | `1` | Minimum batch size for processing this request. |
+| `min_batch_size` | `integer` | `1` | Minimum batch size for processing this request. Cannot exceed the server's admission capacity (infer.max_concurrent_requests). |
 | `ignore_eos` | `boolean` \| `null` | `null` | vLLM/SGLang-compatible inverse of stop_with_eos. ignore_eos=True forces generation to max_tokens. |
 | `stop_with_eos` | `boolean` \| `null` | `null` | Whether generation should stop at the EOS token. Cannot conflict with ignore_eos. |
 | `model` | `string` \| `null` | `null` | Loaded model name or configured alias. Defaults to the loaded name. |

@@ -197,6 +197,7 @@ def test_chat_http_creation_time_and_model(monkeypatch):
         lambda: SimpleNamespace(
             models=SimpleNamespace(name="test-model"),
             serve=SimpleNamespace(model_alias=None),
+            infer=SimpleNamespace(max_concurrent_requests=None),
         ),
     )
     monkeypatch.setattr(chat, "build_user_request", AsyncMock(return_value=req))

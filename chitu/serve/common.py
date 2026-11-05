@@ -80,6 +80,29 @@ def set_min_batch_size(value: int):
     min_batch_size = value
 
 
+def min_batch_size_error(value: int, capacity: Optional[int]) -> Optional[str]:
+    """Return why ``value`` cannot gate the queue, or ``None`` when it can.
+
+    ``process_queue`` runs the engine only once ``len(TaskPool.pool)`` reaches
+    the threshold, while ``RejectOverloadMiddleware`` stops admitting requests
+    at ``capacity`` requests in flight. A threshold above that capacity can
+    never be reached, so the request would wait forever and every later request
+    would be rejected as overloaded before it could reset the threshold.
+
+    ``capacity`` is the server's ``infer.max_concurrent_requests``. A ``None``
+    capacity admits unbounded requests and therefore imposes no upper bound.
+    """
+    if value < 1:
+        return f"min_batch_size ({value}) must be at least 1"
+    if capacity is not None and value > capacity:
+        return (
+            f"min_batch_size ({value}) exceeds the admission capacity "
+            f"infer.max_concurrent_requests={capacity}, so the batch can never "
+            f"form"
+        )
+    return None
+
+
 def get_profile_output_root() -> str:
     output_root = get_chitu_env("CHITU_TORCH_PROFILER_OUTPUT_ROOT", "trace/chitu")
     return os.path.abspath(os.path.normpath(output_root))
