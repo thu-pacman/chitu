@@ -20,9 +20,9 @@
 #if defined(CHITU_ENABLE_DSA_FP8_KV_DEQUANT) && CHITU_ENABLE_DSA_FP8_KV_DEQUANT
 #include "dequant/dequant_kv.h"
 #endif
+#include "common/weak_ref_tensor.h"
 #include "marlin/marlin_gemm/gptq_marlin.h"
 #include "marlin/marlin_group_gemm/ops.h"
-#include "common/weak_ref_tensor.h"
 #if !defined(CHITU_HYGON_BUILD) || CHITU_HYGON_BUILD != 1
 #include "gemm/w4a8_per_group_gemm_cuda.h"
 #endif
@@ -50,8 +50,7 @@ void init_compute(py::module &m) {
     m.def("cuda_batched_routed_activation_indexed_to_expert_block_indexed",
           &batched_routed_activation_indexed_to_expert_block_indexed, "");
     m.def("cuda_add_shared_experts", &add_shared_experts, "");
-    m.def("cuda_route_gate", &route_gate, "");
-    m.def("cuda_route_gate_norm", &route_gate_norm, "");
+    m.def("cuda_moe_gate", &moe_gate, "");
     m.def("cuda_hash_route_gate", &hash_route_gate, "");
     m.def("cuda_rotary_pos_emb_llama", &rotary_pos_emb_llama, "q"_a, "k"_a,
           "freqs_cis_cos"_a, "freqs_cis_sin"_a, "q_out"_a = std::nullopt,
@@ -108,7 +107,6 @@ void init_compute(py::module &m) {
     m.def("fast_topk_transform_ragged", &fast_topk_transform_ragged_interface,
           "score"_a, "lengths"_a, "topk_indices_ragged"_a,
           "topk_indices_offset"_a, "row_starts_opt"_a = std::nullopt, "");
-    m.def("cuda_topk_softmax", &topk_softmax, "");
     m.def("cuda_frequency_penalty", &applyFrequencyPenalty, "");
     m.def("cuda_response_append", &response_append, "");
 #if defined(CHITU_ENABLE_CUSTOM_ALL_REDUCE) && CHITU_ENABLE_CUSTOM_ALL_REDUCE

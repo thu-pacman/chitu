@@ -31,6 +31,11 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
         (256, 1, 1, None, 6, "sqrtsoftplus", True, True),
         (128, 1, 1, None, 8, "softmax", False, None),
         (384, 1, 1, None, 8, "sigmoid", True, True),  # Kimi-K2.5
+        (256, 8, 4, 1, 8, "softmax", False, None),  # softmax + grouped topk
+        (256, 8, 4, 2, 8, "softmax", True, True),  # softmax + grouped topk + fp32 bias
+        (256, 1, 1, None, 6, "softmax", False, None),  # softmax + topk 6
+        (384, 1, 1, None, 8, "softmax", False, None),  # softmax + 384 experts
+        (256, 8, 4, 2, 6, "sigmoid", True, True),  # grouped topk + topk 6
     ],
 )
 @pytest.mark.parametrize("norm_prob", [True, False])

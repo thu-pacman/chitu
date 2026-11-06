@@ -334,19 +334,24 @@ class Sampler:
 
     def sample_draft_tokens(
         self, logits: torch.Tensor
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Select the next MTP draft token and its proposal distribution p'.
 
         Returns the proposal p' as a sparse top-k ``(probs, token_ids)`` pair —
         the verify only consumes values at the draft / target-top-k positions, so
-        materializing a full-vocab tensor is unnecessary. Returns ``None`` when
-        the whole batch is greedy (exact-match verify never reads p'), and the
-        draft token is then a plain argmax. This is the eager draft path's
-        entry point; `sample_draft_token` is the shared helper it and the
-        captured draft both call.
+        materializing a full-vocab tensor is unnecessary. A greedy row keeps a
+        single slot at its draft token: its acceptance is exact match and never
+        reads p', but an absent proposal makes the verify rebuild the draft rows
+        on the host, which is the round trip the sync-free decode path exists to
+        avoid. This is the eager draft path's entry point; `sample_draft_token`
+        is the shared helper it and the captured draft both call.
         """
         if self.all_greedy:
-            return torch.argmax(logits, dim=-1), None
+            tokens = torch.argmax(logits, dim=-1)
+            probs = torch.ones(
+                tokens.shape + (1,), device=logits.device, dtype=torch.float32
+            )
+            return tokens, (probs, tokens.unsqueeze(-1).to(torch.int64))
         temperatures, top_ks, top_ps, greedy_mask = self.draft_sample_params()
         return Sampler.sample_draft_token(
             logits,
