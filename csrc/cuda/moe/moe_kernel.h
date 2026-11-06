@@ -6,6 +6,9 @@
 
 #pragma once
 
+#include <optional>
+#include <string>
+
 #include "common.h"
 
 namespace chitu {
@@ -22,25 +25,15 @@ void add_shared_experts(torch::Tensor &topk_weights_new,
                         torch::Tensor &topk_indices, int64_t num_routed_experts,
                         int64_t num_shared_experts);
 
-void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
-                int n_groups, int topK_groups, int topInGroup,
-                torch::Tensor &expertsIds,
-                torch::Tensor &selectedExpertsWeights, int topK,
-                c10::optional<torch::Tensor> bias = c10::nullopt);
-
-void route_gate_norm(torch::Tensor &linear_output, int score_fun, int batchSize,
-                     int n_groups, int topK_groups, int topInGroup,
-                     torch::Tensor &expertsIds,
-                     torch::Tensor &selectedExpertsWeights, int topK,
-                     c10::optional<torch::Tensor> bias = c10::nullopt);
+void moe_gate(torch::Tensor &linear_output, torch::Tensor &expertsIds,
+              torch::Tensor &selectedExpertsWeights, int n_groups,
+              int topK_groups, int topInGroup,
+              c10::optional<torch::Tensor> bias, std::string score_func,
+              bool norm_prob);
 
 void hash_route_gate(torch::Tensor &x, torch::Tensor &weight,
                      torch::Tensor &input_ids, torch::Tensor &tid2eid,
                      torch::Tensor &expertsIds,
                      torch::Tensor &selectedExpertsWeights, int topK);
-
-void topk_softmax(torch::Tensor &topk_weights, torch::Tensor &topk_indices,
-                  torch::Tensor &token_expert_indices,
-                  torch::Tensor &gating_output);
 
 } // namespace chitu

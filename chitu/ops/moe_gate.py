@@ -103,20 +103,19 @@ def _auto_moe_gate(
         and score_func in ["softmax"]
     ):
         return "blackwell"
-    if has_chitu_backend and (
-        (
-            score_func == "softmax"
-            and topk == 8
-            and num_experts <= 256
-            and is_power_of_two(num_experts)
+    if (
+        has_chitu_backend
+        and topk in [6, 8]
+        and (
+            (8 <= num_experts <= 256 and is_power_of_two(num_experts))
+            or num_experts == 384
         )
-        or (
-            score_func in ["sigmoid", "sqrtsoftplus"]
-            and topk in [6, 8]
-            and (
-                (num_experts <= 256 and is_power_of_two(num_experts))
-                or num_experts == 384
-            )
+        # The CUDA kernel keeps softmax selection scores in fp32, so a softmax
+        # bias must be fp32; otherwise fall back to the torch impl.
+        and not (
+            score_func == "softmax"
+            and e_score_correction_bias is not None
+            and e_score_correction_bias.dtype != torch.float32
         )
     ):
         return "cuda"
@@ -201,78 +200,24 @@ def moe_gate_cuda(
 
     if bs == 0:
         return (
-            torch.empty(bs, topk, dtype=scores.dtype, device=scores.device),
             torch.empty(bs, topk, dtype=torch.int32, device=scores.device),
+            torch.empty(bs, topk, dtype=scores.dtype, device=scores.device),
         )
 
-    if score_func == "softmax":
-        # This branch is originally from from SGLang, licensed under Apache 2.0.
-
-        if num_expert_group != 1 or topk_group != 1:
-            raise NotImplementedError(
-                "Expert group is not supported for softmax score function."
-            )
-        if e_score_correction_bias is not None:
-            raise NotImplementedError(
-                "Expert score correction bias is not supported for softmax score function."
-            )
-
-        topk_weights = torch.empty(bs, topk, dtype=torch.float32, device=scores.device)
-        topk_ids = torch.empty(bs, topk, dtype=torch.int32, device=scores.device)
-        token_expert_indices = torch.empty(
-            bs, topk, dtype=torch.int32, device=scores.device
-        )
-
-        dtype = scores.dtype
-        chitu_backend.cuda_topk_softmax(
-            topk_weights,
-            topk_ids,
-            token_expert_indices,
-            scores.float(),
-        )
-        topk_weights = topk_weights.to(dtype)
-        if norm_prob:
-            topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
-        return topk_ids, topk_weights
-
-    elif score_func in ["sigmoid", "sqrtsoftplus"]:
-        score_fun = 1 if score_func == "sigmoid" else 2
-        topk_ids = torch.empty(bs, topk, dtype=torch.int, device=scores.device)
-        topk_weights = torch.empty(bs, topk, dtype=scores.dtype, device=scores.device)
-        if norm_prob and topk == 8:
-            chitu_backend.cuda_route_gate_norm(
-                scores,
-                score_fun,
-                # TODO: Merge the score_func == "softmax" branch into this C function
-                bs,
-                num_expert_group,
-                topk_group,
-                -1 if num_expert_group == 1 else topk_as_topk_group_criteria,
-                topk_ids,
-                topk_weights,
-                topk,
-                e_score_correction_bias,
-            )
-        else:
-            chitu_backend.cuda_route_gate(
-                scores,
-                score_fun,
-                # TODO: Merge the score_func == "softmax" branch into this C function
-                bs,
-                num_expert_group,
-                topk_group,
-                -1 if num_expert_group == 1 else topk_as_topk_group_criteria,
-                topk_ids,
-                topk_weights,
-                topk,
-                e_score_correction_bias,
-            )
-            if norm_prob:
-                topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
-        return topk_ids, topk_weights
-
-    else:
-        raise ValueError(f"Unsupported score function: {score_func}")
+    topk_ids = torch.empty(bs, topk, dtype=torch.int32, device=scores.device)
+    topk_weights = torch.empty(bs, topk, dtype=scores.dtype, device=scores.device)
+    chitu_backend.cuda_moe_gate(
+        scores,
+        topk_ids,
+        topk_weights,
+        num_expert_group,
+        topk_group,
+        -1 if num_expert_group == 1 else topk_as_topk_group_criteria,
+        e_score_correction_bias,
+        score_func,
+        norm_prob,
+    )
+    return topk_ids, topk_weights
 
 
 @moe_gate.register("muxi", available=has_muxi_layout_kernels)
