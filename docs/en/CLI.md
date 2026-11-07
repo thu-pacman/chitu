@@ -671,7 +671,8 @@ memory usage for intermediate tensors.
 Acceptable values:
 - "auto": Decide automatically.
 - null: Disable prefill chunking.
-- a positive integer: The global (total) prefill chunk size across DP ranks.
+- an integer at least infer.dp_size: The global (total) prefill chunk size across DP ranks.
+  Each DP rank must receive at least one token per step.
 
 *Default: `auto`.*
 
