@@ -57,6 +57,7 @@ from chitu.utils import (
     should_pretty_log,
 )
 from chitu.distributed.parallel_state import get_pp_group
+from chitu.distributed.partition import compute_prefill_chunk_size_dist_in_dp
 from chitu.logging_utils import setup_chitu_logging
 from chitu.metrics import (
     PrometheusMetricsCollector,
@@ -929,6 +930,7 @@ def _warmup_via_taskpool(args):
         )
         warmup_seq_len = 1
         prefill_chunk_size = args.infer.max_seq_len * args.infer.max_batch_size
+    warmup_tasks: list[Task] = []
     if rank == 0:
         for i in range(num_warmup_reqs):
             req = UserRequest.create_mock(
@@ -941,6 +943,7 @@ def _warmup_via_taskpool(args):
             )
             task = Task(f"{req.request_id}", req, stop_with_eos=False)
             TaskPool.add(task)
+            warmup_tasks.append(task)
         logger.info(f"Added {num_warmup_reqs} warmup requests to TaskPool")
         for scheduler in Backend.schedulers:
             scheduler.start_warmup()
@@ -950,40 +953,42 @@ def _warmup_via_taskpool(args):
     # infer.prefill_chunk_size is the GLOBAL (total) prefill chunk size across all DP and CP ranks,
     # so the effective per-step budget for the whole system is just `prefill_chunk_size` itself.
     # Due to per-rank budget constraints and uneven task distribution, some tokens may be left unprocessed.
-    # Example: DP2, chunk=16, max_batch_size=5 (创建 5 个 warmup 任务), 每任务 3 tokens
-    #   - Budget: Rank0=8, Rank1=8 (chunk_size 均分给各 rank)
-    #   - Tasks: Rank0 分到 3 个任务 (round robin), Rank1 分到 2 个任务
-    #   - Actual: Rank0 处理 8 tokens (3+3+2, task4 剩 1 token), Rank1 处理 6 tokens (3+3)
-    #   - Result: 需要 2 轮迭代来处理完所有 15 tokens
-    effective_prefill_chunk_size = prefill_chunk_size
+    # Example: DP2, chunk=16, max_batch_size=5 (5 warmup tasks), 3 tokens per task
+    #   - Budget: Rank0=8, Rank1=8 (an uneven split gives the remainder to the low ranks)
+    #   - Tasks: Rank0 gets 3 tasks (round robin), Rank1 gets 2 tasks
+    #   - Actual: Rank0 processes 8 tokens (3+3+2, 1 token of the 3rd task left), Rank1 processes 6 tokens (3+3)
+    #   - Result: 2 iterations are needed to process all 15 tokens
     total_tokens = warmup_seq_len * num_warmup_reqs
 
     # Calculate required iterations considering DP task distribution
-    # NOTE: required iterations maybe wrong when pp_size > 1
+    # NOTE: required iterations may be wrong when pp_size > 1
     if get_global_args().infer.dp_size > 1:
-        # In DP mode, tasks are distributed via round-robin, and each rank has limited budget
-        # Worst case: most tasks go to one rank, requiring more iterations
+        # In DP mode, tasks are distributed via round-robin, and each rank has a limited budget.
+        # Worst case: most tasks go to one rank, requiring more iterations.
+        # Round-robin gives rank 0 the most tasks, so rank 0 is the busiest rank. Rank 0 also
+        # has the largest per-rank budget (the remainder of an uneven chunk split goes to the
+        # low ranks, see `compute_prefill_chunk_size_dist_in_dp`), which is never zero even
+        # when chunk < dp_size — then the high ranks get zero budget and cannot prefill at all.
         # Example:
         # dp_size = 2 prefill_chunk_size = 16
-        # per_rank_budget = 16 // 2 = 8
-        # max_tasks_per_rank = ceil_div(5, 2) = 3  # round-robin 最多分到 3 个任务
+        # per_rank_budget = 16 // 2 + (0 < 16 % 2) = 8
+        # max_tasks_per_rank = ceil_div(5, 2) = 3  # round-robin gives rank 0 at most 3 tasks
         # max_tokens_per_rank = 3 × 3 = 9
         # num_required = ceil_div(9, 8) = 2
         dp_size = get_global_args().infer.dp_size
-        per_rank_budget = effective_prefill_chunk_size // dp_size
+        per_rank_budget = compute_prefill_chunk_size_dist_in_dp(
+            prefill_chunk_size, dp_size
+        )[0]
         max_tasks_per_rank = ceil_div(num_warmup_reqs, dp_size)
         max_tokens_per_rank = max_tasks_per_rank * warmup_seq_len
-        # Iterations needed for the busiest rank (usually rank 0)
+        # Iterations needed for the busiest rank (rank 0)
         num_required_prefill_schedules = ceil_div(max_tokens_per_rank, per_rank_budget)
     else:
-        num_required_prefill_schedules = ceil_div(
-            total_tokens, effective_prefill_chunk_size
-        )
+        num_required_prefill_schedules = ceil_div(total_tokens, prefill_chunk_size)
     num_required_decode_schedules = _n_decode_steps * _mtp_size
 
     logger.info(
         f"Warmup: total_tokens={total_tokens}, chunk_size={prefill_chunk_size}, "
-        f"effective_chunk_size={effective_prefill_chunk_size}, "
         f"prefill_iters={num_required_prefill_schedules}"
     )
 
@@ -1003,11 +1008,18 @@ def _warmup_via_taskpool(args):
         if prefill_iter != num_required_prefill_schedules:
             logger.warning(
                 f"Warmup incomplete: # of prefill iterations is {prefill_iter}, "
-                f"which is excepted to be {num_required_prefill_schedules}."
+                f"which is expected to be {num_required_prefill_schedules}."
             )
-        assert (
-            len(TaskPool.pool) == num_warmup_reqs
-        ), f"Expected {num_warmup_reqs} tasks after prefill, found {len(TaskPool.pool)}"
+        # A warmup task may complete its whole lifecycle during the prefill phase: a
+        # DP rank with a zero prefill budget (prefill_chunk_size < dp_size) cannot
+        # prefill, and its tasks wait for a budgeted rank to go idle, so an earlier
+        # task can finish decoding before a later one starts prefilling. Every
+        # warmup task must still be running, or have finished cleanly.
+        for task in warmup_tasks:
+            if task.task_id not in TaskPool.pool:
+                assert (
+                    task.req.finished
+                ), f"Warmup task {task.task_id} left the TaskPool without finishing"
         # End warmup prefill phase before starting decode phase
         for scheduler in Backend.schedulers:
             scheduler.end_warmup()
@@ -1020,7 +1032,7 @@ def _warmup_via_taskpool(args):
         if decode_iter != num_required_decode_schedules:
             logger.warning(
                 f"Warmup incomplete: # of decode iterations is {decode_iter}, "
-                f"which is excepted to be {num_required_decode_schedules}."
+                f"which is expected to be {num_required_decode_schedules}."
             )
         # stop other ranks
         Backend.executor.step(

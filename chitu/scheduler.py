@@ -18,7 +18,10 @@ from chitu.hooks import TaskEvictHook, NoopTaskEvictHook
 from chitu.utils import ceil_div, step_timer
 from chitu.backend import Backend
 from chitu.testing.exception import test_inject_exception_kv_capacity_exceeded
-from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
+from chitu.distributed.partition import (
+    compute_local_batch_size_dist_in_dp,
+    compute_prefill_chunk_size_dist_in_dp,
+)
 from chitu.metrics.prometheus_collector import (
     PrometheusMetricsCollector,
     inc_completed_requests,
@@ -132,13 +135,14 @@ class Scheduler:
         if infer_args.prefill_chunk_size is not None:
             # infer.prefill_chunk_size is the GLOBAL (total) prefill chunk size across
             # all DP and CP ranks. The scheduler for a given DP rank packs its share
-            # of the global budget: config // dp_size tokens per step. These tokens
-            # are then split across the pcp_size CP ranks, so each CP rank only
-            # processes 1/pcp_size of them (i.e. config // pcp_size per rank).
-            global_chunk_size = infer_args.prefill_chunk_size
+            # of the global budget per step, with the remainder of an uneven split
+            # going to the low ranks (compute_prefill_chunk_size_dist_in_dp). These
+            # tokens are then split across the pcp_size CP ranks, so each CP rank
+            # only processes 1/pcp_size of them (i.e. config // pcp_size per rank).
             prefill_chunk_size_per_dp: Optional[int] = (
-                global_chunk_size // infer_args.dp_size
-                + int(dp_rank < global_chunk_size % infer_args.dp_size)
+                compute_prefill_chunk_size_dist_in_dp(
+                    infer_args.prefill_chunk_size, infer_args.dp_size
+                )[dp_rank]
             )
         else:
             prefill_chunk_size_per_dp: Optional[int] = None

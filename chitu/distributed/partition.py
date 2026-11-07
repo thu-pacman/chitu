@@ -18,6 +18,22 @@ def compute_local_batch_size_dist_in_dp(
     ]
 
 
+def compute_prefill_chunk_size_dist_in_dp(
+    global_chunk_size: int, dp_size: int
+) -> list[int]:
+    """Per-DP-rank prefill token budget of one scheduling step.
+
+    `infer.prefill_chunk_size` is the GLOBAL (total) prefill chunk size across all DP
+    ranks. Each DP rank's scheduler packs its share of the global budget per step;
+    the remainder of an uneven split goes to the low ranks, so rank 0 always has the
+    largest budget.
+    """
+    return [
+        global_chunk_size // dp_size + int(i < global_chunk_size % dp_size)
+        for i in range(dp_size)
+    ]
+
+
 def compute_layer_dist_in_pp(pp_size: int):
     args = get_global_args()
     num_layers = args.models.n_layers + int(args.infer.mtp_size > 1)
