@@ -20,6 +20,26 @@ import triton.language as tl
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
 
+
+# --- GCU: Triton's vectorized int64 `%` returns negative residues on this
+# backend, so the decode fast paths use a bit mask instead (STATE_ROWS / RATIO
+# are powers of two). Verify that precondition cheaply, once per value.
+_POW2_OK = set()
+
+
+def _check_pow2(name, value):
+    value = int(value)
+    if value in _POW2_OK:
+        return
+    if value <= 0 or (value & (value - 1)) != 0:
+        raise ValueError(
+            f"{name}={value} must be a power of two: the DSV4 decode fast paths "
+            "use a bit mask instead of `%` to avoid negative residues from the "
+            "GCU int64 vectorized modulo"
+        )
+    _POW2_OK.add(value)
+
+
 # FIXME: The ragged metadata tensors and most pointer-offset arithmetic in this
 # file currently assume int32 indices. Other KV-cache Triton ops switch to
 # int64 offsets for large tensors; do the same here before relying on these
@@ -659,6 +679,8 @@ def writeback_pending_triton(
         return
     D = flat_kv.shape[1]
     state_rows = kv_state.shape[1]
+    _check_pow2("STATE_ROWS", state_rows)
+    _check_pow2("RATIO", ratio)
     BLOCK_R = triton.next_power_of_2(state_rows)
     BLOCK_D = triton.next_power_of_2(D)
     _writeback_pending_kernel[(n,)](
@@ -887,7 +909,7 @@ def _decode_mtp_csa_kernel(
     t_mask = t_offs < Q_LEN
     d_mask = d_offs < FULL_D
     positions = sp + t_offs
-    dst_rows = positions % STATE_ROWS
+    dst_rows = positions & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
     ape_rows = positions % RATIO
     src_rows = req * Q_LEN + t_offs
     new_kv = tl.load(
@@ -1145,7 +1167,7 @@ def _decode_hca_kernel(
     d_offs = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
     ape_row = sp % RATIO
-    dst_row = sp % STATE_ROWS
+    dst_row = sp & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
 
     kv = tl.load(kv_ptr + req * D + d_offs, mask=d_mask, other=0.0)
     score = tl.load(score_ptr + req * D + d_offs, mask=d_mask, other=0.0)
@@ -1211,6 +1233,8 @@ def decode_hca(
         return
     D = out_kv.shape[1]
     BLOCK_D = min(64, triton.next_power_of_2(D))
+    _check_pow2("STATE_ROWS", kv_state.shape[1])
+    _check_pow2("RATIO", ratio)
     grid = (bsz, triton.cdiv(D, BLOCK_D))
     _decode_hca_kernel[grid](
         kv,
