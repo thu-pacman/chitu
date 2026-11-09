@@ -771,7 +771,16 @@ def _build_qwen3_5_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
 
 @register_cache_manager_builder(model_types=[ModelType.KIMI_K3], priority=5)
 def _build_kimi_k3_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
-    """Kimi-K3 hybrid cache: main (Gated MLA) + linear (KDA) caches."""
+    """Kimi-K3 hybrid cache: main (Gated MLA) + linear (KDA) caches.
+
+    Kimi-K3.1 is the same backbone with the DSA indexer on the full-attention
+    layers, activated by the config carrying the DSA fields (``index_head_dim``
+    etc.): the indexer K cache is then built over those same layers.
+
+    Kimi-K3 has no DSA config and must skip the indexer cache: the indexer spec
+    providers all require ``index_head_dim``, and ``get_kv_cache_spec`` raises
+    when no provider matches.
+    """
 
     def is_full_attention(layer_id: int) -> bool:
         return args.models.layer_types[layer_id] == "full_attention"
@@ -795,6 +804,13 @@ def _build_kimi_k3_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
             main_block_size=_main_cache_block_size(main_cache),
         ),
     }
+    # The gate matches the indexer spec providers' own ``index_head_dim``
+    # requirement, so a config that passes it always has a matching spec.
+    if getattr(args.models, "index_head_dim", None):
+        indexer = _build_indexer_cache(args, layer_filter_fn=filter_full)
+        _attach_indexer_cache_managers(
+            args, main_cache, main_managers, cache_dict, indexer
+        )
     mm_cache = _build_multimodal_cache(args, main_cache)
     if mm_cache is not None:
         cache_dict[MULTIMODAL_CACHE_NAME] = mm_cache

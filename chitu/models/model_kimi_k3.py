@@ -38,6 +38,7 @@ from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.cp_utils import get_cp_context
 from chitu.device_type import has_accelerator
+from chitu.dsa_indexer_backend import DSAIndexer
 from chitu.global_vars import get_global_args
 from chitu.kv_cache import KVCacheBase
 from chitu.lazy import eval_lazy
@@ -445,6 +446,11 @@ class AttentionKimiK3(AttentionDeepSeekV3):
     NoPE comes from ``args.mla_apply_rope=False`` (handled by the base class).
     The output gate multiplies the attention output with
     ``sigmoid(g_proj(attn_input))`` before ``o_proj``.
+
+    ``indexer_impl`` additionally enables the DeepSeek-V3.2-shaped DSA indexer
+    (used by Kimi-K3.1, whose full-attention layers are sparse): the base class
+    then owns the whole indexer → top-k → sparse-MLA flow, on top of the same
+    NoPE + output-gate layer.
     """
 
     def __init__(
@@ -457,6 +463,8 @@ class AttentionKimiK3(AttentionDeepSeekV3):
         mla_absorb,
         *,
         checkpoint_prefix,
+        indexer_cache: Optional[KVCacheBase] = None,
+        indexer_impl: Optional[DSAIndexer] = None,
     ):
         super().__init__(
             args,
@@ -466,9 +474,9 @@ class AttentionKimiK3(AttentionDeepSeekV3):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
             checkpoint_prefix=checkpoint_prefix,
-            indexer_cache=None,
-            indexer_impl=None,
-            has_local_indexer=False,
+            indexer_cache=indexer_cache,
+            indexer_impl=indexer_impl,
+            has_local_indexer=indexer_impl is not None,
         )
         checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         self.use_output_gate = bool(getattr(args, "mla_use_output_gate", False))
@@ -874,6 +882,7 @@ class TransformerBlockKimiK3(TransformerBlock):
         mla_absorb,
         *,
         checkpoint_prefix,
+        indexer_impl: Optional[DSAIndexer] = None,
     ):
         super().__init__(
             layer_id, args, cache_dict, attn_backend=attn_backend, op_impl=op_impl
@@ -897,6 +906,8 @@ class TransformerBlockKimiK3(TransformerBlock):
                 op_impl,
                 mla_absorb,
                 checkpoint_prefix=checkpoint_prefix / "self_attn",
+                indexer_cache=cache_dict.get("indexer"),
+                indexer_impl=indexer_impl,
             )
         else:
             raise ValueError(f"Unknown Kimi-K3 layer type: {self.block_type}")
@@ -1002,6 +1013,13 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
     """Kimi-K3 text backbone with TP/DP/EP/PP (no CP/MTP), plus the optional
     MoonViT-V2 vision tower + PatchMergerMLPV2 projector for multimodal runs.
 
+    Kimi-K3.1 is the same backbone with DeepSeek-style sparse attention (DSA)
+    on the full-attention layers, activated purely by the model config carrying
+    the DSA fields (``index_topk`` etc.): TransformerDeepSeekV3 then creates
+    the shared indexer, ``_init_layers`` forwards it into every MLA layer, and
+    the indexer K cache arrives through ``cache_dict["indexer"]``. The K3.1
+    indexer is RoPE-free (``index_rope_dim: 0`` — the MLA layers are NoPE).
+
     PP carries the running stream and only the AttnRes blocks produced before
     the next stage. The vision modules live on PP stage 0 (same stage as
     embed_tokens); the multimodal cache stages per-request image features so
@@ -1021,6 +1039,21 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
         mla_absorb: str,
         **kwargs,
     ):
+        # The indexer RoPE width is configured independently of the main
+        # attention (index_rope_dim). A NoPE model has no rotary cache the
+        # indexer could share, and the width-absent fallback (qk_rope_head_dim)
+        # would silently rotate with the placeholder freqs_cis — so an active
+        # indexer on the NoPE MLA layers must set index_rope_dim=0 explicitly.
+        if (
+            getattr(params, "index_topk", None) is not None
+            and not bool(getattr(params, "mla_apply_rope", True))
+            and int(getattr(params, "index_rope_dim", -1)) != 0
+        ):
+            raise ValueError(
+                "The DSA indexer on the NoPE Kimi-K3 MLA layers requires "
+                "index_rope_dim=0 (Kimi-K3.1): there is no rotary cache to "
+                "share with the indexer"
+            )
         self.vision_config = getattr(params, "vision_config", None)
         # Text-only runs (infer.language_model_only=True) never build the vision
         # modules, the multimodal cache or the processor.
@@ -1081,6 +1114,10 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
                     op_impl,
                     self.mla_absorb,
                     checkpoint_prefix=f"layers.{layer_id}",
+                    # - Kimi-K3: indexer_impl=None.
+                    # - Kimi-K3.1: indexer_impl is created by TransformerDeepSeekV3
+                    #   when params carry index_topk.
+                    indexer_impl=self.indexer_backend,
                 )
             )
 

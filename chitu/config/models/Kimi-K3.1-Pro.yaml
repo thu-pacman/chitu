@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Kimi-K3.1-Pro = Kimi-K3 + DeepSeek-style sparse attention (DSA): the 24
+# full-attention (Gated MLA) layers each own a DeepSeek-V3.2-shaped NSA indexer
+# selecting the top-2048 keys per query. Everything else (KDA layers, AttnRes,
+# latent MoE, vision, XTML tokenizer, reasoning/tools structure) is inherited
+# from Kimi-K3.yaml unchanged.
+defaults:
+  - Kimi-K3
+  - _self_ # Config in this file overrides configs in defaults
+
+name: Kimi-K3.1-Pro
+# Same model type as Kimi-K3: K3.1 is the K3 backbone plus the DSA indexer,
+# activated by the index_* fields below (the DeepSeek-V3.2 pattern — the
+# indexer exists iff the config carries index_topk).
+type: kimi-k3
+source: "https://huggingface.co/moonshotai/Kimi-K3.1-Pro" # Just for displaying. No automatic download.
+
+# DSA indexer on the full-attention layers (config.json text_config.dsa_config).
+# The indexer Q comes from the normed q_lora latent (wq_b), the shared K from the
+# hidden states (wk) through a bias-full LayerNorm (k_norm), and the per-token
+# head-combination weights from weights_proj; scores are relu-weighted sums and
+# the top index_topk keys per query feed the FlashMLA sparse kernels.
+index_topk: "$(config.json:text_config.dsa_config.index_topk)"
+index_n_heads: "$(config.json:text_config.dsa_config.index_num_heads)"
+index_head_dim: "$(config.json:text_config.dsa_config.index_head_dim)"
+# No indexer RoPE: the MLA layers are NoPE, so there is no rotary cache to share.
+index_rope_dim: "$(config.json:text_config.dsa_config.index_rope_dim)"
+# This checkpoint ships k_norm in bf16 (DeepSeek-V3.2's is fp32); the LayerNorm
+# still computes in fp32 regardless of the weight dtype.
+index_norm_dtype: bfloat16
+
+# dsa_config also carries index_topk_freq=1 / index_skip_topk_offset=1, which
+# would enable cross-layer top-k sharing on other models. With freq=1 every DSA
+# layer computes its own top-k, so both fields are inert here and intentionally
+# not configured (chitu has no index-sharing machinery).
+#
+# Indexer KV precision follows the same quant_config kv_cache rules as the
+# DeepSeek models: with no rule matching "indexer_k" (the inherited Kimi-K3
+# quant_config) the indexer K cache is bf16; an fp8 override is a config-only
+# change (a quant_config with `kv_cache: {rules: [{regex: '^indexer_k$', type:
+# fp8_pertoken_indexer}]}` plus this model's expert rules, and
+# infer.indexer_type then auto-resolves to the deepgemm/triton fp8 backend).

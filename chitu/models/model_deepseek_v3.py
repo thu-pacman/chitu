@@ -145,7 +145,15 @@ class Indexer(torch.nn.Module):
         self.dim: int = args.dim
         self.n_heads: int = args.index_n_heads
         self.head_dim: int = args.index_head_dim
-        self.rope_head_dim: int = args.qk_rope_head_dim
+        # Width of the leading dims of each indexer head that receive RoPE.
+        # DeepSeek-V3.2-style models rotate the same leading dims as the main
+        # attention (qk_rope_head_dim). Models whose attention is NoPE (e.g.
+        # Kimi-K3.1) configure ``index_rope_dim: 0``: the indexer never rotates,
+        # and there is no rotary cache to share with the main attention.
+        index_rope_dim = getattr(args, "index_rope_dim", None)
+        self.rope_head_dim: int = (
+            args.qk_rope_head_dim if index_rope_dim is None else int(index_rope_dim)
+        )
         self.index_rope_layout = getattr(args, "index_rope_layout", "separated")
 
         # Adjust index_topk not exceed the max addressable length to avoid out-of-range errors
@@ -194,7 +202,10 @@ class Indexer(torch.nn.Module):
         if not k_pre_normed:
             k = self.k_norm(k)
 
-        if freqs_cis_k is not None:
+        if self.rope_head_dim == 0:
+            # NoPE indexer: no rotation; Q/K stay as projected (K already normed).
+            q_rot, k_rot = q, k
+        elif freqs_cis_k is not None:
             # CP mode: Q uses local positions and K uses global positions.
             q_rot, _, _, _ = apply_rotary_pos_emb_single_partial(
                 q,
