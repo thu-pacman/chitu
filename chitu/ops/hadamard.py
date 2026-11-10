@@ -30,29 +30,37 @@ def _auto_hadamard_transform():
     return "torch"
 
 
+@functools.cache
+def get_hadamard_matrix_torch(
+    dim: int, dtype: torch.dtype, device: torch.device | str
+) -> torch.Tensor:
+    """Sylvester Hadamard matrix, built once per (dim, dtype, device) and cached.
+
+    This mirrors :func:`hadamard_transform_scipy`: the transform is a single
+    matmul against a cached matrix, which is faster than a butterfly for any
+    realistically sized hidden dimension.
+    """
+    h = torch.ones((1, 1), dtype=torch.float32)
+    while h.shape[0] < dim:
+        h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
+    return h.to(dtype=dtype, device=device)
+
+
 @hadamard_transform.register("torch")
 def hadamard_transform_torch(x: torch.Tensor, scale: float) -> torch.Tensor:
-    """Portable FWHT fallback using log2(N) Torch butterfly stages."""
-    if x.numel() == 0:
-        return x
-
+    """Portable fallback for platforms without scipy / fast_hadamard_transform."""
     dim = x.shape[-1]
-    dim_padded = dim if is_power_of_two(dim) else next_power_of_two(dim)
-    if dim_padded != dim:
-        y = torch.nn.functional.pad(x, (0, dim_padded - dim))
+    if not is_power_of_two(dim):
+        dim_padded = next_power_of_two(dim)
+        x = torch.nn.functional.pad(x, (0, dim_padded - dim))
     else:
-        y = x
-
-    leading_shape = y.shape[:-1]
-    butterfly = 1
-    while butterfly < dim_padded:
-        y = y.reshape(*leading_shape, -1, butterfly * 2)
-        left = y[..., :butterfly]
-        right = y[..., butterfly:]
-        y = torch.cat((left + right, left - right), dim=-1)
-        butterfly *= 2
-
-    return y.reshape(*leading_shape, dim_padded)[..., :dim] * scale
+        dim_padded = dim
+    return (
+        torch.nn.functional.linear(
+            x, get_hadamard_matrix_torch(dim_padded, x.dtype, x.device)
+        )[..., :dim]
+        * scale
+    )
 
 
 @functools.cache
