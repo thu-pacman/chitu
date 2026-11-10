@@ -274,6 +274,7 @@ Build the image directly with the root `Dockerfile`:
 ```bash
 docker build \
   --build-arg torch_cuda_arch_list='<your_arch_list>' \
+  --build-arg is_at_least_blackwell='<true_or_false>' \
   --build-arg optional_deps='<comma_separated_optional_deps>' \
   --build-arg enable_cython='<true_or_false>' \
   --build-arg enable_test='<true_or_false>' \
@@ -284,98 +285,59 @@ docker build \
 
 #### MetaX GPU
 
-Some dependencies must be installed with device visible, so they must be installed with `docker run` rather than `docker build`. Therefore please prepare the build environment with at least one device, and use the two-stage build script with `muxi.Dockerfile`:
+Build the image with `muxi.Dockerfile`:
 
 ```bash
-bash ./script/two-stage-docker-build.sh \
-  'muxi.Dockerfile' \
-  '<your_image_name>' \
-  '<your_image_tag>' \
-  --optional_deps='<comma_separated_optional_deps>' \
-  --chitu_setup_jobs='<chitu_setup_jobs>' \
-  --enable_cython='<true_or_false>' \
-  --enable_test='<true_or_false>' \
-  --pypi_mirror='<your_pypi_mirror>' \
-  -- \
-  docker run \
-    --pid=host \
-    --device=/dev/dri \
-    --device=/dev/mxcd \
-    --group-add video \
-    --privileged=true \
-    --security-opt seccomp=unconfined \
-    --security-opt apparmor=unconfined \
-    --shm-size '<your_shm_size>' \
-    --ulimit memlock=-1 \
-    -w /workspace/chitu
+docker buildx build -f muxi.Dockerfile \
+  --build-arg optional_deps='<comma_separated_optional_deps>' \
+  --build-arg chitu_setup_jobs='<chitu_setup_jobs>' \
+  --build-arg enable_cython='<true_or_false>' \
+  --build-arg enable_test='<true_or_false>' \
+  --build-arg pypi_mirror='<your_pypi_mirror>' \
+  --load \
+  -t <your_image_name> \
+  .
 ```
 
 #### Ascend NPU
 
-Some dependencies must be installed with device visible, so they must be installed with `docker run` rather than `docker build`. Therefore please prepare the build environment with at least one device, and use the two-stage build script with `ascend.Dockerfile`:
+Build the image with `ascend.Dockerfile`, and pass the driver library directories with `--build-context`:
 
 ```bash
-bash ./script/two-stage-docker-build.sh \
-  'ascend.Dockerfile' \
-  '<your_image_name>' \
-  '<your_image_tag>' \
-  --optional_deps='<comma_separated_optional_deps>' \
-  --chitu_setup_jobs='<chitu_setup_jobs>' \
-  --enable_cython='<true_or_false>' \
-  --enable_test='<true_or_false>' \
-  --pypi_mirror='<your_pypi_mirror>' \
-  -- \
-  docker run \
-    --pid=host \
-    --privileged \
-    --device /dev/devmm_svm \
-    --device /dev/hisi_hdc \
-    -v /usr/local/dcmi:/usr/local/dcmi \
-    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
-    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-    -v /etc/ascend_install.info:/etc/ascend_install.info \
-    -v /dev/davinci<npu_id>:/dev/davinci<npu_id>
-    -w /workspace/chitu
+docker buildx build -f ascend.Dockerfile \
+  --build-context ascend_driver=/usr/local/Ascend/driver/lib64 \
+  --build-context ascend_dcmi=/usr/local/dcmi \
+  --build-arg optional_deps='<comma_separated_optional_deps>' \
+  --build-arg chitu_setup_jobs='<chitu_setup_jobs>' \
+  --build-arg enable_cython='<true_or_false>' \
+  --build-arg enable_test='<true_or_false>' \
+  --build-arg pypi_mirror='<your_pypi_mirror>' \
+  --load \
+  -t <your_image_name> \
+  .
 ```
 
 #### Hygon DCU
 
-Some dependencies must be installed with device visible, so they must be installed with `docker run` rather than `docker build`. Therefore please prepare the build environment with at least one device, and use the two-stage build script with `hygon.Dockerfile`:
+Build the image with `hygon.Dockerfile`, and pass hyhal with `--build-context`:
 
 ```bash
-bash ./script/two-stage-docker-build.sh \
-  'hygon.Dockerfile' \
-  '<your_image_name>' \
-  '<your_image_tag>' \
-  --optional_deps='<comma_separated_optional_deps>' \
-  --chitu_setup_jobs='<chitu_setup_jobs>' \
-  --enable_editable_install='<true_or_false>' \
-  --enable_cython='<true_or_false>' \
-  --enable_test='<true_or_false>' \
-  --pypi_mirror='<your_pypi_mirror>' \
-  -- \
-  docker run \
-    -u root \
-    --network=host \
-    --pid=host \
-    --privileged \
-    --device=/dev/kfd \
-    --device=/dev/dri \
-    --ipc=host \
-    --shm-size='<your_shm_size>' \
-    --group-add video \
-    --cap-add=SYS_PTRACE \
-    --security-opt seccomp=unconfined \
-    --ulimit stack=-1:-1 \
-    --ulimit memlock=-1:-1 \
-    -v /opt/hyhal:/opt/hyhal:ro \
-    -w /workspace/chitu
+docker buildx build -f hygon.Dockerfile \
+  --build-context hyhal=/usr/local/hyhal \
+  --build-arg optional_deps='<comma_separated_optional_deps>' \
+  --build-arg chitu_setup_jobs='<chitu_setup_jobs>' \
+  --build-arg enable_cython='<true_or_false>' \
+  --build-arg enable_test='<true_or_false>' \
+  --build-arg pypi_mirror='<your_pypi_mirror>' \
+  --build-arg build_for_shca='<true_or_false>' \
+  --load \
+  -t <your_image_name> \
+  .
 ```
 
 ### Build for Apptainer Image Distribution
 
-You can convert a Docker image to an Apptainer image. Apptainer is a good choice for deamonless execution.
+You can convert a Docker image to an Apptainer image. Apptainer is a good choice for daemonless execution.
 
 ```bash
 apptainer build <your_apptainer_image.sif> <your_docker_image>
