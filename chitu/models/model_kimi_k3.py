@@ -25,7 +25,7 @@ Kimi-K3
 """
 
 import re
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
 import torch.nn as nn
@@ -1229,6 +1229,18 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
             self.output_attn_res_proj.weight.view(-1),
             self.output_attn_res_norm.eps,
         )
+
+    @override
+    def prepare_freqs_cis(self) -> BatchedFreqsCis:
+        """Kimi-K3 is NoPE, so no layer reads RoPE cos/sin.
+
+        The generic decode/prefill paths call this every step. Returning ``None``
+        avoids the two int32->int64 index copies and two table gathers that the
+        inherited DeepSeek-V3 implementation would issue as dead work. KDA layers
+        ignore ``freqs_cis``, and Gated-MLA only splits the stored rope dimensions
+        without rotating them (``mla_apply_rope`` is false).
+        """
+        return cast(BatchedFreqsCis, None)
 
     @override
     @torch.inference_mode()
