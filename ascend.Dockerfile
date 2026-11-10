@@ -138,6 +138,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install pyyaml setuptools
 
+# Build dependencies are needed by the wheel stage and by the local AscendC
+# kernel package installed in the dependency installer.
+COPY ./requirements-build.txt /tmp/requirements-build.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /tmp/requirements-build.txt
+
 WORKDIR /workspace/chitu
 COPY ./test ./test
 COPY ./script ./script
@@ -155,5 +161,84 @@ ENV CHITU_ASCEND_BUILD=1
 COPY ./script/entrypoint.sh /chitu-entrypoint.sh
 ENTRYPOINT ["/chitu-entrypoint.sh", "/bin/bash", "-c", "source /usr/local/Ascend/ascend-toolkit/set_env.sh && source /usr/local/Ascend/nnal/atb/set_env.sh && exec \"$@\"", "--"]
 
-# The actual installing procedure requries a NPU device, which is not available in the `docker build` stage.
-# We delay it to an additional `docker run` stage which runs `script/ascend_install.sh`.
+#####################################
+# Dependency resolver stage
+#
+# Generate the PyPI and local-package requirements files from get_requires.py,
+# including the selected optional extras. This stage needs torch only for
+# get_requires/csrc imports.
+FROM base AS dependency_resolver
+WORKDIR /workspace/chitu
+COPY . .
+RUN ./gen_tmp_requirements_txt.py "${optional_deps}" --kind pypi > /tmp/requirements-pypi.txt
+RUN ./gen_tmp_requirements_txt.py "${optional_deps}" --kind local > /tmp/requirements-local.txt
+
+#####################################
+# Dependency installer stage
+#
+# Install torch_npu and the PyPI dependencies. Disable torch's backend
+# auto-loading while installing, because torch_npu needs the host driver and
+# we are not mounting it in this stage. The final image copies this Python
+# environment and does not inherit this variable.
+FROM base AS dependency_installer
+WORKDIR /workspace/chitu
+ENV TORCH_DEVICE_BACKEND_AUTOLOAD=0
+COPY --from=dependency_resolver /tmp/requirements-pypi.txt /tmp/requirements-pypi.txt
+RUN pip install torch-npu==2.9.0.post9
+RUN if [ -n "${pypi_mirror}" ]; then \
+        pip install --no-build-isolation -r /tmp/requirements-pypi.txt \
+            -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "tokenizers" -e "xgrammar" -e "pytest" -e "build" -e "click") \
+            -i "${pypi_mirror}" \
+            --extra-index-url https://pypi.org/simple \
+            --timeout 60 --retries 10; \
+    else \
+        pip install --no-build-isolation -r /tmp/requirements-pypi.txt \
+            -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "tokenizers" -e "xgrammar" -e "pytest" -e "build" -e "click") \
+            -i https://pypi.org/simple \
+            --timeout 60 --retries 10; \
+    fi
+
+#####################################
+# Local kernel stage
+#
+# Build and install the AscendC kernel package. The driver is mounted only
+# here, because its setup.py imports torch_npu.
+FROM dependency_installer AS kernel_builder
+WORKDIR /workspace/chitu
+COPY ./third_party/ascend-kernel ./third_party/ascend-kernel
+COPY ./csrc/cpuinfer ./csrc/cpuinfer
+COPY --from=dependency_resolver /tmp/requirements-local.txt /tmp/requirements-local.txt
+RUN --mount=type=bind,from=ascend_driver,target=/usr/local/Ascend/driver/lib64 \
+    --mount=type=bind,from=ascend_dcmi,target=/usr/local/dcmi \
+    export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/inner:/usr/local/dcmi:${LD_LIBRARY_PATH}; \
+    pip wheel --no-build-isolation --no-deps -w /tmp/kernel-wheels -r /tmp/requirements-local.txt
+
+#####################################
+# Wheel build stage
+#
+# Source is present only in the resolver/installer/wheel stages. The final
+# image copies just the wheel, so no source tree ends up in the image.
+FROM kernel_builder AS wheel_builder
+ARG enable_cython
+WORKDIR /workspace/chitu
+COPY . .
+RUN ./script/build_for_dist.sh "${enable_cython}"
+RUN mkdir -p /tmp/wheels && cp dist/*.whl /tmp/wheels/
+RUN rm -rf /workspace/chitu/*
+
+#####################################
+# Final image
+# Start from dependency_installer, not base: the PyPI dependencies are
+# installed there, and this stage must not copy the Python tree to get them.
+FROM dependency_installer AS final
+WORKDIR /workspace/chitu
+# Install the local kernel wheel and the chitu wheel; both are prebuilt.
+COPY --from=kernel_builder /tmp/kernel-wheels /tmp/kernel-wheels
+# cinfer_ascendc's build step installs the AscendC vendor ops directly into
+# site-packages, and the wheel does not contain them. Copy them explicitly.
+COPY --from=kernel_builder /usr/local/python3.11.17/lib/python3.11/site-packages/vendors /usr/local/python3.11.17/lib/python3.11/site-packages/vendors
+RUN --mount=from=wheel_builder,source=/tmp/wheels,target=/tmp/wheels <<'EOF'
+set -e
+pip install --no-index --no-deps /tmp/kernel-wheels/*.whl /tmp/wheels/*.whl
+rm -rf /tmp/kernel-wheels
+EOF
