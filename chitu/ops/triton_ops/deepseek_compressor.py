@@ -198,7 +198,7 @@ def _gather_kernel(
     # may remain physically present, but the rolled-back logical position makes
     # them invisible to this gather.
     pend_pos = pending_abs_start + t_offs
-    pend_row = pend_pos % STATE_ROWS
+    pend_row = pend_pos & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
     pend_kv_ptr = (
         kv_state_ptr + slot * state_s0 + pend_row[:, None] * state_s1 + d_offs[None, :]
     )
@@ -217,7 +217,7 @@ def _gather_kernel(
 
     # ---- load score ----
     # pending part: kv_state stores score WITH ape already added; subtract ape back.
-    ape_row = pend_pos % RATIO
+    ape_row = pend_pos & (RATIO - 1)  # gcu: vector % returns negative residues
     ape_ptr2 = ape_ptr + ape_row[:, None] * D + d_offs[None, :]
     ape_val = tl.load(ape_ptr2, mask=mask2d, other=0.0)
 
@@ -638,8 +638,8 @@ def _writeback_pending_kernel(
     )
 
     pos = suffix_abs_start + r_offs
-    dst_row = pos % STATE_ROWS
-    ape_row = pos % RATIO
+    dst_row = pos & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
+    ape_row = pos & (RATIO - 1)  # gcu: vector % returns negative residues
     ape_val = tl.load(
         ape_ptr + ape_row[:, None] * D + d_offs[None, :], mask=mask2d, other=0.0
     )
@@ -758,7 +758,7 @@ def _decode_mtp_hca_compress_kernel(
     r_offs = tl.arange(0, RATIO)
     is_pending = r_offs < pending
     new_idx = r_offs - pending
-    state_rows = (group_start + r_offs) % STATE_ROWS
+    state_rows = (group_start + r_offs) & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
 
     state_kv = tl.load(
         kv_state_ptr
@@ -833,8 +833,8 @@ def _decode_mtp_hca_update_kernel(
     t_mask = t_offs < Q_LEN
     d_mask = d_offs < D
     positions = sp + t_offs
-    dst_rows = positions % STATE_ROWS
-    ape_rows = positions % RATIO
+    dst_rows = positions & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
+    ape_rows = positions & (RATIO - 1)  # gcu: vector % returns negative residues
     src_rows = req * Q_LEN + t_offs
     kv = tl.load(
         kv_cat_ptr + src_rows[:, None] * D + d_offs[None, :],
@@ -899,7 +899,7 @@ def _decode_mtp_csa_kernel(
     is_pending = r_offs < pending
     new_idx = r_offs - pending
     cur_pos = group_start + r_offs
-    cur_rows = cur_pos % STATE_ROWS
+    cur_rows = cur_pos & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
 
     # Save every draft token to the logical ring. If a suffix is rejected, the
     # scheduler rolls back the logical length; these physical rows are then
@@ -910,7 +910,7 @@ def _decode_mtp_csa_kernel(
     d_mask = d_offs < FULL_D
     positions = sp + t_offs
     dst_rows = positions & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
-    ape_rows = positions % RATIO
+    ape_rows = positions & (RATIO - 1)  # gcu: vector % returns negative residues
     src_rows = req * Q_LEN + t_offs
     new_kv = tl.load(
         kv_cat_ptr + src_rows[:, None] * FULL_D + d_offs[None, :],
@@ -1046,6 +1046,8 @@ def decode_mtp_hca(
         return
     D = kv_cat.shape[1]
     state_rows = kv_state.shape[1]
+    _check_pow2("STATE_ROWS", state_rows)
+    _check_pow2("RATIO", ratio)
     BLOCK_Q = triton.next_power_of_2(q_len)
     BLOCK_D = triton.next_power_of_2(D)
     n_compressed = 0 if compressed_reqs is None else compressed_reqs.shape[0]
@@ -1107,6 +1109,8 @@ def decode_mtp_csa(
         return
     full_d = kv_cat.shape[1]
     state_rows = kv_state.shape[1]
+    _check_pow2("STATE_ROWS", state_rows)
+    _check_pow2("RATIO", ratio)
     BLOCK_Q = triton.next_power_of_2(q_len)
     BLOCK_HD = triton.next_power_of_2(head_dim)
     BLOCK_FULL_D = triton.next_power_of_2(full_d)
@@ -1166,7 +1170,7 @@ def _decode_hca_kernel(
 
     d_offs = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
-    ape_row = sp % RATIO
+    ape_row = sp & (RATIO - 1)  # gcu: vector % returns negative residues
     dst_row = sp & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
 
     kv = tl.load(kv_ptr + req * D + d_offs, mask=d_mask, other=0.0)
@@ -1195,7 +1199,7 @@ def _decode_hca_kernel(
 
     group_start = sp - (RATIO - 1)
     r_offs = tl.arange(0, RATIO)
-    rows = (group_start + r_offs) % STATE_ROWS
+    rows = (group_start + r_offs) & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
 
     state_kv = tl.load(
         kv_state_ptr + slot * state_s0 + rows[:, None] * state_s1 + d_offs[None, :],
