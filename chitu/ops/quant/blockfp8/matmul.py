@@ -2,8 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
-
 import torch
 
 from chitu.lazy import single_dispatch_lazy_tensor
@@ -68,6 +66,22 @@ def _auto_blockfp8_gemm(
     raise NotImplementedError("No supported implementation found for blockfp8_gemm")
 
 
+def blockfp8_gemm_wants_packed_ue8m0_scale(
+    *,
+    round_scale_to_pow2: bool = False,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+) -> bool:
+    """Mirror the SM100 DeepGEMM selection in `_auto_blockfp8_gemm`."""
+    return (
+        round_scale_to_pow2
+        and list(scale_block_shape) == list(DEFAULT_SCALE_BLOCK_SHAPE)
+        and torch.get_default_dtype() == torch.bfloat16
+        and has_deep_gemm
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 10
+    )
+
+
 @blockfp8_gemm.register("deep_gemm", available=has_deep_gemm)
 def blockfp8_gemm_deep_gemm(
     a: torch.Tensor,
@@ -91,6 +105,15 @@ def blockfp8_gemm_deep_gemm(
 
     if isinstance(b_s, DeepGemmScale):
         b_s = b_s.layout_tensor
+
+    # `a_s` may either be FP32 block scales (DeepGEMM converts them into the
+    # packed UE8M0 layout itself, one extra kernel per GEMM) or already be in
+    # that layout as an INT32 tensor, which DeepGEMM passes straight through.
+    # See `blockfp8_gemm_wants_packed_ue8m0_scale`.
+    if isinstance(a_s, torch.Tensor) and a_s.dtype == torch.int32:
+        assert (
+            torch.cuda.get_device_capability()[0] == 10
+        ), "Packed UE8M0 activation scales are only supported by DeepGEMM on sm_10x"
 
     c = a.new_empty(*a.shape[:-1], b.shape[0], dtype=torch.get_default_dtype())
     deep_gemm.fp8_gemm_nt((a, a_s), (b.view(torch.float8_e4m3fn), b_s), c)

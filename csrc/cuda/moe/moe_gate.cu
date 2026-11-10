@@ -95,6 +95,25 @@ struct alignas(Alignment) StoreArray {
     T data[N];
 };
 
+template <typename DST, typename SRC, int N>
+__device__ __forceinline__ void store_gate_row(DST *output,
+                                               const SRC (&values)[N]) {
+    constexpr int WIDTH = N == 8 ? 4 : 2;
+#pragma unroll
+    for (int i = 0; i < N; i += WIDTH) {
+        StoreArray<DST, WIDTH> vector;
+#pragma unroll
+        for (int j = 0; j < WIDTH; ++j) {
+            if constexpr (std::is_integral_v<SRC>) {
+                vector.data[j] = static_cast<DST>(values[i + j]);
+            } else {
+                vector.data[j] = to_scalar<DST>(values[i + j]);
+            }
+        }
+        *reinterpret_cast<StoreArray<DST, WIDTH> *>(output + i) = vector;
+    }
+}
+
 template <typename T, int EXPERTS, int BYTES_PER_LDG,
           int _ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T),
           int _VECs_PER_THREAD = (EXPERTS / (_ELTS_PER_LDG * WARP_SIZE) > 0)
@@ -145,8 +164,10 @@ template <typename T, typename BIAS_T, GateScoreFunc SF, GateTopkMode MODE,
 __global__ void __launch_bounds__(BLOCK_SIZE)
     fused_moe_gate_kernel(const T *input, const int batchSize,
                           const int n_groups, const int topK_groups,
-                          const int topInGroup, int *expertsIds,
-                          T *selectedExpertsWeights, const BIAS_T *bias)
+                          const int topInGroup, void *expertsIds,
+                          void *selectedExpertsWeights, const BIAS_T *bias,
+                          const float routed_scaling_factor,
+                          const bool int64_ids, const bool fp32_weights)
     requires(NUM_EXPERTS >= VPT)
 {
     static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
@@ -412,41 +433,85 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     int topK_expert_ids[TOPK];
 
     for (int kid = 0; kid < TOPK; ++kid) {
-        // First, each thread does the local argmax over the biased scores,
-        // tracking the unbiased score of the winner as the output weight.
-        BIAS_T max_val = row_chunk_bias_original[0];
-        T max_val_no_bias = row_chunk[0];
-        int expert_id = start_expert_id;
+        int expert_id;
+        T max_val_no_bias;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIPCC__) &&   \
+    !defined(__HIP_PLATFORM_AMD__) && !CHITU_MUXI_BUILD
+        // Disjoint sub-warp masks serialize hardware reductions. Keep the
+        // shuffle path for layouts with several rows in one warp.
+        if constexpr (THREADS_PER_ROW == WARP_SIZE) {
+            // Reduce the score and tie-breaking ID separately. The weight only
+            // needs one shuffle after the winning expert is known.
+            float max_score = to_float(row_chunk_bias_original[0]);
 #pragma unroll
-        for (int ldg = 0, experts = start_expert_id; ldg < LDG_PER_THREAD;
-             ++ldg, experts += ELTS_PER_LDG) {
+            for (int i = 1; i < VPT; ++i) {
+                max_score =
+                    fmaxf(max_score, to_float(row_chunk_bias_original[i]));
+            }
+            // Integer hardware reductions need an order-preserving float key.
+            unsigned int key = __float_as_uint(max_score);
+            key = (key & 0x80000000u) ? ~key : (key ^ 0x80000000u);
+            key = __reduce_max_sync(WARP_SHFL_MASK, key);
+            max_score = __uint_as_float(
+                (key & 0x80000000u) ? (key ^ 0x80000000u) : ~key);
+            expert_id = NUM_EXPERTS;
 #pragma unroll
-            for (int i = 0; i < ELTS_PER_LDG; ++i) {
-                BIAS_T val = row_chunk_bias_original[ldg * ELTS_PER_LDG + i];
-                if (gt(val, max_val)) {
-                    max_val = val;
-                    expert_id = experts + i;
-                    max_val_no_bias = row_chunk[ldg * ELTS_PER_LDG + i];
+            for (int i = 0; i < VPT; ++i) {
+                if (to_float(row_chunk_bias_original[i]) == max_score) {
+                    expert_id = min(expert_id, start_expert_id + i);
                 }
             }
-        }
+            expert_id = __reduce_min_sync(WARP_SHFL_MASK, expert_id);
+            float raw_score = 0.0f;
+#pragma unroll
+            for (int i = 0; i < VPT; ++i) {
+                if (start_expert_id + i == expert_id) {
+                    raw_score = to_float(row_chunk[i]);
+                }
+            }
+            max_val_no_bias = to_scalar<T>(__shfl_sync(
+                WARP_SHFL_MASK, raw_score, expert_id / VPT, THREADS_PER_ROW));
+        } else
+#endif
+        {
+            // First, each thread does the local argmax over the biased scores,
+            // tracking the unbiased score of the winner as the output weight.
+            BIAS_T max_val = row_chunk_bias_original[0];
+            max_val_no_bias = row_chunk[0];
+            expert_id = start_expert_id;
+#pragma unroll
+            for (int ldg = 0, experts = start_expert_id; ldg < LDG_PER_THREAD;
+                 ++ldg, experts += ELTS_PER_LDG) {
+#pragma unroll
+                for (int i = 0; i < ELTS_PER_LDG; ++i) {
+                    BIAS_T val =
+                        row_chunk_bias_original[ldg * ELTS_PER_LDG + i];
+                    if (gt(val, max_val)) {
+                        max_val = val;
+                        expert_id = experts + i;
+                        max_val_no_bias = row_chunk[ldg * ELTS_PER_LDG + i];
+                    }
+                }
+            }
 
 // Second, use butterfly to find the global max
 #pragma unroll
-        for (int mask = THREADS_PER_ROW / 2; mask > 0; mask >>= 1) {
-            BIAS_T other_max_val = CHITU_SHFL_XOR_SYNC(max_val, WARP_SHFL_MASK,
-                                                       mask, THREADS_PER_ROW);
-            int other_expert_id = CHITU_SHFL_XOR_SYNC(expert_id, WARP_SHFL_MASK,
-                                                      mask, THREADS_PER_ROW);
-            T other_max_val_no_bias = CHITU_SHFL_XOR_SYNC(
-                max_val_no_bias, WARP_SHFL_MASK, mask, THREADS_PER_ROW);
+            for (int mask = THREADS_PER_ROW / 2; mask > 0; mask >>= 1) {
+                BIAS_T other_max_val = CHITU_SHFL_XOR_SYNC(
+                    max_val, WARP_SHFL_MASK, mask, THREADS_PER_ROW);
+                int other_expert_id = CHITU_SHFL_XOR_SYNC(
+                    expert_id, WARP_SHFL_MASK, mask, THREADS_PER_ROW);
+                T other_max_val_no_bias = CHITU_SHFL_XOR_SYNC(
+                    max_val_no_bias, WARP_SHFL_MASK, mask, THREADS_PER_ROW);
 
-            // keep the lower expert_id "win"
-            if (gt(other_max_val, max_val) ||
-                (eq(other_max_val, max_val) && (other_expert_id < expert_id))) {
-                max_val = other_max_val;
-                expert_id = other_expert_id;
-                max_val_no_bias = other_max_val_no_bias;
+                // keep the lower expert_id "win"
+                if (gt(other_max_val, max_val) ||
+                    (eq(other_max_val, max_val) &&
+                     (other_expert_id < expert_id))) {
+                    max_val = other_max_val;
+                    expert_id = other_expert_id;
+                    max_val_no_bias = other_max_val_no_bias;
+                }
             }
         }
         // Third, record the winner. Only the first thread of the sub-group
@@ -459,11 +524,19 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 
         // Finally, clear the max value in buffer for next iteration
         if (kid + 1 < TOPK) {
-            const int thread_to_clear_in_group = expert_id / VPT;
-            if (threadIdInGroup == thread_to_clear_in_group) {
-                const int offset_for_expert = expert_id % VPT;
-                row_chunk_bias_original[offset_for_expert] =
-                    to_scalar<BIAS_T>(0.0f);
+            // Correction bias can make selection scores negative. Preserve
+            // direct indexing when a single thread owns the whole row.
+            if constexpr (THREADS_PER_ROW == 1) {
+                row_chunk_bias_original[expert_id] =
+                    to_scalar<BIAS_T>(-INFINITY);
+            } else {
+#pragma unroll
+                for (int i = 0; i < VPT; ++i) {
+                    if (start_expert_id + i == expert_id) {
+                        row_chunk_bias_original[i] =
+                            to_scalar<BIAS_T>(-INFINITY);
+                    }
+                }
             }
         }
     }
@@ -486,48 +559,31 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
                 }
             }
         }
-        const int output_offset = threadRow * TOPK;
-        if constexpr (TOPK == 6) {
-            using WeightVec2 = StoreArray<T, 2>;
-            using IdVec2 = StoreArray<int, 2>;
-#pragma unroll
-            for (int i = 0; i < 3; ++i) {
-                const int base = i * 2;
-                WeightVec2 weight_vec = {
-                    {topK_weights[base], topK_weights[base + 1]}};
-                IdVec2 id_vec = {
-                    {topK_expert_ids[base], topK_expert_ids[base + 1]}};
-                *reinterpret_cast<WeightVec2 *>(
-                    selectedExpertsWeights + output_offset + base) = weight_vec;
-                *reinterpret_cast<IdVec2 *>(expertsIds + output_offset + base) =
-                    id_vec;
-            }
-        } else if constexpr (TOPK == 8) {
-            using WeightVec8 = StoreArray<T, 8>;
-            using IdVec4 = StoreArray<int, 4>;
-            WeightVec8 weight_vec;
-            IdVec4 id_vec_0;
-            IdVec4 id_vec_1;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                weight_vec.data[i] = topK_weights[i];
-            }
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                id_vec_0.data[i] = topK_expert_ids[i];
-                id_vec_1.data[i] = topK_expert_ids[i + 4];
-            }
-            *reinterpret_cast<WeightVec8 *>(selectedExpertsWeights +
-                                            output_offset) = weight_vec;
-            *reinterpret_cast<IdVec4 *>(expertsIds + output_offset) = id_vec_0;
-            *reinterpret_cast<IdVec4 *>(expertsIds + output_offset + 4) =
-                id_vec_1;
-        } else {
+        if (routed_scaling_factor != 1.0f) {
 #pragma unroll
             for (int i = 0; i < TOPK; ++i) {
-                selectedExpertsWeights[output_offset + i] = topK_weights[i];
-                expertsIds[output_offset + i] = topK_expert_ids[i];
+                // Match scaling the rounded output in the input dtype before
+                // converting to the consumer's dtype.
+                topK_weights[i] = to_scalar<T>(to_float(topK_weights[i]) *
+                                               routed_scaling_factor);
             }
+        }
+        const int64_t output_offset = int64_t(threadRow) * TOPK;
+        if (int64_ids) {
+            store_gate_row(static_cast<int64_t *>(expertsIds) + output_offset,
+                           topK_expert_ids);
+        } else {
+            store_gate_row(static_cast<int *>(expertsIds) + output_offset,
+                           topK_expert_ids);
+        }
+        if (fp32_weights) {
+            store_gate_row(static_cast<float *>(selectedExpertsWeights) +
+                               output_offset,
+                           topK_weights);
+        } else {
+            store_gate_row(static_cast<T *>(selectedExpertsWeights) +
+                               output_offset,
+                           topK_weights);
         }
     }
 }
@@ -541,11 +597,13 @@ void fused_moe_gate_launcher(const torch::Tensor &input, const int batchSize,
                              torch::Tensor &selectedExpertsWeights,
                              const int topK, const int numExperts,
                              c10::optional<torch::Tensor> bias,
-                             cudaStream_t stream) {
+                             cudaStream_t stream, float routed_scaling_factor) {
     const T *input_ptr = reinterpret_cast<const T *>(input.data_ptr());
-    int *expertsIds_ptr = reinterpret_cast<int *>(expertsIds.data_ptr());
-    T *selectedExpertsWeights_ptr =
-        reinterpret_cast<T *>(selectedExpertsWeights.data_ptr());
+    void *expertsIds_ptr = expertsIds.data_ptr();
+    void *selectedExpertsWeights_ptr = selectedExpertsWeights.data_ptr();
+    const bool int64_ids = expertsIds.scalar_type() == at::ScalarType::Long;
+    const bool fp32_weights =
+        selectedExpertsWeights.scalar_type() == at::ScalarType::Float;
     const BIAS_T *bias_ptr =
         bias.has_value()
             ? reinterpret_cast<const BIAS_T *>(bias.value().data_ptr())
@@ -557,11 +615,15 @@ void fused_moe_gate_launcher(const torch::Tensor &input, const int batchSize,
         // uses 32 threads, so warp-shuffle reductions still have a
         // power-of-two width.
         constexpr int BYTES_PER_LDG = EXPERTS == 384 ? 8 : 16;
-        constexpr int BLOCK_SIZE = 256;
-
         using Constants = TopkConstants<T, EXPERTS, BYTES_PER_LDG>;
         constexpr int THREADS_PER_ROW = Constants::THREADS_PER_ROW;
         constexpr int VPT = Constants::VPT;
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__) && !CHITU_MUXI_BUILD
+        constexpr int BLOCK_SIZE =
+            THREADS_PER_ROW == WARP_SIZE ? WARP_SIZE : 256;
+#else
+        constexpr int BLOCK_SIZE = 256;
+#endif
         const int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
 
         if (n_groups > 1) {
@@ -588,14 +650,16 @@ void fused_moe_gate_launcher(const torch::Tensor &input, const int batchSize,
                                       NORMALIZE_TOPK>
                     <<<numBlocks, block_dim, 0, stream>>>(
                         input_ptr, batchSize, n_groups, topK_groups, topInGroup,
-                        expertsIds_ptr, selectedExpertsWeights_ptr, bias_ptr);
+                        expertsIds_ptr, selectedExpertsWeights_ptr, bias_ptr,
+                        routed_scaling_factor, int64_ids, fp32_weights);
             } else {
                 fused_moe_gate_kernel<T, BIAS_T, SF, GateTopkMode::Plain, VPT,
                                       EXPERTS, BLOCK_SIZE, BYTES_PER_LDG, TOPK,
                                       NORMALIZE_TOPK>
                     <<<numBlocks, block_dim, 0, stream>>>(
                         input_ptr, batchSize, n_groups, topK_groups, topInGroup,
-                        expertsIds_ptr, selectedExpertsWeights_ptr, bias_ptr);
+                        expertsIds_ptr, selectedExpertsWeights_ptr, bias_ptr,
+                        routed_scaling_factor, int64_ids, fp32_weights);
             }
         });
     });
@@ -606,7 +670,7 @@ void moe_gate_impl(torch::Tensor &linear_output, torch::Tensor &expertsIds,
                    torch::Tensor &selectedExpertsWeights, const int n_groups,
                    const int topK_groups, const int topInGroup,
                    const c10::optional<torch::Tensor> &bias,
-                   const GateScoreFunc scoreFunc) {
+                   const GateScoreFunc scoreFunc, float routed_scaling_factor) {
     const int seq_length = linear_output.size(0);
     const int num_experts = linear_output.size(1);
     const int topK = expertsIds.size(-1);
@@ -620,8 +684,9 @@ void moe_gate_impl(torch::Tensor &linear_output, torch::Tensor &expertsIds,
                 "moe_gate does not support empty input; skip the call instead");
     TORCH_CHECK(topK <= num_experts, "topk (", topK,
                 ") cannot exceed num_experts (", num_experts, ")");
-    TORCH_CHECK(expertsIds.scalar_type() == at::ScalarType::Int,
-                "expertsIds must be int32");
+    TORCH_CHECK(expertsIds.scalar_type() == at::ScalarType::Int ||
+                    expertsIds.scalar_type() == at::ScalarType::Long,
+                "expertsIds must be int32 or int64");
     TORCH_CHECK(expertsIds.size(0) == seq_length &&
                     selectedExpertsWeights.size(0) == seq_length &&
                     selectedExpertsWeights.size(1) == topK,
@@ -635,8 +700,9 @@ void moe_gate_impl(torch::Tensor &linear_output, torch::Tensor &expertsIds,
     }
 
     TORCH_CHECK(
-        linear_output.dtype() == selectedExpertsWeights.dtype(),
-        "Mismatched dtypes: linear_output and selected_experts_weights.");
+        linear_output.dtype() == selectedExpertsWeights.dtype() ||
+            selectedExpertsWeights.scalar_type() == at::ScalarType::Float,
+        "selected_experts_weights must have the input dtype or float32");
 
     if (bias.has_value()) {
         TORCH_CHECK(bias->dtype() == linear_output.dtype() ||
@@ -668,7 +734,7 @@ void moe_gate_impl(torch::Tensor &linear_output, torch::Tensor &expertsIds,
                                     NORMALIZE_TOPK>(
                 linear_output, seq_length, n_groups, topK_groups, topInGroup,
                 expertsIds, selectedExpertsWeights, topK, num_experts, bias,
-                stream);
+                stream, routed_scaling_factor);
         } else if (scoreFunc == GateScoreFunc::Sigmoid) {
             if (bias.has_value() &&
                 bias.value().scalar_type() == at::ScalarType::Float) {
@@ -676,13 +742,13 @@ void moe_gate_impl(torch::Tensor &linear_output, torch::Tensor &expertsIds,
                                         NORMALIZE_TOPK>(
                     linear_output, seq_length, n_groups, topK_groups,
                     topInGroup, expertsIds, selectedExpertsWeights, topK,
-                    num_experts, bias, stream);
+                    num_experts, bias, stream, routed_scaling_factor);
             } else {
                 fused_moe_gate_launcher<kernel_t, kernel_t,
                                         GateScoreFunc::Sigmoid, NORMALIZE_TOPK>(
                     linear_output, seq_length, n_groups, topK_groups,
                     topInGroup, expertsIds, selectedExpertsWeights, topK,
-                    num_experts, bias, stream);
+                    num_experts, bias, stream, routed_scaling_factor);
             }
         } else {
             if (bias.has_value() &&
@@ -692,14 +758,14 @@ void moe_gate_impl(torch::Tensor &linear_output, torch::Tensor &expertsIds,
                                         NORMALIZE_TOPK>(
                     linear_output, seq_length, n_groups, topK_groups,
                     topInGroup, expertsIds, selectedExpertsWeights, topK,
-                    num_experts, bias, stream);
+                    num_experts, bias, stream, routed_scaling_factor);
             } else {
                 fused_moe_gate_launcher<kernel_t, kernel_t,
                                         GateScoreFunc::SqrtSoftplus,
                                         NORMALIZE_TOPK>(
                     linear_output, seq_length, n_groups, topK_groups,
                     topInGroup, expertsIds, selectedExpertsWeights, topK,
-                    num_experts, bias, stream);
+                    num_experts, bias, stream, routed_scaling_factor);
             }
         }
     });
@@ -709,7 +775,7 @@ void moe_gate(torch::Tensor &linear_output, torch::Tensor &expertsIds,
               torch::Tensor &selectedExpertsWeights, const int n_groups,
               const int topK_groups, const int topInGroup,
               c10::optional<torch::Tensor> bias, std::string score_func,
-              const bool norm_prob) {
+              const bool norm_prob, const double routed_scaling_factor) {
     GateScoreFunc scoreFunc;
     if (score_func == "softmax") {
         scoreFunc = GateScoreFunc::Softmax;
@@ -726,11 +792,12 @@ void moe_gate(torch::Tensor &linear_output, torch::Tensor &expertsIds,
 
     if (norm_prob) {
         moe_gate_impl<true>(linear_output, expertsIds, selectedExpertsWeights,
-                            n_groups, topK_groups, topInGroup, bias, scoreFunc);
+                            n_groups, topK_groups, topInGroup, bias, scoreFunc,
+                            float(routed_scaling_factor));
     } else {
         moe_gate_impl<false>(linear_output, expertsIds, selectedExpertsWeights,
-                             n_groups, topK_groups, topInGroup, bias,
-                             scoreFunc);
+                             n_groups, topK_groups, topInGroup, bias, scoreFunc,
+                             float(routed_scaling_factor));
     }
 }
 

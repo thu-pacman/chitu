@@ -61,6 +61,10 @@ from chitu.distributed.partition import (
     compute_expert_dist_in_ep,
 )
 from chitu.moe import get_moe_impl, MoEImplBase
+from chitu.moe.token_dispatchers import (
+    MoELowLatencyTokenDispatcher,
+    MoENormalTokenDispatcher,
+)
 from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
 from chitu.moe.load_balancer import get_moe_load_planner
 
@@ -2531,6 +2535,7 @@ class MoeGate(nn.Module):
         self.e_score_correction_bias = e_score_correction_bias
         self.norm_prob = norm_prob
         self.n_fused_shared_experts = n_fused_shared_experts
+        self.output_dtypes: Optional[tuple[torch.dtype, torch.dtype]] = None
 
         if _debug_force_moe_balance is None:
             _debug_force_moe_balance = get_global_args().debug.force_moe_balance
@@ -2567,11 +2572,13 @@ class MoeGate(nn.Module):
         if x.shape[0] == 0:
             return torch.empty(
                 (0, self.topk + self.n_fused_shared_experts),
-                dtype=self.weight.dtype,
+                dtype=(
+                    self.output_dtypes[1] if self.output_dtypes else self.weight.dtype
+                ),
                 device=self.weight.device,
             ), torch.empty(
                 (0, self.topk + self.n_fused_shared_experts),
-                dtype=torch.int32,
+                dtype=self.output_dtypes[0] if self.output_dtypes else torch.int32,
                 device=self.weight.device,
             )
         scores = F.linear(x, self.weight, self.bias)
@@ -2596,11 +2603,12 @@ class MoeGate(nn.Module):
             e_score_correction_bias=e_score_correction_bias,
             score_func=self.score_func,
             norm_prob=self.norm_prob,
+            routed_scaling_factor=self.route_scale,
+            output_dtypes=self.output_dtypes,
         )
-        if self.route_scale != 1:
-            weights *= self.route_scale
-        weights = weights.type_as(x)
-        indices = indices.to(torch.int32)
+        if self.output_dtypes is None:
+            weights = weights.type_as(x)
+            indices = indices.to(torch.int32)
 
         if self.n_fused_shared_experts > 0:
             weights, indices = add_shared_experts(
@@ -2644,6 +2652,21 @@ class ParallelMoeBlock(nn.Module):
             moe_impl = get_moe_impl()
 
         self.gate = gate
+        # Both DeepEP dispatchers consume int64 IDs and float32 weights.
+        # Request that storage directly when both phases use DeepEP.
+        if (
+            type(gate).forward is MoeGate.forward
+            and gate.n_fused_shared_experts == 0
+            and isinstance(
+                getattr(moe_impl, "prefill_token_dispatcher", None),
+                MoENormalTokenDispatcher,
+            )
+            and isinstance(
+                getattr(moe_impl, "decode_token_dispatcher", None),
+                MoELowLatencyTokenDispatcher,
+            )
+        ):
+            gate.output_dtypes = (torch.int64, torch.float32)
         self.experts = experts
         self.shared_experts = non_fused_shared_experts
 

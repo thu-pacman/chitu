@@ -21,6 +21,34 @@ from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
 from chitu.utils import ceil_div
 
 
+def empty_deepgemm_packed_ue8m0_scale(
+    mn: int,
+    sf_k: int,
+    *,
+    num_groups: Optional[int] = None,
+    device=None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Allocate a scale buffer in DeepGEMM's packed UE8M0 sfa layout.
+
+    Returns ``(scale_view, flat_uint8_view, aligned_mn)`` where ``scale_view``
+    is the (strided) INT32 tensor to hand to DeepGEMM and ``flat_uint8_view``
+    aliases the whole padded storage as bytes, which is what the Triton kernels
+    write into.
+    """
+    packed_sf_k = ceil_div(sf_k, 4)
+    aligned_mn = ceil_div(mn, 4) * 4
+    n_groups = 1 if num_groups is None else num_groups
+    buf = torch.empty(
+        n_groups * packed_sf_k * aligned_mn, dtype=torch.int32, device=device
+    )
+    view = buf.as_strided(
+        (n_groups, mn, packed_sf_k), (packed_sf_k * aligned_mn, 1, aligned_mn)
+    )
+    if num_groups is None:
+        view = view.squeeze(0)
+    return view, buf.view(torch.uint8), aligned_mn
+
+
 @triton.jit
 def quant_fp8_e4m3fn_per_tensor(x_ptr, y_ptr, s_ptr, n, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
@@ -67,6 +95,7 @@ def blockfp8_act_quant_triton(
     *,
     scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     round_scale_to_pow2: bool = False,
+    packed_ue8m0: bool = False,
     eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -88,6 +117,12 @@ def blockfp8_act_quant_triton(
     assert (
         x.shape[-1] % block_size == 0
     ), f"Last dimension size must be divisible by scale block size (scale_block_shape={scale_block_shape}, in_blk={block_size})"
+
+    if packed_ue8m0:
+        return _blockfp8_act_quant_packed_ue8m0_triton(
+            x, block_size=block_size, round_scale_to_pow2=round_scale_to_pow2, eps=eps
+        )
+
     y = torch.empty(*x.shape, dtype=torch.float8_e4m3fn, device=x.device)
     s = torch.empty(
         *x.shape[:-1], x.shape[-1] // block_size, dtype=torch.float32, device=x.device
@@ -123,6 +158,7 @@ def _(
     *,
     scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     round_scale_to_pow2: bool = False,
+    packed_ue8m0: bool = False,
     eps: float = 1e-4,
 ):
     from chitu.ops import silu_and_mul_and_blockfp8_act_quant
@@ -135,6 +171,7 @@ def _(
         swiglu_beta=x.kwargs.get("swiglu_beta"),
         scale_block_shape=scale_block_shape,
         round_scale_to_pow2=round_scale_to_pow2,
+        packed_ue8m0=packed_ue8m0,
         eps=eps,
         impl="triton",
     )
@@ -222,6 +259,126 @@ def blockfp8_act_quant_kernel(
     tl.store(s_ptr + s_offs, s)
 
 
+@triton.jit
+def blockfp8_act_quant_packed_ue8m0_kernel(
+    x_ptr,
+    y_ptr,
+    s8_ptr,  # uint8 alias of the packed int32 scale buffer
+    stride_xg,
+    stride_xm,
+    stride_yg,
+    stride_ym,
+    stride_sg,  # in int32 elements: packed_sf_k * aligned_mn
+    stride_sk,  # in int32 elements: aligned_mn
+    mn,
+    sf_k,
+    BLOCK_SIZE: tl.constexpr,
+    EPS: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
+):
+    """Block-quantize `x` and emit DeepGEMM's packed UE8M0 scale layout.
+
+    One program handles the 4 consecutive k-blocks that share one packed int32
+    scale element, for one row. Programs with ``row >= mn`` only zero the TMA
+    alignment padding rows of the scale tensor.
+    """
+    row = tl.program_id(axis=0)
+    pk = tl.program_id(axis=1)
+    g = tl.program_id(axis=2)
+
+    lanes = tl.arange(0, 4)
+    s8_offs = (
+        tl.cast(
+            tl.cast(g, INDEX_DTYPE) * stride_sg
+            + tl.cast(pk, INDEX_DTYPE) * stride_sk
+            + tl.cast(row, INDEX_DTYPE),
+            INDEX_DTYPE,
+        )
+        * 4
+        + lanes
+    )
+
+    if row < mn:
+        k_ids = pk * 4 + lanes
+        valid = k_ids < sf_k
+        blk_offs = (
+            tl.cast(k_ids, INDEX_DTYPE)[:, None] * BLOCK_SIZE
+            + tl.arange(0, BLOCK_SIZE)[None, :]
+        )
+        x_offs = (
+            tl.cast(g, INDEX_DTYPE) * stride_xg
+            + tl.cast(row, INDEX_DTYPE) * stride_xm
+            + blk_offs
+        )
+        y_offs = (
+            tl.cast(g, INDEX_DTYPE) * stride_yg
+            + tl.cast(row, INDEX_DTYPE) * stride_ym
+            + blk_offs
+        )
+        x = tl.load(x_ptr + x_offs, mask=valid[:, None], other=0.0).to(tl.float32)
+        amax = tl.maximum(tl.max(tl.abs(x), axis=1), EPS)
+        s = fast_round_scale(amax, 1.0 / 448.0)
+        y = (x / s[:, None]).to(y_ptr.dtype.element_ty)
+        tl.store(y_ptr + y_offs, y, mask=valid[:, None])
+        # UE8M0 = the FP32 exponent field of a power-of-two scale (the sign bit
+        # is always 0 here, so an arithmetic shift yields the exponent directly)
+        exponent = tl.cast(s, tl.int32, bitcast=True) >> 23
+        exponent = tl.where(valid, exponent, 0)
+        tl.store(s8_ptr + s8_offs, exponent.to(tl.uint8))
+    else:
+        tl.store(s8_ptr + s8_offs, (lanes * 0).to(tl.uint8))
+
+
+def _blockfp8_act_quant_packed_ue8m0_triton(
+    x: torch.Tensor,
+    *,
+    block_size: int,
+    round_scale_to_pow2: bool,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not round_scale_to_pow2:
+        raise ValueError(
+            "packed_ue8m0 scales require round_scale_to_pow2=True (UE8M0 stores "
+            "only the exponent of the scale)"
+        )
+    assert x.dim() in (2, 3), "packed UE8M0 scales support 2D or 3D activations"
+    assert x.stride(-1) == 1, "Input tensor must be contiguous in the last dimension"
+
+    num_groups = None if x.dim() == 2 else x.shape[0]
+    mn, hidden_dim = x.shape[-2], x.shape[-1]
+    sf_k = hidden_dim // block_size
+
+    y = torch.empty(*x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    s, s8, aligned_mn = empty_deepgemm_packed_ue8m0_scale(
+        mn, sf_k, num_groups=num_groups, device=x.device
+    )
+    packed_sf_k = ceil_div(sf_k, 4)
+
+    if x.numel() >= 2147483648 or y.numel() >= 2147483648:
+        INDEX_DTYPE = tl.int64
+    else:
+        INDEX_DTYPE = tl.int32
+
+    grid = (aligned_mn, packed_sf_k, 1 if num_groups is None else num_groups)
+    blockfp8_act_quant_packed_ue8m0_kernel[grid](
+        x,
+        y,
+        s8,
+        stride_xg=x.stride(0) if x.dim() == 3 else 0,
+        stride_xm=x.stride(-2),
+        stride_yg=y.stride(0) if y.dim() == 3 else 0,
+        stride_ym=y.stride(-2),
+        stride_sg=packed_sf_k * aligned_mn,
+        stride_sk=aligned_mn,
+        mn=mn,
+        sf_k=sf_k,
+        BLOCK_SIZE=block_size,
+        EPS=eps,
+        INDEX_DTYPE=INDEX_DTYPE,
+    )
+    return y, s
+
+
 @auto_retry_triton_compilation
 def silu_and_mul_and_blockfp8_act_quant_triton(
     x: torch.Tensor,
@@ -232,24 +389,42 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
     swiglu_beta: Optional[float] = None,
     scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     round_scale_to_pow2: bool = False,
+    packed_ue8m0: bool = False,
     eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (swiglu_alpha is None) != (swiglu_beta is None):
         raise ValueError("swiglu_alpha and swiglu_beta must be specified together")
     is_swiglu_oai = swiglu_alpha is not None
     block_size = scale_block_shape[1]
+    if packed_ue8m0 and not round_scale_to_pow2:
+        raise ValueError(
+            "packed_ue8m0 scales require round_scale_to_pow2=True (UE8M0 stores "
+            "only the exponent of the scale)"
+        )
 
     if expert_n_tokens is not None:
         assert x.shape[-1] % (2 * block_size) == 0
         output = torch.empty(
             *x.shape[:-1], x.shape[-1] // 2, dtype=torch.float8_e4m3fn, device=x.device
         )
-        output_scale = torch.empty(
-            *x.shape[:-1],
-            x.shape[-1] // 2 // block_size,
-            dtype=torch.float32,
-            device=x.device,
-        )
+        if packed_ue8m0:
+            assert x.dim() == 3, "Masked SiLU+quant expects [E, M, 2 * N]"
+            output_scale, output_scale_u8, aligned_mn = (
+                empty_deepgemm_packed_ue8m0_scale(
+                    x.shape[1],
+                    x.shape[-1] // 2 // block_size,
+                    num_groups=x.shape[0],
+                    device=x.device,
+                )
+            )
+        else:
+            output_scale = torch.empty(
+                *x.shape[:-1],
+                x.shape[-1] // 2 // block_size,
+                dtype=torch.float32,
+                device=x.device,
+            )
+            output_scale_u8, aligned_mn = None, 0
         silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
             x,
             output,
@@ -261,6 +436,8 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
             swiglu_beta=swiglu_beta,
             scale_ue8m0=round_scale_to_pow2,
             eps=eps,
+            packed_output_scale_u8=output_scale_u8,
+            packed_aligned_mn=aligned_mn,
         )
         return output, output_scale
 
@@ -268,6 +445,17 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
     assert (
         x.size(-1) % (2 * block_size) == 0
     ), f"Last dimension size must be divisible by scale block size (scale_block_shape={scale_block_shape}, in_blk={block_size})"
+
+    if packed_ue8m0:
+        return _silu_and_mul_and_blockfp8_act_quant_packed_ue8m0_triton(
+            x,
+            block_size=block_size,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            eps=eps,
+        )
+
     y = torch.empty(
         *x.shape[:-1], x.shape[-1] // 2, dtype=torch.float8_e4m3fn, device=x.device
     )
@@ -360,6 +548,116 @@ def silu_and_mul_and_blockfp8_act_quant_kernel(
     tl.store(s_ptr + pid, s)
 
 
+@triton.jit
+def silu_and_mul_and_blockfp8_act_quant_packed_ue8m0_kernel(
+    x_ptr,
+    y_ptr,
+    s8_ptr,  # uint8 alias of the packed int32 scale buffer
+    mn,
+    sf_k,
+    HIDDEN_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ALIGNED_MN,
+    EPS: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
+    HAS_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
+    HAS_SWIGLU_OAI: tl.constexpr,
+    SWIGLU_ALPHA: tl.constexpr,
+    SWIGLU_BETA: tl.constexpr,
+):
+    """Fused SiLU+mul+quant emitting DeepGEMM's packed UE8M0 scale layout."""
+    row = tl.program_id(axis=0)
+    pk = tl.program_id(axis=1)
+
+    lanes = tl.arange(0, 4)
+    s8_offs = (
+        tl.cast(pk, INDEX_DTYPE) * ALIGNED_MN + tl.cast(row, INDEX_DTYPE)
+    ) * 4 + lanes
+
+    if row < mn:
+        k_ids = pk * 4 + lanes
+        valid = k_ids < sf_k
+        blk_offs = (
+            tl.cast(k_ids, INDEX_DTYPE)[:, None] * BLOCK_SIZE
+            + tl.arange(0, BLOCK_SIZE)[None, :]
+        )
+        x1_offs = tl.cast(row, INDEX_DTYPE) * (2 * HIDDEN_DIM) + blk_offs
+        x2_offs = x1_offs + HIDDEN_DIM
+        y_offs = tl.cast(row, INDEX_DTYPE) * HIDDEN_DIM + blk_offs
+
+        x1 = tl.load(x_ptr + x1_offs, mask=valid[:, None], other=0.0).to(tl.float32)
+        x2 = tl.load(x_ptr + x2_offs, mask=valid[:, None], other=0.0).to(tl.float32)
+        x1_fp32 = x1.to(tl.float32)
+        x2_fp32 = x2.to(tl.float32)
+        if HAS_SWIGLU_LIMIT:
+            x1_fp32 = tl.minimum(x1_fp32, SWIGLU_LIMIT)
+            x2_fp32 = tl.minimum(tl.maximum(x2_fp32, -SWIGLU_LIMIT), SWIGLU_LIMIT)
+        if HAS_SWIGLU_OAI:
+            sig = 1.0 / (1.0 + tl.exp(-SWIGLU_ALPHA * x1_fp32))
+            x = (x1_fp32 * sig * (x2_fp32 + SWIGLU_BETA)).to(x1.dtype)
+        else:
+            silu_x1_fp32 = x1_fp32 / (1 + tl.exp(-1 * x1_fp32))
+            silu_x1 = silu_x1_fp32.to(x1.dtype)
+            x = silu_x1 * x2_fp32.to(x2.dtype)
+
+        amax = tl.maximum(tl.max(tl.abs(x), axis=1), EPS)
+        s = fast_round_scale(amax, 1.0 / 448.0)
+        y = (x / s[:, None]).to(y_ptr.dtype.element_ty)
+        tl.store(y_ptr + y_offs, y, mask=valid[:, None])
+        exponent = tl.cast(s, tl.int32, bitcast=True) >> 23
+        exponent = tl.where(valid, exponent, 0)
+        tl.store(s8_ptr + s8_offs, exponent.to(tl.uint8))
+    else:
+        tl.store(s8_ptr + s8_offs, (lanes * 0).to(tl.uint8))
+
+
+def _silu_and_mul_and_blockfp8_act_quant_packed_ue8m0_triton(
+    x: torch.Tensor,
+    *,
+    block_size: int,
+    swiglu_limit: Optional[float],
+    swiglu_alpha: Optional[float],
+    swiglu_beta: Optional[float],
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    is_swiglu_oai = swiglu_alpha is not None
+    # The packed scale layout is defined over a 2D `[mn, k]` activation, so
+    # collapse the leading dimensions (the caller feeds the result to a 2D GEMM).
+    x2d = x.reshape(-1, x.shape[-1])
+    mn = x2d.shape[0]
+    hidden_dim = x2d.shape[-1] // 2
+    sf_k = hidden_dim // block_size
+
+    y = torch.empty(mn, hidden_dim, dtype=torch.float8_e4m3fn, device=x.device)
+    s, s8, aligned_mn = empty_deepgemm_packed_ue8m0_scale(mn, sf_k, device=x.device)
+
+    if x.numel() >= 2147483648:
+        INDEX_DTYPE = tl.int64
+    else:
+        INDEX_DTYPE = tl.int32
+
+    grid = (aligned_mn, ceil_div(sf_k, 4))
+    silu_and_mul_and_blockfp8_act_quant_packed_ue8m0_kernel[grid](
+        x2d,
+        y,
+        s8,
+        mn=mn,
+        sf_k=sf_k,
+        HIDDEN_DIM=hidden_dim,
+        BLOCK_SIZE=block_size,
+        ALIGNED_MN=aligned_mn,
+        EPS=eps,
+        INDEX_DTYPE=INDEX_DTYPE,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None,
+        SWIGLU_LIMIT=float(swiglu_limit) if swiglu_limit is not None else 0.0,
+        HAS_SWIGLU_OAI=is_swiglu_oai,
+        SWIGLU_ALPHA=float(swiglu_alpha) if is_swiglu_oai else 0.0,
+        SWIGLU_BETA=float(swiglu_beta) if is_swiglu_oai else 0.0,
+    )
+    return y, s
+
+
 # SPDX-SnippetBegin
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-SnippetCopyrightText: 2025 ModelTC Team
@@ -385,9 +683,12 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask_kernel(
     size_n,
     fp8_max,
     fp8_min,
+    ALIGNED_MN,
     BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
+    PACKED_UE8M0: tl.constexpr,
+    SF_K: tl.constexpr,
     EPS: tl.constexpr,
     HAS_SWIGLU_LIMIT: tl.constexpr,
     SWIGLU_LIMIT: tl.constexpr,
@@ -411,11 +712,24 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask_kernel(
     offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
     input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
     output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
-    output_scale_offs = (
-        output_scale_ptr
-        + expert_id * stride_output_scale_0
-        + hidden_dim_block_index * stride_output_scale_2
-    )
+    if PACKED_UE8M0:
+        # `output_scale_ptr` aliases DeepGEMM's packed int32 scale buffer as
+        # bytes; byte `k % 4` of int32 element `[expert, token, k // 4]`.
+        output_scale_offs = (
+            output_scale_ptr
+            + (
+                tl.cast(expert_id, tl.int64) * ((SF_K + 3) // 4) * ALIGNED_MN
+                + tl.cast(hidden_dim_block_index // 4, tl.int64) * ALIGNED_MN
+            )
+            * 4
+            + (hidden_dim_block_index % 4)
+        )
+    else:
+        output_scale_offs = (
+            output_scale_ptr
+            + expert_id * stride_output_scale_0
+            + hidden_dim_block_index * stride_output_scale_2
+        )
 
     for token_index in tl.range(
         token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
@@ -453,10 +767,26 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask_kernel(
             output_q,
             mask=offs_in_d < size_n,
         )
-        tl.store(
-            output_scale_offs + token_index * stride_output_scale_1,
-            output_s,
-        )
+        if PACKED_UE8M0:
+            exponent = tl.cast(output_s, tl.int32, bitcast=True) >> 23
+            tl.store(
+                output_scale_offs + token_index * 4,
+                exponent.to(tl.uint8),
+            )
+            if SF_K % 4 != 0:
+                # Zero the unused high bytes of the last packed int32
+                if hidden_dim_block_index == SF_K - 1:
+                    lanes = tl.arange(0, 4)
+                    tl.store(
+                        output_scale_offs + token_index * 4 - (SF_K % 4 - 1) + lanes,
+                        (lanes * 0).to(tl.uint8),
+                        mask=lanes >= SF_K % 4,
+                    )
+        else:
+            tl.store(
+                output_scale_offs + token_index * stride_output_scale_1,
+                output_s,
+            )
 
 
 # SPDX-SnippetEnd
@@ -482,6 +812,8 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
     swiglu_beta: Optional[float] = None,
     scale_ue8m0: bool = False,
     eps: float = 1e-4,
+    packed_output_scale_u8: Optional[torch.Tensor] = None,
+    packed_aligned_mn: int = 0,
 ):
     """
     input shape [expert_num, token_num_padded, hidden_dim]
@@ -489,7 +821,14 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
     output_scale [expert_num token_num_paddded, hidden_dim // 2 // 128] dtype float32
     quant_group_size  int,
     masked_m shape [expert_num],
+
+    When ``packed_output_scale_u8`` is given, ``output_scale`` is DeepGEMM's
+    packed UE8M0 int32 view and the kernel writes the exponent bytes through the
+    uint8 alias instead (see ``empty_deepgemm_packed_ue8m0_scale``).
     """
+    packed_ue8m0 = packed_output_scale_u8 is not None
+    if packed_ue8m0 and not scale_ue8m0:
+        raise ValueError("packed UE8M0 scales require scale_ue8m0=True")
     if (swiglu_alpha is None) != (swiglu_beta is None):
         raise ValueError("swiglu_alpha and swiglu_beta must be specified together")
     is_swiglu_oai = swiglu_alpha is not None
@@ -532,16 +871,19 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
         *input.stride(),
         output,
         *output.stride(),
-        output_scale,
-        *output_scale.stride(),
+        packed_output_scale_u8 if packed_ue8m0 else output_scale,
+        *((0, 0, 0) if packed_ue8m0 else output_scale.stride()),
         masked_m,
         size_n,
         fp8_max,
         fp8_min,
+        packed_aligned_mn,
         BLOCK_N=BLOCK_N,
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
+        PACKED_UE8M0=packed_ue8m0,
+        SF_K=hidden_dim_split_block_num,
         EPS=eps,
         HAS_SWIGLU_LIMIT=swiglu_limit is not None,
         SWIGLU_LIMIT=float(swiglu_limit) if swiglu_limit is not None else 0.0,

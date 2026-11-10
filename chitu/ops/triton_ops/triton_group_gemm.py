@@ -253,6 +253,7 @@ def fused_moe_kernel_block_fp8(
     SCALE_IS_UE8M0: tl.constexpr,
     per_channel_quant: tl.constexpr,
 ):
+    PACKED_UE8M0: tl.constexpr = b_scale_ptr.dtype.element_ty == tl.int32
     fp8_to_fp32_scale = tl.cast(0x7B800000, dtype=tl.float32, bitcast=True)
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -302,15 +303,11 @@ def fused_moe_kernel_block_fp8(
     if group_k > 0 and group_n > 0:
         if not soft_fp8:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-        if group_n == 1:
-            b_scale_n_ptrs = (
-                b_scale_ptr + off_experts * stride_bse + offs_bn * stride_bsn
-            )
+        if group_n == 1 or PACKED_UE8M0:
+            offs_bsn = offs_bn
         else:
             offs_bsn = offs_bn // group_n
-            b_scale_ptrs = (
-                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
-            )
+        b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
     elif per_channel_quant:
         # per-channel: b_scale shape [E, N], load per output channel
         b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bn * stride_bsn
@@ -336,8 +333,11 @@ def fused_moe_kernel_block_fp8(
         if group_k > 0 and group_n > 0:
             k_start = k * BLOCK_SIZE_K
             offs_ks = k_start // group_k
-            if group_n == 1:
-                b_scale = tl.load(b_scale_n_ptrs + offs_ks * stride_bsk)
+            if PACKED_UE8M0:
+                # DeepGEMM broadcasts scales along N and packs four K-block
+                # exponents into each int32. Read that layout without unpacking.
+                packed = tl.load(b_scale_ptrs + (offs_ks // 4) * stride_bsk)
+                b_scale = (packed.to(tl.uint32) >> ((offs_ks % 4) * 8)) & 255
             else:
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
 
@@ -347,7 +347,7 @@ def fused_moe_kernel_block_fp8(
                 )  # Do signed cast to copy the sign bit
                 t = (t << 20) & SIGNED_INT32_0x87F00000
                 b_unscaled_fp32 = t.to(tl.float32, bitcast=True)
-                if SCALE_IS_UE8M0:
+                if SCALE_IS_UE8M0 or PACKED_UE8M0:
                     b_s = (b_scale.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
                 else:
                     b_s = b_scale.to(tl.float32)
@@ -359,7 +359,7 @@ def fused_moe_kernel_block_fp8(
                 a_scale = tl.load(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
-                if SCALE_IS_UE8M0:
+                if SCALE_IS_UE8M0 or PACKED_UE8M0:
                     b_s = (b_scale.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
                 else:
                     b_s = b_scale.to(tl.float32)
