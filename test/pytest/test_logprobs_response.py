@@ -85,7 +85,10 @@ def make_data_stream():
 
 
 def make_response(top_logprobs=None):
-    async_stream = StaticAsyncStream([("2", False, ([-0.1], ["2"]))])
+    entries = 2 if top_logprobs is not None and top_logprobs > 0 else 1
+    async_stream = StaticAsyncStream(
+        [("2", False, ([-0.1] * entries, ["2"] * entries))]
+    )
     req = SimpleNamespace(
         request_id="req-logprobs",
         async_stream=async_stream,
@@ -162,3 +165,66 @@ def test_full_response_handles_top_logprobs(top_logprobs, expected_count):
         "top_logprobs"
     ]
     assert len(response_top_logprobs) == expected_count
+
+
+@pytest.mark.parametrize("accepted_prefix", [[], [1]])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("top_logprobs", [None, 0, 1, 2])
+@pytest.mark.parametrize("sampled_token, sampled_logprob", [(2, -0.2), (3, -2.4)])
+def test_response_final_token_logprob_matches_sampled_token(
+    accepted_prefix, streaming, top_logprobs, sampled_token, sampled_logprob
+):
+    """The retained probability row describes the last accepted token."""
+    response = make_response(top_logprobs)
+    stream = make_data_stream()
+    stream.output_parser.params = SimpleNamespace(enable_reasoning=False)
+    response.req.async_stream = stream
+    response.async_stream = stream
+    accepted_tokens = accepted_prefix + [sampled_token]
+    expected_text = "".join(str(token) for token in accepted_tokens)
+    response.req.output = expected_text
+    batch_result = SimpleNamespace(
+        tasks=[SimpleNamespace(req=response.req)],
+        tokens=[accepted_tokens],
+        return_logprobs=True,
+        logprobs=torch.tensor([[-0.2, -1.7, -2.4]], dtype=torch.float64),
+        token_idxs=torch.tensor([[2, 1, 3]]),
+    )
+    sink = RecordingTokenSink()
+    executor = Executor.__new__(Executor)
+    executor.get_token_sink = lambda: sink
+    executor.postprocess_async_part(batch_result)
+    for token in sink.token_list[0]:
+        stream.add_data(
+            token,
+            sink.logprobs_list[0],
+            sink.token_idxs_list[0],
+            notify_server=False,
+        )
+    stream.stop_signal = True
+
+    async def collect_choice():
+        if streaming:
+            chunks = [
+                chunk async for chunk in response.stream_generator(include_usage=False)
+            ]
+            choices = [
+                json.loads(chunk.removeprefix("data: "))["choices"][0]
+                for chunk in chunks[:-2]
+            ]
+            assert "".join(c["delta"]["content"] for c in choices) == expected_text
+            choice = choices[-1]
+        else:
+            choice = (await response.full_generator()).choices[0]
+            assert choice["message"]["content"] == expected_text
+        return choice
+
+    choice = asyncio.run(collect_choice())
+    token_logprob = choice["logprobs"]["content"][-1]
+    assert token_logprob["token"] == str(sampled_token)
+    assert token_logprob["logprob"] == pytest.approx(sampled_logprob)
+    expected_candidates = [
+        {"token": "2", "logprob": -0.2},
+        {"token": "1", "logprob": -1.7},
+    ][: top_logprobs or 0]
+    assert token_logprob["top_logprobs"] == expected_candidates

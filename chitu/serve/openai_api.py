@@ -466,8 +466,8 @@ class AsyncResponse:
                             logprobs = {"content": []}
                             logprobs["content"].append(
                                 {
-                                    "token": top_tokens[0],
-                                    "logprob": top_logprobs[0],
+                                    "token": top_tokens[-1],
+                                    "logprob": top_logprobs[-1],
                                     "top_logprobs": [],
                                 }
                             )
@@ -475,7 +475,9 @@ class AsyncResponse:
                                 self.req.top_logprobs is not None
                                 and self.req.top_logprobs > 0
                             ):
-                                for logprob, token in zip(top_logprobs, top_tokens):
+                                for logprob, token in zip(
+                                    top_logprobs[:-1], top_tokens[:-1]
+                                ):
                                     logprobs["content"][-1]["top_logprobs"].append(
                                         {
                                             "token": token,
@@ -591,13 +593,13 @@ class AsyncResponse:
             for top_logprobs, top_tokens in zip(top_logprobs_list, top_tokens_list):
                 logprobs["content"].append(
                     {
-                        "token": top_tokens[0],
-                        "logprob": top_logprobs[0],
+                        "token": top_tokens[-1],
+                        "logprob": top_logprobs[-1],
                         "top_logprobs": [],
                     }
                 )
                 if self.req.top_logprobs is not None and self.req.top_logprobs > 0:
-                    for logprob, token in zip(top_logprobs, top_tokens):
+                    for logprob, token in zip(top_logprobs[:-1], top_tokens[:-1]):
                         logprobs["content"][-1]["top_logprobs"].append(
                             {
                                 "token": token,
