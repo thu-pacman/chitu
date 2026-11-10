@@ -3,7 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+import torch.nn.functional as F
 from typing import Optional
+
+from typing_extensions import override
 
 from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.global_vars import get_global_args
@@ -11,7 +14,11 @@ from chitu.utils import (
     ceil_div,
 )
 from chitu.quantization.registry import QuantizationRegistry
-from chitu.quantization.base import QuantizedLinearBase, QuantizedMoeExpertsMerged
+from chitu.quantization.base import (
+    QuantizedLinearBase,
+    QuantizedMoeExpertsMerged,
+    QuantizedMoeExpertsUnmerged,
+)
 from chitu.native_layout import (
     NativeLayoutMixin,
     Packed4BitWeightAlongKContig,
@@ -21,6 +28,9 @@ from chitu.ops import (
     situ_and_mul,
     linear,
 )
+
+
+MXFP4_GROUP_SIZE = 32
 
 
 def _require_contiguous_packed_mxfp4_weight(weight: torch.nn.Parameter) -> None:
@@ -230,6 +240,118 @@ class MXFP4MoeExpertsBase(NativeLayoutMixin, QuantizedMoeExpertsMerged):
                 gate_up_out, beta=situ_beta, linear_beta=situ_linear_beta
             )
         return super().forward_act_fn_merged(gate_up_out)
+
+
+class MXFP4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
+    """Shared implementation of unmerged MXFP4 routed experts.
+
+    Not registered by itself: backends select it via
+    ``QuantizationRegistry.register_moe_experts(..., merge_gate_up=False)``
+    (see :mod:`chitu.quantization.mxfp4_gcu`), so device-specific behaviour is
+    expressed by the registration rather than by a separate implementation.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        moe_inter_dim: int,
+        global_n_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
+        n_activated_experts: int,
+        checkpoint_prefix: str,
+    ):
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            global_n_experts,
+            experts_start_idx,
+            experts_end_idx,
+            n_activated_experts,
+            checkpoint_prefix,
+        )
+
+        scale_in_features = ceil_div(dim, MXFP4_GROUP_SIZE)
+        down_scale_in_features = ceil_div(moe_inter_dim, MXFP4_GROUP_SIZE)
+
+        self.gate_proj_weight = torch.nn.Parameter(
+            torch.empty(self.group_size, moe_inter_dim, dim // 2, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        self.gate_proj_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size, moe_inter_dim, scale_in_features, dtype=torch.uint8
+            ),
+            requires_grad=False,
+        )
+        self.up_proj_weight = torch.nn.Parameter(
+            torch.empty(self.group_size, moe_inter_dim, dim // 2, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        self.up_proj_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size, moe_inter_dim, scale_in_features, dtype=torch.uint8
+            ),
+            requires_grad=False,
+        )
+        self.down_proj_weight = torch.nn.Parameter(
+            torch.empty(self.group_size, dim, moe_inter_dim // 2, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        self.down_proj_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                dim,
+                down_scale_in_features,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+
+    @staticmethod
+    def _dequant_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return mxfp4_weight_dequant(weight, scale, MXFP4_GROUP_SIZE).to(
+            torch.get_default_dtype()
+        )
+
+    @override
+    def forward_ith_expert_gate(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if x_scale is not None:
+            raise ValueError(
+                "The MXFP4 BF16 fallback does not accept quantized activations"
+            )
+        return F.linear(
+            x,
+            self._dequant_weight(
+                self.gate_proj_weight[i], self.gate_proj_weight_scale[i]
+            ),
+        )
+
+    @override
+    def forward_ith_expert_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if x_scale is not None:
+            raise ValueError(
+                "The MXFP4 BF16 fallback does not accept quantized activations"
+            )
+        return F.linear(
+            x,
+            self._dequant_weight(
+                self.up_proj_weight[i], self.up_proj_weight_scale[i]
+            ),
+        )
+
+    @override
+    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(
+            x,
+            self._dequant_weight(
+                self.down_proj_weight[i], self.down_proj_weight_scale[i]
+            ),
+        )
 
 
 def _moe_activation_params() -> tuple[str, float, Optional[float]]:
