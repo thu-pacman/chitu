@@ -63,6 +63,7 @@
 | Kimi-K2.7-Code |  | `models=Kimi-K2.7-Code` | https://huggingface.co/moonshotai/Kimi-K2.7-Code |
 | Kimi-K2.7-Code-kv-e5m2 |  | `models=Kimi-K2.7-Code-kv-e5m2` | https://huggingface.co/moonshotai/Kimi-K2.7-Code |
 | Kimi-K3 | ✓ | `models=Kimi-K3` | https://huggingface.co/moonshotai/Kimi-K3 |
+| Kimi-K3.1-Pro | ✓ | `models=Kimi-K3.1-Pro` | https://huggingface.co/moonshotai/Kimi-K3.1-Pro |
 | LLaDA2.1-flash |  | `models=LLaDA2.1-flash` | https://huggingface.co/inclusionAI/LLaDA2.0-flash |
 | LLaDA2.1-mini |  | `models=LLaDA2.1-mini` | https://huggingface.co/inclusionAI/LLaDA2.0-mini |
 | Llama-3-8B-QServe |  | `models=Llama-3-8B-QServe` | https://huggingface.co/mit-han-lab/Llama-3-8B-QServe |

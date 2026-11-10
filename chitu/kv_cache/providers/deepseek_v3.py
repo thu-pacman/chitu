@@ -47,11 +47,14 @@ def _deepseek_v3_paged_block_size(args, attn_backend_type, *, cache_name: str):
     return 64
 
 
+# KIMI_K3 is gated on index_head_dim: Kimi-K3 (no DSA config) resolves to no
+# spec, while Kimi-K3.1 (config carries the DSA fields) builds the indexer
+# cache over its full-attention layers.
 @register_kv_cache_spec(
     predicate=lambda args, cache_name: bool(
         cache_name == "indexer"
         and _normalize_model_type(getattr(getattr(args, "models", args), "type", None))
-        in (ModelType.DEEPSEEK_V3, ModelType.GLM_5_2)
+        in (ModelType.DEEPSEEK_V3, ModelType.GLM_5_2, ModelType.KIMI_K3)
         and getattr(getattr(args, "models", args), "index_head_dim", None)
     ),
     priority=2,
