@@ -40,6 +40,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
 from chitu.distributed.pd_disaggregation.pd_types import PDRequestStatus
+from chitu.metrics.task_stats import kv_send_inflight_request_ids
 from chitu.metrics.prometheus_collector import (
     inc_request_timeouts,
     observe_stage_duration,
@@ -280,6 +281,10 @@ class PDInstanceRequestManager:
             self.kv_manager.set_transfer_failure_callback(
                 self._handle_kv_transfer_failure
             )
+            # The Prefill stall sweep reports a stuck transfer to the Router
+            # itself: by then the request is already out of the pool, and a
+            # notification queue drained by a tick would never run.
+            self.kv_manager.set_token_sender(token_manager.token_sender)
             for scheduler in Backend.schedulers or []:
                 scheduler._pd_exceeds_capacity_callback = self._send_error_for_request
                 # TTFT drop in base prefill admission also needs prefill_failed for peer notify.
@@ -412,7 +417,39 @@ class PDInstanceRequestManager:
             # Unified mode owns no KV transfer state; just drop the local task.
             return abort_task(request_id)
 
+        in_flight = request_id in kv_send_inflight_request_ids()
+        if not in_flight:
+            # `kv_send_inflight_request_ids()` is a per-process registry, so with
+            # TP > 1 it only reports this rank's marker: the other ranks of the
+            # instance can still be writing KV blocks. The Prefill TaskInfo
+            # aggregates one RankTransferDone per rank, so a `done_count` below
+            # `dp_way_size` means some rank has not finished. The Decode TaskInfo
+            # keeps no such counter (`done_count` stays 0 there), which is why
+            # the criterion is only used when the KV manager reports a Prefill
+            # role rather than a Decode one.
+            dp_way_size = getattr(self.kv_manager, "dp_way_size", None)
+            if dp_way_size is not None and not getattr(
+                self.kv_manager, "is_decode", True
+            ):
+                # No `create=True`: a missing entry means no transfer was ever
+                # registered for this request, i.e. nothing to protect.
+                info = self.kv_manager._info(request_id)
+                in_flight = info is not None and info.done_count < dp_way_size
+
+        if in_flight:
+            # This instance (or a rank of it) is still writing KV blocks for the
+            # request. Tearing the request down now would release the source
+            # blocks while RDMA is still reading them, so only end this
+            # instance's token stream and let the transfer finish. The Prefill
+            # stall sweep bounds how long that wait can last.
+            task = TaskPool.pool.get(request_id)
+            req = getattr(task, "req", None)
+            if req is not None and not req.finished:
+                req.stop_stream(FinishReason.ABORTED)
+            return False
+
         stopped = self.stop_request(request_id, force_stop=True, timeout=0.0)
+        # Re-read the task: stop_request may have already dropped it.
         task = TaskPool.pool.get(request_id)
         req = getattr(task, "req", None)
         if req is not None and not req.finished:
@@ -810,6 +847,12 @@ class PrefillOnlyManager(PDInstanceRequestManager):
             return
         self._bootstrap_last_poll_ts = now
 
+        # Bound how long a request can wait for an RDMA transfer that never
+        # reports back. Runs before the promotion loop: a swept request is taken
+        # out of the pool by the sweep itself, so there is no dependency on
+        # anything being promoted afterwards.
+        self.kv_manager.sweep_stuck_transfers()
+
         incoming_task_ids = [
             tid
             for tid in TaskPool.id_list
@@ -954,6 +997,11 @@ class DecodeOnlyManager(PDInstanceRequestManager):
         self._decode_ready_wait_total_snapshot_s = 0.0
         self._decode_ready_exec_delays_ms: list[float] = []
         self._decode_ready_exec_last_log_ts = 0.0
+        # Requests whose block release was postponed while their KV was still on
+        # the wire. Scheduler.update() owns the retry and drops the task once the
+        # release goes through, so the KV transfer state can only be cleaned up
+        # after the task disappears (see _decode_check_and_promote).
+        self._deferred_kv_teardown: set[str] = set()
 
     def _release_decode_prealloc_budget(self, task: Task) -> None:
         if task.status != TaskStatus.PDDecodePrealloc:
@@ -1012,11 +1060,26 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                     break
                 time.sleep(0.1)
 
-            # clean kv cache
-            for cache_dict in Backend.cache_managers:
-                for cache_manager in cache_dict.values():
-                    cache_manager.finalize_metadata_all_decode(task)
+            # 先把任务标成 stopped，再试着释放 KV。这样即使是下面那个延后释放
+            # 的分支，任务也还留在 TaskPool 里，下一轮 Scheduler.update() 能靠
+            # need_remove() 认出它、再 finalize 一次。
             task.set_stopped()
+            # clean kv cache
+            released = [
+                cache_manager.finalize_metadata_all_decode(task)
+                for cache_dict in Backend.cache_managers
+                for cache_manager in cache_dict.values()
+            ]
+            if not all(released):
+                # 有 cache manager 说这块 KV 还在 RDMA 上：这会儿把任务删掉或
+                # mark_pending_remove，就再也没人去 finalize 它了，块会永久泄漏。
+                # 所以任务先留着，交给 Scheduler.update() 下一轮重试；延后期过了
+                # （transfer_grace_timeout）就会照常释放。
+                # KV 传输状态现在也不能清：清了它，下一轮 finalize 就看不到"还在
+                # 线上"的证据，块会在 RDMA 还在写的时候被放掉。等 Scheduler.update()
+                # 真的把任务删掉之后，_decode_check_and_promote 再收尾。
+                self._deferred_kv_teardown.add(request_id)
+                return False
             TaskPool.mark_pending_remove(request_id)
 
         return super().stop_request(request_id, force_stop, timeout)
@@ -1029,6 +1092,34 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
         if self.kv_manager is None:
             return
+
+        # 延后释放的请求，等 Scheduler.update() 真的把任务删掉之后再清 KV 传输
+        # 状态。清早了，finalize 看不到"还在线上"，块会在 RDMA 还在写的时候被放
+        # 掉；不清，block id 列表和 recv buffer 就一直挂在 kv_manager 里。
+        # 判据是"任务已经不在 TaskPool 里"，因为块放完、任务删除都发生在那一轮
+        # update() 里。
+        for rid in list(self._deferred_kv_teardown):
+            if rid in TaskPool.pool:
+                continue
+            # `remove_request_all_rank` is a PUSH chain, so a dead Prefill peer
+            # makes it raise `zmq.Again` after SNDTIMEO (60 s). This loop runs on
+            # the scheduling thread, so one dead peer must not take the instance
+            # down with it.
+            try:
+                self.kv_manager.remove_request_all_rank(rid)
+            except Exception as exc:
+                logger.warning(
+                    "[KV_RETIRE] deferred RemoveRequest broadcast failed "
+                    "req_id=%s: %s",
+                    rid,
+                    exc,
+                )
+            finally:
+                # Drop the id even when the broadcast failed: otherwise every
+                # later round retries the same dead peer and pays SNDTIMEO
+                # again, while the request can never be cleaned up.
+                self._deferred_kv_teardown.discard(rid)
+
         now = time.time()
 
         incoming_task_ids = [

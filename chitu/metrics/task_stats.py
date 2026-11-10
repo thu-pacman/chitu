@@ -67,7 +67,11 @@ def count_kv_send_inflight() -> int:
 
 
 def kv_send_inflight_request_ids() -> "list[str]":
-    """Requests whose KV transfer is in flight (sorted; test/diagnostic helper)."""
+    """Requests whose KV transfer is in flight (sorted).
+
+    The Prefill KV manager uses this to decide whether a request's blocks may
+    still be read by RDMA; the metrics and test code read it too.
+    """
     with _KV_SEND_LOCK:
         return sorted(_KV_SEND_INFLIGHT)
 

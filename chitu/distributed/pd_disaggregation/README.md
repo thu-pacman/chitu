@@ -384,7 +384,7 @@ multi_inst:
 
     kv_transfer:
       buffer_size: 2048
-      transfer_timeout: 30.0
+      transfer_timeout: 120.0
       max_concurrent_transfers: 8
       decode_wait_timeout_s: 300.0     # Decode 等待 KV 传输完成的超时
       decode_resend_interval_s: 0.5    # Decode 重发 DecodePrepare 间隔

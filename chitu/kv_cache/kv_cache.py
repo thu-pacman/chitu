@@ -1022,7 +1022,17 @@ class PagedKVCache(KVCacheBase):
                         f"max_blocks_per_req={self.max_blocks_per_req}"
                     )
 
+            # A submitted KV send reads this row from the transfer worker, which
+            # runs on another thread. Growing the row from here would make the
+            # worker's plan shorter than the Decode side's reserved blocks, or
+            # make it read a row that is being rewritten, so the row is frozen
+            # from submission until the transfer is over.
+            from chitu.metrics import task_stats  # local import: avoid a cycle
+
             for task_id, item in zip(task_ids, new_cache_ids_list):
+                assert (
+                    task_id not in task_stats.kv_send_inflight_request_ids()
+                ), f"{task_id} extends its block list after the KV send was submitted"
                 self.block_table[task_id].extend(item.get(self.manager_name, []))
 
         self._upd_gpu_block_table(task_ids, incremental=incremental)

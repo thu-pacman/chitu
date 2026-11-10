@@ -8,6 +8,7 @@ Per-request transfer state for PD disaggregation.
 
 from __future__ import annotations
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional, TYPE_CHECKING
@@ -50,9 +51,10 @@ class TaskInfo:
     #            Prefill
     # ===============================
 
-    decode_sid: int = -1
+    decode_sid: int | None = None
+    """Decode scheduler slot that owns this request, or None before DecodeAllocated."""
     decode_generation: int = 0
-    decode_dp_rank: int = -1
+    decode_dp_rank: int | None = None
 
     recv_buffers: dict[str, TransferBuffers] = field(default_factory=dict)
     """Per decode session_id (P side, from DecodeAllocated)."""
@@ -64,6 +66,30 @@ class TaskInfo:
 
     rank_bytes: dict[str, int] = field(default_factory=dict)
     """Per-session sent bytes, accumulated from RankTransferDone (P side)."""
+
+    # Progress clocks for the P-side stall sweep. All three are monotonic.
+    # `submitted_ts` and `started_ts` stay 0 until that step really happened, so
+    # the sweep can tell "not submitted yet" (a long prefill is healthy) from
+    # "submitted and silent".
+    submitted_ts: float = 0.0
+    """When send_kv_cache handed this request to a transfer worker."""
+    started_ts: float = 0.0
+    """When the transfer worker began the RDMA write (diagnostics only)."""
+    last_progress_ts: float = field(default_factory=time.monotonic)
+    """Last sign of progress: submit, worker start, or a RankTransferDone.
+
+    Initialized to "now" at creation: if it were 0, every request would look
+    stalled (now - 0 exceeds any threshold) before its transfer even starts.
+    """
+    transfer_grace_s: float = 150.0
+    """How long without progress before the sweep retires this transfer.
+
+    The value comes from the manager: `_info(create=True)` passes its own grace
+    in, so this dataclass default only applies to a TaskInfo built by hand. The
+    Prefill manager requires transfer timeout plus release grace to finish below
+    `decode_wait_timeout_s` and refuses to start otherwise, so the Prefill side
+    always gives up before Decode frees the receive blocks.
+    """
 
     # ===============================
     #            Decode
@@ -96,8 +122,8 @@ class TaskInfo:
     is_decode_allocated_sent: bool = False
 
     prefix_len: int = 0
-    dp_rank: int = -1
-    """dp_rank that owns this request on the decode side."""
+    dp_rank: int | None = None
+    """dp_rank that owns this request on the decode side, or None before DecodePrepare."""
 
     recv_bytes: int = 0
     """Expected total recv bytes, set during prepare_kv_transfer (D side)."""

@@ -87,6 +87,24 @@ class TestDecodeAllocated:
         assert ids == [7, 8, 9, 10]
         assert restored.cache_block_ids["main"].dtype == np.int32
 
+    def test_decode_sid_defaults_to_none(self):
+        # `None` is the "no Decode peer assigned yet" placeholder, so the message
+        # has to carry it through msgpack unchanged instead of inventing a
+        # sentinel number that a receiver could mistake for a real slot.
+        msg = DecodeAllocated(
+            dp_rank=0,
+            req_id="unset",
+            rank_num=1,
+            session_id="s1",
+            buffers=TransferBuffers(),
+        )
+        assert msg.decode_sid is None
+
+        unpacked = ProtocolSerializer.unpack(ProtocolSerializer.pack(msg))
+
+        assert unpacked.decode_sid is None
+        assert unpacked.req_id == "unset"
+
 
 class TestDecodePrepare:
     def test_roundtrip_preserves_hit_block_counts(self):

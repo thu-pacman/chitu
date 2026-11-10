@@ -982,12 +982,29 @@ Acceptable values: mooncake, nccl
 
 Additional configs for KV transfer
 
+##### Argument `multi_inst.pd_disaggregation.kv_transfer.transfer_timeout`
+
+How long the RDMA engine may spend on one transfer. Both roles derive
+their stall-retire grace from it, because a transfer past this point is
+dead by the engine's own reckoning, so waiting longer only holds blocks.
+
+*Default: `120.0`.*
+
 ##### Argument `multi_inst.pd_disaggregation.kv_transfer.prefill_wait_timeout_s`
 
 Message-loss fallback on the Prefill side: how long to wait for the
 DecodeAllocated signal before failing the request at request level.
 
 *Default: `600.0`.*
+
+##### Argument `multi_inst.pd_disaggregation.kv_transfer.transfer_grace_timeout`
+
+How long both sides postpone releasing a request's KV blocks after that
+request's teardown trigger. An RDMA write cannot be cancelled, so
+releasing the blocks right at the trigger would let the next request
+overwrite memory the wire is still reading or writing.
+
+*Default: `60.0`.*
 
 ### Argument `multi_inst.inst_overrides`
 

@@ -349,6 +349,20 @@ class KVManagerDecode(KVManagerBase):
     def is_prefill_done(self, req_id: str):
         return self._transfer_done_states.get(req_id, TransferStatus())
 
+    def should_postpone_release(self, task_id: str) -> bool:
+        """Whether this request's KV blocks may still be written by RDMA.
+
+        True while this rank has not received PrefillDone for the request.
+        `handle_decode_prepare` creates the TaskInfo and
+        `recv_kv_cache_and_insert` removes it once the KV is installed, so a
+        normal request stops postponing at the latest there. A request Prefill
+        failed never receives PrefillDone, so it keeps postponing until the
+        grace expires. That is what the grace is for: the RDMA write it gave up
+        on may still be running.
+        """
+        info = self._info(task_id, create=False)
+        return info is not None and not info.is_prefill_done
+
     def is_prefill_failed(self, req_id: str) -> bool:
         """Whether the Prefill side reported a request-level failure for this
         request (its KV will never arrive). Consumed by the decode scheduler to
