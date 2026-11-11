@@ -291,7 +291,7 @@ def _gcu_blockfp8_act_quant(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Vendor per-token-group FP8 activation quantization (``block`` = in axis
     scale block size), matching the scale layout ``_C.linear_quant`` reads."""
-    del round_scale_to_pow2, eps
+    assert not round_scale_to_pow2
     ensure_gcu_c_ops()
     block_size = scale_block_shape[1]
     assert x.shape[-1] % block_size == 0

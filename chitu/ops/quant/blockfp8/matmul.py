@@ -118,7 +118,8 @@ def _gcu_blockfp8_gemm(
     scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ) -> torch.Tensor:
     """Vendor block-FP8 GEMM over the already-quantized activation + scales."""
-    del round_scale_to_pow2, scale_block_shape
+    assert not round_scale_to_pow2
+    assert scale_block_shape == DEFAULT_SCALE_BLOCK_SHAPE
     ensure_gcu_c_ops()
     if isinstance(a_s, DeepGemmScale):
         raise NotImplementedError("GCU blockfp8 gemm: unsupported DeepGemmScale a_s")
