@@ -203,9 +203,7 @@ def _blockfp8_weight_dequant_soft_torch(
 
 
 blockfp8_weight_dequant.register_candidate("soft_torch")
-blockfp8_weight_dequant.register("soft_torch")(
-    _blockfp8_weight_dequant_soft_torch
-)
+blockfp8_weight_dequant.register("soft_torch")(_blockfp8_weight_dequant_soft_torch)
 
 
 soft_fp8_blockfp8_weight_dequant.register_candidate("triton")

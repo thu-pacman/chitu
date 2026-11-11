@@ -339,9 +339,7 @@ class MXFP4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
             )
         return F.linear(
             x,
-            self._dequant_weight(
-                self.up_proj_weight[i], self.up_proj_weight_scale[i]
-            ),
+            self._dequant_weight(self.up_proj_weight[i], self.up_proj_weight_scale[i]),
         )
 
     @override

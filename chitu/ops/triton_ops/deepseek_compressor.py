@@ -758,7 +758,9 @@ def _decode_mtp_hca_compress_kernel(
     r_offs = tl.arange(0, RATIO)
     is_pending = r_offs < pending
     new_idx = r_offs - pending
-    state_rows = (group_start + r_offs) & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
+    state_rows = (group_start + r_offs) & (
+        STATE_ROWS - 1
+    )  # gcu: vector % returns negative residues
 
     state_kv = tl.load(
         kv_state_ptr
@@ -1199,7 +1201,9 @@ def _decode_hca_kernel(
 
     group_start = sp - (RATIO - 1)
     r_offs = tl.arange(0, RATIO)
-    rows = (group_start + r_offs) & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
+    rows = (group_start + r_offs) & (
+        STATE_ROWS - 1
+    )  # gcu: vector % returns negative residues
 
     state_kv = tl.load(
         kv_state_ptr + slot * state_s0 + rows[:, None] * state_s1 + d_offs[None, :],
