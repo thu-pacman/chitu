@@ -5,7 +5,7 @@
 import copy
 import itertools
 from datetime import timedelta
-from typing import Optional, Sequence, Any
+from typing import Optional, Sequence, Iterable, Any
 
 import torch
 import torch.distributed
@@ -31,6 +31,21 @@ def _get_pg_timeout() -> Optional[timedelta]:
 
 class SingletonGroupPlaceholder:
     pass
+
+
+def _destroy_process_groups_once(groups: Iterable[Any], destroyed_group_ids: set[int]):
+    world_group = torch.distributed.group.WORLD
+    for group in groups:
+        if (
+            group is None
+            or group is world_group
+            or isinstance(group, SingletonGroupPlaceholder)
+        ):
+            continue
+        group_id = id(group)
+        if group_id not in destroyed_group_ids:
+            torch.distributed.destroy_process_group(group)
+            destroyed_group_ids.add(group_id)
 
 
 def new_torch_group_dedup(
@@ -380,6 +395,15 @@ class CommGroup:
             return
         torch.distributed.all_gather_into_tensor(output, input, group=self.gpu_group)
 
+    def all_to_all_single(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> torch.Tensor:
+        if self.group_size == 1:
+            output.copy_(input)
+            return output
+        torch.distributed.all_to_all_single(output, input, group=self.gpu_group)
+        return output
+
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if self.group_size == 1:
             return
@@ -461,16 +485,14 @@ class CommGroup:
 
         return torch.cat(output_tensor_list, dim=0)
 
-    def destroy(self):
-        if self.gpu_group and type(self.gpu_group) != SingletonGroupPlaceholder:
-            torch.distributed.destroy_process_group(self.gpu_group)
-
-        if self.cpu_group and type(self.cpu_group) != SingletonGroupPlaceholder:
-            torch.distributed.destroy_process_group(self.cpu_group)
-
+    def destroy(self, destroyed_group_ids: set[int]):
         if self.custom_ar_manager is not None:
             try:
                 self.custom_ar_manager.close()
             except Exception as e:
                 logger.warning(f"Error closing custom_ar_manager: {e}")
             self.custom_ar_manager = None
+
+        _destroy_process_groups_once(
+            (self.gpu_group, self.cpu_group), destroyed_group_ids
+        )

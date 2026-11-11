@@ -284,11 +284,17 @@ class KVCacheAccessor:
 
 @dataclass
 class PagedKVCacheAccessor(KVCacheAccessor):
+    """One layer's physical pages and optional Decode CP layout metadata."""
+
     block_table: torch.Tensor
     kv: dict[str, torch.Tensor]
     get_page_ids: Optional[Callable[[], torch.Tensor]] = None
     get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None
     use_i64_offsets: bool = False
+    # One logical block reserves a local physical page on every DCP rank.
+    block_size: int = 0
+    dcp_rank: int = 0
+    dcp_size: int = 1
 
     @property
     def k(self):  # Legacy interface
@@ -360,11 +366,19 @@ class GPUBlockTableSyncState:
             self.batch_states[batch_index] = None
         self.batch_size = len(task_ids)
 
+    def invalidate_tasks(self, task_ids: list[str]) -> None:
+        """Forget rows whose physical pages were released by the scheduler."""
+        removed = set(task_ids)
+        for batch_index in range(self.batch_size):
+            binding = self.batch_states[batch_index]
+            if binding is not None and binding[0] in removed:
+                self.batch_states[batch_index] = None
+
 
 class KVCacheBase:
-    # Tokens per KV-cache block: the page size of `PagedKVCache`, the whole
-    # sequence for `DenseKVCache`.
+    # Physical token capacity of one page; DenseKVCache stores a whole sequence.
     block_size: int
+    dcp_size: int = 1
 
     def __init__(
         self,
@@ -746,6 +760,8 @@ class PagedKVCache(KVCacheBase):
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
         manager_name: str = MAIN_CACHE_NAME,
         split_size: int = 0,
+        dcp_rank: int = 0,
+        dcp_size: int = 1,
     ):
         super().__init__(
             layer_id_map,
@@ -759,9 +775,16 @@ class PagedKVCache(KVCacheBase):
             device=device,
         )
 
+        self.dcp_rank = int(dcp_rank)
+        self.dcp_size = int(dcp_size)
+        if not 0 <= self.dcp_rank < self.dcp_size:
+            raise ValueError("Paged KV layout requires 0 <= DCP rank < DCP size")
+        self.block_size = block_size
         if max_blocks_per_req is None:
             max_seq_len_consider_mtp = max_alloc_seq_len(max_seq_len)
-            max_blocks_per_req = ceil_div(max_seq_len_consider_mtp, block_size)
+            max_blocks_per_req = ceil_div(
+                max_seq_len_consider_mtp, self.block_size * self.dcp_size
+            )
         assert max_blocks_per_req > 0, f"max_blocks_per_req should bigger than 0"
         self.max_blocks_per_req = max_blocks_per_req
         # Page-table capacity: `gpu_block_table` has num_hot_req rows of
@@ -776,7 +799,6 @@ class PagedKVCache(KVCacheBase):
             self.allocatable_max_num_blocks = self.max_num_blocks
 
         self.num_blocks = num_blocks
-        self.block_size = block_size
         self.manager_name = manager_name
         self.split_size = split_size
 
@@ -787,7 +809,8 @@ class PagedKVCache(KVCacheBase):
         self.paged_kv_cache: dict[str, torch.Tensor] = {}
         logger.info(
             f"Allocating KV cache of {','.join(self.shape_per_token_dict.keys())} with "
-            f"{self.num_blocks} blocks, each of size {self.block_size}"
+            f"{self.num_blocks} blocks, block_size={self.block_size}, "
+            f"dcp_size={self.dcp_size}"
         )
 
         for key in self.shape_per_token_dict:
@@ -839,7 +862,7 @@ class PagedKVCache(KVCacheBase):
 
         logger.info(
             f"Reallocating KV cache to {self.num_blocks} blocks, "
-            f"each of size {self.block_size}"
+            f"block_size={self.block_size}, dcp_size={self.dcp_size}"
         )
 
         keys = list(self.paged_kv_cache.keys())
@@ -871,14 +894,16 @@ class PagedKVCache(KVCacheBase):
     def page_ids(self):
         return self.gpu_block_table.get()[
             self.seq_len_delta.delta_seq_ids_tensor_device,
-            self.seq_len_delta.delta_position_ids_tensor_device // self.block_size,
+            self.seq_len_delta.delta_position_ids_tensor_device
+            // (self.block_size * self.dcp_size),
         ]
 
     @cuda_graph_safe_cached_property("_page_ids_static_tensor", "_page_ids_up_to_date")
     def page_ids_mtp(self):
         return self.gpu_block_table.get()[
             self.mtp_seq_len_delta.delta_seq_ids_tensor_device,
-            self.mtp_seq_len_delta.delta_position_ids_tensor_device // self.block_size,
+            self.mtp_seq_len_delta.delta_position_ids_tensor_device
+            // (self.block_size * self.dcp_size),
         ]
 
     @cuda_graph_safe_cached_property(
@@ -1093,7 +1118,9 @@ class PagedKVCache(KVCacheBase):
             # the first step, but for every steps. This is to be compatible
             # with `infer.mtp_draft_single_graph`.
             for tid in tasks.task_ids:
-                allocated_tokens = len(self.block_table.get(tid, ())) * self.block_size
+                allocated_tokens = (
+                    len(self.block_table.get(tid, ())) * self.block_size * self.dcp_size
+                )
                 anchor = self.tid_to_cached_len[tid]
                 if anchor + self.mtp_size - 2 >= allocated_tokens:
                     raise RuntimeError(
@@ -1154,6 +1181,9 @@ class PagedKVCache(KVCacheBase):
         for tid in tasks.task_ids:
             if tid in self.block_table:
                 self.block_table.pop(tid)
+        # A later request may reuse the same external task ID with different
+        # physical pages and the same page count. Force a full row upload then.
+        self._gpu_block_table_sync_state.invalidate_tasks(tasks.task_ids)
 
     @override
     def get_accessor(self, layer_id: int, is_mtp: bool = False) -> PagedKVCacheAccessor:
@@ -1161,24 +1191,18 @@ class PagedKVCache(KVCacheBase):
         ret_kv = {
             key: cache[local_layer_id] for key, cache in self.paged_kv_cache.items()
         }
-
-        if is_mtp:
-            return PagedKVCacheAccessor(
-                self.get_gpu_block_table(),
-                ret_kv,
-                lambda: self.page_ids_mtp,
-                lambda: self.offs_in_page_mtp,
-                self.use_i64_offsets,
-            )
-
-        else:
-            return PagedKVCacheAccessor(
-                self.get_gpu_block_table(),
-                ret_kv,
-                lambda: self.page_ids,
-                lambda: self.offs_in_page,
-                self.use_i64_offsets,
-            )
+        return PagedKVCacheAccessor(
+            block_table=self.get_gpu_block_table(),
+            kv=ret_kv,
+            get_page_ids=lambda: self.page_ids_mtp if is_mtp else self.page_ids,
+            get_offs_in_page=lambda: (
+                self.offs_in_page_mtp if is_mtp else self.offs_in_page
+            ),
+            use_i64_offsets=self.use_i64_offsets,
+            block_size=self.block_size,
+            dcp_rank=self.dcp_rank,
+            dcp_size=self.dcp_size,
+        )
 
     @override
     def get_gpu_block_table(self):
@@ -1829,7 +1853,7 @@ class MMPagedKVCache(PagedKVCache):
         delta_lens = self.seq_multimodal_len_delta._delta.lens_list
 
         if delta_pos.numel() > 0:
-            block_indices = delta_pos // self.block_size
+            block_indices = delta_pos // (self.block_size * self.dcp_size)
             offset_indices = delta_pos % self.block_size
 
             page_ids = gpu_block_table[delta_seq.long(), block_indices.long()]
@@ -1893,9 +1917,10 @@ class MMPagedKVCache(PagedKVCache):
         if tid in self.block_table:
             return max(
                 0,
-                ceil_div(target_seq_len, self.block_size) - len(self.block_table[tid]),
+                ceil_div(target_seq_len, self.block_size * self.dcp_size)
+                - len(self.block_table[tid]),
             )
-        return max(0, ceil_div(target_seq_len, self.block_size))
+        return max(0, ceil_div(target_seq_len, self.block_size * self.dcp_size))
 
     def allocate_block_for_cache(self, tasks: "PackedTasksBase"):
         """Allocate blocks for the requests to write into cache."""

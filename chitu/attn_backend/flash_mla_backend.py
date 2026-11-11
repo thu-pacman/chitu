@@ -635,8 +635,9 @@ class FlashMLABackend(TritonAttnBackend):
         topk_indices: torch.Tensor,
         attn_sink: Optional[torch.Tensor] = None,
         topk_length: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
     ):
-        output, _, _ = flash_mla.flash_mla_sparse_fwd_split_q(
+        output, _, lse = flash_mla.flash_mla_sparse_fwd_split_q(
             q_nope=q_nope,
             q_pe=q_pe,
             kv=kv.view(-1, 1, kv.shape[-1]),
@@ -646,7 +647,75 @@ class FlashMLABackend(TritonAttnBackend):
             attn_sink=attn_sink,
             topk_length=topk_length,
         )
-        return output
+        return (output, lse) if return_lse else output
+
+    def _update_local_paged_mla_kv(
+        self,
+        kv_cache,
+        kv: torch.Tensor,
+        seq_len_delta: BatchedSeqLenDelta,
+    ) -> None:
+
+        if self.use_fp8_cache:
+            kv = quant_pertoken_kvcache_dsa(kv)
+        super()._update_local_paged_mla_kv(kv_cache, kv, seq_len_delta)
+
+    @override
+    def mla_dcp_local(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        flash_indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        softmax_scale=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return local attention and FP32 LSE for compact physical KV indices."""
+        if q_nope.shape[0] == 0:
+            return (
+                q_nope.new_empty(q_nope.shape),  # o.shape = q_nope.shape
+                q_nope.new_empty(q_nope.shape[:2], dtype=torch.float32),
+            )
+
+        if softmax_scale is None:
+            softmax_scale = (self.qk_nope_head_dim + q_pe.shape[-1]) ** -0.5
+
+        if self.use_fp8_cache:
+            metadata = (
+                self.hygon_metadata_decode if is_hygon() else self.metadata_decode
+            )
+            if metadata is None:
+                raise RuntimeError("miss metadata to run FP8 attention")
+            # Treat each query row as an independent single-token batch item.
+            # -1 indices carry validity without changing shared scheduler metadata.
+            output, lse = flash_mla.flash_mla_with_kvcache(
+                q=torch.cat((q_nope, q_pe), dim=-1).unsqueeze(1),
+                k_cache=kv_cache.unsqueeze(2),
+                block_table=None,
+                head_dim_v=512,
+                cache_seqlens=None,
+                tile_scheduler_metadata=metadata,
+                num_splits=None,
+                is_fp8_kvcache=True,
+                indices=flash_indices.unsqueeze(1),
+                softmax_scale=softmax_scale,
+            )
+            output, lse = output.squeeze(1), lse.squeeze(-1)
+        else:
+            output, lse = self.flashmla_sparse_fwd_split_q_bf16(
+                q_nope,
+                q_pe,
+                kv_cache,
+                softmax_scale,
+                flash_indices,
+                topk_length=topk_length,
+                return_lse=True,
+            )
+
+        # An Token with zero local KV contributes zero weight to distributed softmax.
+        lse.masked_fill_(topk_length[:, None] == 0, -torch.inf)
+
+        return output, lse
 
     def flashmla_sparse_fwd_fp8(  # fp8 attn forward
         self,

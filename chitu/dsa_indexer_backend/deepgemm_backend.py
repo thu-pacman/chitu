@@ -84,6 +84,10 @@ class DeepGEMMIndexer(NvidiaTopKMixin, DSAIndexer):
         delta_pos = seq_len_delta.delta_position_ids_tensor_device
         delta_seq = seq_len_delta.delta_seq_ids_tensor_device
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
+        if cache_accessor.dcp_size > 1:
+            raise NotImplementedError(
+                "Decode-CP append is not implemented for the packed DeepGEMM indexer cache"
+            )
         append_to_paged_kv_cache_blockfp8_deepgemm(
             cache_accessor.kv["indexer_k_ks"],
             cache_accessor.block_table,

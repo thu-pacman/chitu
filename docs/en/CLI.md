@@ -430,6 +430,13 @@ Token layout used by Prefill Context Parallel: "interleaved" or "contiguous".
 
 *Default: `interleaved`.*
 
+### Argument `infer.dcp_size`
+
+Number of Decode Context Parallel ranks used to shard historical KV pages.
+See `docs/en/DEVELOPMENT.md#parallelism` for details.
+
+*Default: `1`.*
+
 ### Argument `infer.tp_size`
 
 Number of Tensor Parallel ranks for non-MoE models or non-MoE modules in MoE models.

@@ -89,8 +89,10 @@ def _collect_router_kv_cache_stats() -> dict[str, Any]:
         for cache_manager_dict in Backend.cache_managers:
             main_cm = cache_manager_dict[MAIN_CACHE_NAME]
             if block_size is None:
-                block_size = int(main_cm.block_size)
-            assert block_size == main_cm.block_size, (
+                # Router's block_size is the prefix-hash token span:
+                # physical page tokens * DCP size, matching manager hashes.
+                block_size = int(main_cm.block_size * main_cm.dcp_size)
+            assert block_size == main_cm.block_size * main_cm.dcp_size, (
                 "The block size of all main cache managers in the same instance "
                 "should be the same."
             )

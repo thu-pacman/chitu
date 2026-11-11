@@ -505,6 +505,42 @@ torchrun --nnodes 1 \
     infer.use_cuda_graph=True
 ```
 
+#### Decode Context Parallelism
+
+`infer.dcp_size=1` disables Decode Context Parallelism (DCP). To shard
+historical KV pages across Decode ranks, set `infer.dcp_size` equal to
+`infer.tp_size`; DCP currently reuses the TP group. Enabling DCP requires
+`multi_inst.role=decode`, `infer.cache_type=paged`, and a
+GLM-5.2 model. In a disaggregated deployment, keep `infer.dcp_size=1`
+on Prefill instances and set it to the TP size on Decode instances. Prefill
+instances can continue to use PP with DCP disabled. With Decode PP enabled,
+each stage shards only its own layers' KV across its TP/DCP group; DCP
+collectives stay within that stage.
+
+`PagedKVCache` reserves one physical `S`-token page per rank for each logical
+`S * DCP`-token group. All ranks share the block IDs. Sequence page `p` belongs
+to rank `p % DCP` in group `p // DCP`. The append kernel maps token positions
+to local physical pages and masks non-owner writes. Ordinary and DCP writes
+use the same append interface and kernel. P-to-D transfers
+only each Decode rank's prompt pages. Decode prefix caching shares only complete,
+ready logical groups.
+
+The Decode attention path uses the following operations:
+
+1. Score owner-local indexer KV and select local top-k candidates.
+2. AllGather candidate scores and token IDs, then select the global top-k.
+3. Convert global token IDs to compact owner-local physical FlashMLA indices.
+4. AllGather Q head shards so every KV owner computes all query heads.
+5. Exchange partial outputs and LSE by head with AllToAll, then combine them
+   using LSE weights.
+
+Classic Decode and request-major MTP query rows use the same path. The formal
+BF16 path uses Hygon h64 FlashMLA with combined `kv_lora_k_pe[...,576]` records;
+selected latent KV is neither copied between ranks nor communicated. Local
+top-k reuses the backend selector. Global top-k compares unique 64-bit keys:
+larger scores win, and equal scores prefer smaller global token IDs. All KV
+owners therefore select the same token set without an additional broadcast.
+
 ### Multi-Node Parallelism with Slurm
 
 You can use the following script:

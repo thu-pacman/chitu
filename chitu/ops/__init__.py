@@ -99,3 +99,4 @@ from chitu.ops.indexer_score_bf16 import (
     bf16_index_score_paged_kv,
     bf16_index_score_ragged_qk_dsv32,
 )
+from chitu.ops.decode_cp import merge_dcp_attention_partials

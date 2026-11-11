@@ -328,6 +328,9 @@ infer:
 
   #: Token layout used by Prefill Context Parallel: "interleaved" or "contiguous".
   pcp_layout: interleaved
+  #: Number of Decode Context Parallel ranks used to shard historical KV pages.
+  #: See `docs/en/DEVELOPMENT.md#parallelism` for details.
+  dcp_size: 1
 
   #: Number of Tensor Parallel ranks for non-MoE models or non-MoE modules in MoE models.
   #: See `docs/en/DEVELOPMENT.md#parallelism` for details.

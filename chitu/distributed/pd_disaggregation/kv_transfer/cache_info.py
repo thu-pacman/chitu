@@ -155,6 +155,11 @@ def collect_rank_cache_infos(session_id: str) -> RankCacheInfos:
                 group = get_tp_group()
             rank, gsize = int(group.rank_in_group), int(group.group_size)
 
+            if cache.dcp_size > 1:
+                # Decode CP currently reuse TP group
+                assert cache.dcp_rank == rank  # Decode-CP owner编号
+                assert cache.dcp_size == gsize
+
             if split_size == 0:
                 ci = CacheInfo(
                     split_len=split_len,

@@ -7,7 +7,11 @@ from logging import getLogger
 
 import torch
 
-from chitu.distributed.comm_group import CommGroup, _get_pg_timeout
+from chitu.distributed.comm_group import (
+    CommGroup,
+    _destroy_process_groups_once,
+    _get_pg_timeout,
+)
 from chitu.device_type import is_ascend
 from chitu.cp_utils import (
     create_cp_context,
@@ -22,6 +26,7 @@ _PARALLEL_GROUPS_INITIALIZED = False
 
 _WORLD_GROUP: Optional[CommGroup] = None
 _TP_GROUP: Optional[CommGroup] = None
+_DCP_GROUP: Optional[CommGroup] = None
 _PCP_GROUP: Optional[CommGroup] = None
 _DP_GROUP: Optional[CommGroup] = None
 _ETP_GROUP: Optional[CommGroup] = None
@@ -45,6 +50,10 @@ def get_world_group() -> CommGroup:
 
 def get_tp_group() -> CommGroup:
     return get_global_var("_TP_GROUP")
+
+
+def get_dcp_group() -> CommGroup:
+    return get_global_var("_DCP_GROUP")
 
 
 def get_pcp_group() -> CommGroup:
@@ -278,6 +287,20 @@ def initialize_tp_group(
     logger.info(f"tp group: {_TP_GROUP}")
 
 
+def initialize_dcp_group(rank: int, *, dcp_size: int):
+    global _DCP_GROUP
+    assert _DCP_GROUP is None
+    tp_ranks = torch.tensor(get_tp_group().rank_lists, device="cpu")
+    rank_lists = tp_ranks.reshape(-1, dcp_size).tolist()
+    _DCP_GROUP = CommGroup(
+        rank_lists,
+        rank,
+        enable_custom_allreduce=False,
+        force_no_dedup=True,
+    )
+    logger.info(f"dcp group: {_DCP_GROUP}")
+
+
 def initialize_pcp_group(
     rank: int,
     *,
@@ -423,16 +446,6 @@ def _warmup_pp_pair_p2p(rank: int, pp_rank_lists, group_dict):
     logger.info("PP pair P2P communicators warmed up")
 
 
-def _destroy_process_groups_once(group_dict):
-    destroyed_group_ids = set()
-    for group in group_dict.values():
-        group_id = id(group)
-        if group_id in destroyed_group_ids:
-            continue
-        destroyed_group_ids.add(group_id)
-        torch.distributed.destroy_process_group(group)
-
-
 def initialize_dp_group(
     rank: int,
     *,
@@ -498,6 +511,7 @@ def initialize_embed_tokens_lm_head_tp_group(
 def initialize_parallel_groups(
     *,
     tp_size: int,
+    dcp_size: int = 1,
     dp_size: int = 1,
     etp_size: int = 1,
     ep_size: int = 1,
@@ -507,6 +521,8 @@ def initialize_parallel_groups(
 ):
     global _PARALLEL_GROUPS_INITIALIZED
     assert not _PARALLEL_GROUPS_INITIALIZED
+    if dcp_size < 1 or dcp_size not in {1, tp_size}:
+        raise ValueError("Decode CP group size must be 1 or equal to the TP size")
 
     logger.info(
         f"initialize_parallel_groups: {tp_size=}, {pp_size=}, {dp_size=} {ep_size=} {pcp_size=}"
@@ -515,6 +531,7 @@ def initialize_parallel_groups(
     world_size = torch.distributed.get_world_size()
     initialize_world_group(rank, world_size)
     initialize_tp_group(rank, tp_size=tp_size, world_size=world_size)
+    initialize_dcp_group(rank, dcp_size=dcp_size)
     initialize_pcp_group(
         rank, tp_size=tp_size, pcp_size=pcp_size, world_size=world_size
     )
@@ -549,11 +566,18 @@ def parallel_groups_initialized():
 
 def destroy_parallel_groups():
     _reset_cp_context()
-    _destroy_process_groups_once(_PP_RESULT_PAIR_GROUP_DICT)
-    get_tp_group().destroy()
-    get_pcp_group().destroy()
-    get_pp_group().destroy()
-    get_world_group().destroy()
-    get_dp_group().destroy()
+    destroyed_group_ids: set[int] = set()
+    _destroy_process_groups_once(
+        _PP_RESULT_PAIR_GROUP_DICT.values(), destroyed_group_ids
+    )
+    for group in (
+        get_dcp_group(),
+        get_tp_group(),
+        get_pcp_group(),
+        get_pp_group(),
+        get_world_group(),
+        get_dp_group(),
+    ):
+        group.destroy(destroyed_group_ids)
     # Currently we don't destroy ep_group as it is a copy of tp/dp
     # get_ep_group().destroy()

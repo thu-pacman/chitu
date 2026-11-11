@@ -43,7 +43,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
     """Block allocator for paged KV caches with optional prefix caching.
 
     Maintains:
-    - ``task_to_cache_ids``: maps each task to its allocated physical block IDs.
+    - ``task_to_cache_ids``: maps each task to its allocated block IDs. With
+      DCP, an ID reserves one physical page on every rank.
     - Free block pool (reclaimed when tasks finish or blocks are evicted).
     - Optional prefix-cache metadata: tracks block hashes and reference counts
       to enable block sharing across requests with shared prefixes.
@@ -60,10 +61,16 @@ class PagedKVCacheManager(KVCacheManagerBase):
         enable_prefix_caching=False,
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
         manager_name: str = MAIN_CACHE_NAME,
+        dcp_size: int = 1,
     ):
-
+        self.dcp_size = int(dcp_size)
+        if self.dcp_size < 1:
+            raise ValueError("dcp_size must be positive")
+        self.block_size = int(block_size)
         # 单个请求可能写入 kv cache 的最大长度：decode 最后一步可能比 max_seq_len 多出推测段
-        self.max_blocks_per_req = ceil_div(max_alloc_seq_len(max_seq_len), block_size)
+        self.max_blocks_per_req = ceil_div(
+            max_alloc_seq_len(max_seq_len), self.block_size * self.dcp_size
+        )
 
         # Page-table capacity, not the physical block pool size (see PagedKVCache).
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
@@ -78,7 +85,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.dp_rank = dp_rank
         self.manager_name = manager_name
 
-        self.block_size = block_size
         self.task_to_cache_ids: defaultdict[str, set[int]] = defaultdict(
             set
         )  # {task_id: {block_idx,...}}
@@ -102,7 +108,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.enable_prefix_caching: bool = enable_prefix_caching
         self.identity_builder = BlockIdentityChainBuilder.acquire(
             self.manager_name,
-            self.block_size,
+            self.block_size * self.dcp_size,
         )
         # 保存块身份到运行时状态的映射, 数据含义: {blk_hash: BlockRuntime}
         self.identity_runtime_pool: dict[str, BlockRuntime] = {}
@@ -160,11 +166,12 @@ class PagedKVCacheManager(KVCacheManagerBase):
         """``seq_len`` 个 token 所占的、与 token 位置存在映射的块数。
 
         如：
-        PagedKVCacheManager: block_id = p // block_size, block_offset = p % block_size
+        PagedKVCacheManager: group_index = p // (block_size * dcp_size),
+            owner = (p // block_size) % dcp_size, offset = p % block_size
         D-V4 sliding: block_id = 0, block_offset = p % block_size
         singleton 的 ckpt 块: p // C, block_offset = 0
         """
-        return ceil_div(int(seq_len), self.block_size)
+        return ceil_div(int(seq_len), self.block_size * self.dcp_size)
 
     def num_fixed_blocks_per_req(self) -> int:
         """每个请求固定预留的块数：与 token 长度无关。"""
@@ -283,7 +290,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         count may include a non-full trailing block and must not go through here.
         """
         n = len(self.task_to_cache_ids.get(task.task_id, set()))
-        return min(n, task.cached_seq_len // self.block_size)
+        return min(n, task.cached_seq_len // (self.block_size * self.dcp_size))
 
     def num_cached_blocks(self, task: "Task") -> int:
         """Number of contiguous cached blocks hit from prompt start."""
@@ -493,12 +500,14 @@ class PagedKVCacheManager(KVCacheManagerBase):
             # PD分离Decode-Only节点：此时KV cache还未从prefill传输并reorder就绪，
             # 不能视为可复用的cache blocks。推迟到该任务首个decode step
             # (prepare_metadata_before_decode)再发布。
-            self._deferred_prefix_publish[task.task_id] = target_seq_len
+            self._deferred_prefix_publish[task.task_id] = min(
+                target_seq_len, task.prefix_tokens_len
+            )
         return new_cache_ids
 
     def publish_prefix_cache_blocks(self, task: "Task", target_seq_len: int) -> None:
         for idx, block in enumerate(self.task_to_token_blocks[task.task_id]):
-            if (idx + 1) * self.block_size <= target_seq_len:
+            if (idx + 1) * self.block_size * self.dcp_size <= target_seq_len:
                 self.upload_to_identity_runtime_pool(block)
 
     def prepare_metadata_before_decode(self, task: "Task") -> list[int]:
@@ -649,7 +658,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             if (
                 blk_hash is not None
                 and prefix_ready
-                and (i + 1) * self.block_size <= valid_kv_len
+                and (i + 1) * self.block_size * self.dcp_size <= valid_kv_len
             ):
                 if (
                     blk_hash not in self.identity_runtime_pool
@@ -789,7 +798,7 @@ class DeepSeekV4CompressedKVCacheManager(
                 ceil_div(
                     max_alloc_seq_len(int(kwargs["max_seq_len"])), self.compress_ratio
                 ),
-                self.block_size,
+                self.block_size * self.dcp_size,
             ),
         )
         self.max_num_blocks = self.max_blocks_per_req * int(kwargs["num_hot_req"])
@@ -804,7 +813,7 @@ class DeepSeekV4CompressedKVCacheManager(
         compressed_len = seq_len // self.compress_ratio
         if compressed_len == 0:
             return 0
-        return ceil_div(compressed_len, self.block_size)
+        return ceil_div(compressed_len, self.block_size * self.dcp_size)
 
 
 class SingletonPagedKVCacheManager(PagedKVCacheManager):

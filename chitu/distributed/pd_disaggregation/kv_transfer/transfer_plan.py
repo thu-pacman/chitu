@@ -122,6 +122,21 @@ def create_transfer_plan(
             if src_ids is None or dst_ids is None:
                 continue
 
+            if cache_name in recv_bufs.sequence_page_indices:
+                dst_pages = recv_bufs.sequence_page_indices[cache_name]
+                if dst_pages.size == 0:
+                    src_ids = src_ids[:0]
+                else:
+                    src_pages = send_buffers.sequence_page_indices[cache_name]
+                    src_slots = dst_pages.astype(np.intp) - src_pages[0]
+
+                    if np.any((src_slots < 0) | (src_slots >= src_ids.size)):
+                        raise ValueError(
+                            f"Decode-CP destination requests missing Prefill pages for {cache_name}"
+                        )
+
+                    src_ids = src_ids[src_slots]
+
             assert len(src_ids) == len(dst_ids), (
                 f"block count mismatch: {cache_name} "
                 f"src={len(src_ids)} dst={len(dst_ids)}"

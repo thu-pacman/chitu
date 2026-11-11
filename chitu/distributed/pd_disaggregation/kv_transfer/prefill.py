@@ -224,6 +224,8 @@ class KVManagerPrefill(KVManagerBase):
         """
         send_buffers = TransferBuffers()
         for cache in Backend.cache_dict.values():
+            if isinstance(cache, PagedKVCache) and cache.dcp_size > 1:
+                raise TypeError("Decode CP is not allowed inPrefill instance")
             if not isinstance(cache, PagedKVCache) or cache.paged_kv_cache is None:
                 continue
             if isinstance(cache, SingletonPagedKVCache):
@@ -283,8 +285,10 @@ class KVManagerPrefill(KVManagerBase):
                     len(block_indices),
                 )
             ids = np.array(block_indices[skip:], dtype=np.int32)
+            sequence_page_indices = np.arange(skip, len(block_indices), dtype=np.int32)
             for key in cache.paged_kv_cache:
                 send_buffers.cache_block_ids[key] = ids
+                send_buffers.sequence_page_indices[key] = sequence_page_indices
         return send_buffers
 
     def _build_static_transfer_plans(self) -> None:

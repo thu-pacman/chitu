@@ -73,7 +73,7 @@ def is_singleton_kv_cache(cache) -> bool:
 def kv_cache_block_layout(cache) -> tuple[int, int]:
     """cache（或对应的 manager）的 block 数构成：``(固定块数, 一块覆盖多少 token)``。
 
-    * 普通 paged cache：``(0, block_size)``；
+    * paged cache：``(0, block_size * dcp_size)``；
     * 带 checkpoint 的 SingletonPagedKVCache：``(num_hot_req * mtp_size, C)``
     """
     if is_singleton_kv_cache(cache):
@@ -83,7 +83,7 @@ def kv_cache_block_layout(cache) -> tuple[int, int]:
                 int(cache.num_hot_req) * int(cache.mtp_size),
                 int(checkpoint_interval),
             )
-    return 0, int(cache.block_size)
+    return 0, int(cache.block_size * cache.dcp_size)
 
 
 def kv_cache_num_blocks_for_tokens(cache, max_tokens: int) -> int:
@@ -100,7 +100,7 @@ def is_reallocable_kv_cache(cache) -> bool:
 
     * ``SingletonPagedKVCache`` with a ``checkpoint_interval``: one checkpoint
       block per C tokens, so it does scale;
-    * any other paged cache: one block per ``block_size`` tokens.
+    * any other paged cache: one block per ``block_size * dcp_size`` tokens.
 
     Fixed-capacity caches MUST be excluded — a ``SingletonPagedKVCache`` without
     a ``checkpoint_interval`` (MTP hidden state, decode-side linear-attention

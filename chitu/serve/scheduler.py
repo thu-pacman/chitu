@@ -17,6 +17,7 @@ import torch
 import torch.distributed
 
 from chitu.chitu_main import chitu_init, warmup_engine, start_enhanced_scheduler_service
+from chitu.cuda_graph import reset_cuda_graphs
 from chitu.serve.common import start_worker
 from chitu.serve.crash import report_and_exit
 from chitu.task import TaskPool
@@ -67,6 +68,9 @@ def init_dp_scheduler(args):
             if init_pd_worker is None:
                 raise RuntimeError("PD worker service not available")
             init_pd_worker(args, rank)
+        reset_cuda_graphs()
+        # All PD ranks release their process groups in the same order.
+        torch.distributed.destroy_process_group()
         return
 
     if not is_independent_multi_inst():

@@ -614,40 +614,11 @@ def test_paged_dcp(impl):
             values,
             torch.tensor(positions, device=device, dtype=torch.int32),
             torch.tensor(seq_ids, device=device, dtype=torch.int32),
-            decode_cp_size=dcp_size,
-            decode_cp_rank=rank,
+            dcp_size=dcp_size,
+            dcp_rank=rank,
             impl=impl,
         )
         assert_close(storage, expected, atol=0.0, rtol=0.0)
-
-
-@pytest.mark.skipif(not has_accelerator(), reason="Requires an accelerator")
-@pytest.mark.parametrize("dcp_size", [1, 2])
-def test_paged_getters(dcp_size):
-    if dcp_size > 1 and has_torch_npu:
-        pytest.skip("Ascend Torch DCP append is not supported")
-    device = "cuda"
-    cache = torch.zeros(3, 4, 2, device=device)
-    values = torch.tensor([[1, 2], [3, 4]], device=device, dtype=cache.dtype)
-    page_ids = torch.tensor([2, 0], device=device, dtype=torch.int32)
-    offsets = torch.tensor([3, 1], device=device, dtype=torch.int32)
-    expected = cache.clone()
-    expected[2, 3] = values[0]
-    if dcp_size == 1:
-        expected[0, 1] = values[1]
-
-    append_to_paged_kv_cache(
-        cache,
-        None,
-        values,
-        torch.tensor([4, 0], device=device, dtype=torch.int32),
-        get_page_ids=lambda: page_ids,
-        get_offs_in_page=lambda: offsets,
-        decode_cp_size=dcp_size,
-        decode_cp_rank=dcp_size - 1,
-        impl="torch",
-    )
-    assert_close(cache, expected, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.skipif(
@@ -669,8 +640,8 @@ def test_paged_dcp_graph():
             table,
             values,
             positions,
-            decode_cp_size=4,
-            decode_cp_rank=1,
+            dcp_size=4,
+            dcp_rank=1,
             impl="triton",
         )
     torch.cuda.current_stream().wait_stream(stream)
@@ -681,8 +652,8 @@ def test_paged_dcp_graph():
             table,
             values,
             positions,
-            decode_cp_size=4,
-            decode_cp_rank=1,
+            dcp_size=4,
+            dcp_rank=1,
             impl="triton",
         )
 

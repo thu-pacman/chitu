@@ -712,7 +712,8 @@ class PDSchedulerService:
             "max_seq_len": getattr(get_global_args().infer, "max_seq_len", None),
             # FIXME: stats from all cache?
             "num_blocks": main_cache.num_blocks,
-            "block_size": main_cache.block_size,
+            # Router hashes cover one logical group of physical pages.
+            "block_size": main_cache.block_size * main_cache.dcp_size,
             # 本实例 TaskPool 的负载与 Enhanced Scheduler 一致 (count_router_load)；
             # pending_tokens 暂未统计，固定为 0。
             "running_requests": running_requests,
