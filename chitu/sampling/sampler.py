@@ -7,6 +7,7 @@ from typing import Optional
 from dataclasses import dataclass, field, replace
 import torch
 import xgrammar
+from xgrammar import GrammarMatcher, allocate_token_bitmask
 
 from chitu.global_vars import get_global_args, is_pd_prefill_only
 from chitu.task import Task, SampleParams, PackedTasks, PackedTasksResult, TaskType
@@ -26,10 +27,8 @@ from .utils import get_tokenizer_info, get_op_device
 
 logger = logging.getLogger(__name__)
 
-# xgrammar is a required dependency; older versions may lack the batched
-# matcher. Keep the per-task GrammarMatcher path available in that case.
-allocate_token_bitmask = getattr(xgrammar, "allocate_token_bitmask", None)
-GrammarMatcher = getattr(xgrammar, "GrammarMatcher", None)
+# Older xgrammar releases lack BatchGrammarMatcher. Fall back to filling each
+# task's bitmask with its own matcher in that case.
 BatchGrammarMatcher = getattr(xgrammar, "BatchGrammarMatcher", None)
 
 TOKEN_BLOCK_SIZE = 256
@@ -96,7 +95,7 @@ class TaskSampleState:
     enable_frequency_penalty: bool
     token_blocks: list[torch.Tensor] | None = None
     output_len: int = 0
-    matcher: "GrammarMatcher | None" = None
+    matcher: GrammarMatcher | None = None
     # Sparse proposal p' (probs, token_ids), shape (mtp_size-1, k) per task:
     # stored at the task's OWN top-k width -- the proposal a draft step returns
     # is `Sampler.max_top_k_samples` wide -- so a task is not pinned to the width of
@@ -129,11 +128,6 @@ class TaskSampleState:
         )
 
         if task.grammar:
-            if GrammarMatcher is None:
-                raise RuntimeError(
-                    "Grammar-constrained decoding requested but the installed "
-                    "xgrammar does not provide GrammarMatcher; install a newer xgrammar."
-                )
             matcher = GrammarMatcher(task.grammar)
             for i, token in enumerate(tokens):
                 if matcher.is_terminated():
@@ -694,6 +688,10 @@ class Sampler:
             dtype=torch.int64,
         )
         retrieve_sibling = torch.tensor([-1] * node_count, dtype=torch.int64)
+
+        # Reaching here means some task has an active matcher, which also made
+        # `_rebuild_mtp_draft_inputs` materialize the host draft rows.
+        assert draft_tokens_list is not None
 
         for ti, state in enumerate(states):
             if not state.matcher or state.matcher.is_terminated():

@@ -287,11 +287,15 @@ def _gcu_blockfp8_act_quant(
     *,
     scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     round_scale_to_pow2: bool = False,
+    packed_ue8m0: bool = False,
     eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Vendor per-token-group FP8 activation quantization (``block`` = in axis
     scale block size), matching the scale layout ``_C.linear_quant`` reads."""
+    # Plain FP32 per-group scales only. Pow2-rounded (UE8M0) scales and
+    # DeepGEMM's packed UE8M0 layout are CUDA-only contracts.
     assert not round_scale_to_pow2
+    assert not packed_ue8m0
     ensure_gcu_c_ops()
     block_size = scale_block_shape[1]
     assert x.shape[-1] % block_size == 0

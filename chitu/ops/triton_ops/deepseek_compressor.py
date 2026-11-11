@@ -24,7 +24,7 @@ from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
 # --- GCU: Triton's vectorized int64 `%` returns negative residues on this
 # backend, so the decode fast paths use a bit mask instead (STATE_ROWS / RATIO
 # are powers of two). Verify that precondition cheaply, once per value.
-_POW2_OK = set()
+_POW2_OK: set[int] = set()
 
 
 def _check_pow2(name, value):

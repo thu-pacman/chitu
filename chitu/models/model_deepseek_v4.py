@@ -1976,6 +1976,7 @@ class AttentionDeepSeekV4(Attention):
         x = x.unsqueeze(1)
         bsz, seqlen, _ = x.size()
         assert seqlen == 1
+        assert self.freqs_cis is not None
         freqs_cis = self.freqs_cis[start_positions]
         win, ratio, rope_dim = self.window_size, self.compress_ratio, self.rope_head_dim
         if ratio:
@@ -2112,6 +2113,7 @@ class AttentionDeepSeekV4(Attention):
 
         query_offsets = torch.arange(q_len, device=device, dtype=torch.long)
         freq_positions = start_positions.unsqueeze(1) + query_offsets.unsqueeze(0)
+        assert self.freqs_cis is not None
         freqs_cis = self.freqs_cis[freq_positions.reshape(-1)]
 
         qr = self.q_norm(self.wq_a(x))
@@ -2294,6 +2296,7 @@ class AttentionDeepSeekV4(Attention):
             - current_offsets[current_req_ids]
         )
         freq_positions = start_positions[current_req_ids] + current_token_offsets
+        assert self.freqs_cis is not None
         freqs_cis = self.freqs_cis[freq_positions]
 
         qr = self.q_norm(self.wq_a(x))
