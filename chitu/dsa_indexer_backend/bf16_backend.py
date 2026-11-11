@@ -41,6 +41,8 @@ class BF16Indexer(DSAIndexer):
             get_page_ids=cache_accessor.get_page_ids,
             get_offs_in_page=cache_accessor.get_offs_in_page,
             use_i64_offsets=cache_accessor.use_i64_offsets,
+            dcp_size=cache_accessor.dcp_size,
+            dcp_rank=cache_accessor.dcp_rank,
         )
 
     def bf16_index_score_dsa_bf16(
@@ -52,12 +54,24 @@ class BF16Indexer(DSAIndexer):
         is_causal=True,
         ke: Optional[torch.Tensor] = None,
         ks: Optional[torch.Tensor] = None,
+        *,
+        page_table=None,
+        context_lens=None,
+        score_width=None,
     ):
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
         score_impl = {"torch_bf16": "torch", "triton_bf16": "triton"}[self.impl]
 
-        if seq_len_delta.is_decode_stage:
-            return self._decode_score(q, weights, seq_len_delta, cache_accessor)
+        if seq_len_delta.is_decode_stage or context_lens is not None:
+            return self._decode_score(
+                q,
+                weights,
+                seq_len_delta,
+                cache_accessor,
+                page_table=page_table,
+                context_lens=context_lens,
+                score_width=score_width,
+            )
 
         k_full = read_from_paged_kv_cache(
             cache_accessor.kv["indexer_k"],

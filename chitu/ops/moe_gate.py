@@ -40,6 +40,8 @@ def moe_gate(
     e_score_correction_bias: Optional[torch.Tensor],
     score_func: str,
     norm_prob: bool = False,
+    routed_scaling_factor: float = 1.0,
+    output_dtypes: Optional[tuple[torch.dtype, torch.dtype]] = None,
     impl: str = "auto",
 ):
     """
@@ -58,6 +60,10 @@ def moe_gate(
             (softmax/sigmoid/sqrtsoftplus) and before selecting.
         score_func (str): "softmax", "sigmoid", or "sqrtsoftplus"
         norm_prob (bool): True if the output weight need to be normalized. Default False.
+        routed_scaling_factor (float): Scale the selected weights after normalization.
+        output_dtypes: Optional (indices dtype, weights dtype). CUDA supports int32/int64
+            indices and input-dtype/float32 weights. Conversion follows scoring,
+            normalization and scaling in their original dtypes.
 
     Returns:
         [0] (torch.Tensor): indices. indices[i, j] is the index of the j-th selected expert
@@ -105,10 +111,10 @@ def _auto_moe_gate(
         return "blackwell"
     if (
         has_chitu_backend
-        and topk in [6, 8]
+        and topk in [6, 8, 16]
         and (
             (8 <= num_experts <= 256 and is_power_of_two(num_experts))
-            or num_experts == 384
+            or num_experts in [384, 896]
         )
         # The CUDA kernel keeps softmax selection scores in fp32, so a softmax
         # bias must be fp32; otherwise fall back to the torch impl.
@@ -140,6 +146,15 @@ def _auto_moe_gate(
     return "torch"
 
 
+def _postprocess_moe_gate(indices, weights, routed_scaling_factor, output_dtypes):
+    if routed_scaling_factor != 1.0:
+        weights *= routed_scaling_factor
+    if output_dtypes is not None:
+        indices = indices.to(output_dtypes[0])
+        weights = weights.to(output_dtypes[1])
+    return indices, weights
+
+
 @moe_gate.register("torch")
 def moe_gate_torch(
     scores,
@@ -150,6 +165,8 @@ def moe_gate_torch(
     e_score_correction_bias,
     score_func: str,
     norm_prob=False,
+    routed_scaling_factor: float = 1.0,
+    output_dtypes: Optional[tuple[torch.dtype, torch.dtype]] = None,
 ):
     B = scores.shape[0]
     if score_func == "softmax":
@@ -182,7 +199,7 @@ def moe_gate_torch(
     weights = original_scores.gather(1, indices)
     if norm_prob:
         weights /= weights.sum(dim=-1, keepdim=True)
-    return indices, weights
+    return _postprocess_moe_gate(indices, weights, routed_scaling_factor, output_dtypes)
 
 
 @moe_gate.register("cuda", available=has_chitu_backend)
@@ -195,28 +212,26 @@ def moe_gate_cuda(
     e_score_correction_bias,
     score_func: str,
     norm_prob=False,
+    routed_scaling_factor: float = 1.0,
+    output_dtypes: Optional[tuple[torch.dtype, torch.dtype]] = None,
 ):
     bs, _ = scores.shape
-
-    if bs == 0:
-        return (
-            torch.empty(bs, topk, dtype=torch.int32, device=scores.device),
-            torch.empty(bs, topk, dtype=scores.dtype, device=scores.device),
+    indices_dtype, weights_dtype = output_dtypes or (torch.int32, scores.dtype)
+    topk_ids = torch.empty(bs, topk, dtype=indices_dtype, device=scores.device)
+    topk_weights = torch.empty(bs, topk, dtype=weights_dtype, device=scores.device)
+    if bs > 0:
+        chitu_backend.cuda_moe_gate(
+            scores,
+            topk_ids,
+            topk_weights,
+            num_expert_group,
+            topk_group,
+            -1 if num_expert_group == 1 else topk_as_topk_group_criteria,
+            e_score_correction_bias,
+            score_func,
+            norm_prob,
+            routed_scaling_factor,
         )
-
-    topk_ids = torch.empty(bs, topk, dtype=torch.int32, device=scores.device)
-    topk_weights = torch.empty(bs, topk, dtype=scores.dtype, device=scores.device)
-    chitu_backend.cuda_moe_gate(
-        scores,
-        topk_ids,
-        topk_weights,
-        num_expert_group,
-        topk_group,
-        -1 if num_expert_group == 1 else topk_as_topk_group_criteria,
-        e_score_correction_bias,
-        score_func,
-        norm_prob,
-    )
     return topk_ids, topk_weights
 
 
@@ -230,6 +245,8 @@ def moe_gate_muxi(
     e_score_correction_bias: Optional[torch.Tensor] = None,
     score_func: str = "softmax",
     norm_prob: bool = False,
+    routed_scaling_factor: float = 1.0,
+    output_dtypes: Optional[tuple[torch.dtype, torch.dtype]] = None,
 ):
     assert (
         score_func == "softmax" or score_func == "sigmoid"
@@ -256,7 +273,9 @@ def moe_gate_muxi(
     )
 
     if B == 0:
-        return expertsIds, selected_experts_weights
+        return _postprocess_moe_gate(
+            expertsIds, selected_experts_weights, routed_scaling_factor, output_dtypes
+        )
 
     score_fun = 0
     if score_func == "softmax":
@@ -281,7 +300,9 @@ def moe_gate_muxi(
     if norm_prob:
         selected_experts_weights /= selected_experts_weights.sum(dim=-1, keepdim=True)
 
-    return expertsIds, selected_experts_weights
+    return _postprocess_moe_gate(
+        expertsIds, selected_experts_weights, routed_scaling_factor, output_dtypes
+    )
 
 
 @moe_gate.register("cpu", available=has_cpuinfer)
@@ -294,6 +315,8 @@ def moe_gate_cpu(
     e_score_correction_bias=None,
     score_func="softmax",
     norm_prob: bool = False,
+    routed_scaling_factor: float = 1.0,
+    output_dtypes: Optional[tuple[torch.dtype, torch.dtype]] = None,
 ):
     if scores.device.type != "cpu":
         raise ValueError(
@@ -358,7 +381,7 @@ def moe_gate_cpu(
     if norm_prob:
         weights /= weights.sum(dim=-1, keepdim=True)
 
-    return indices, weights
+    return _postprocess_moe_gate(indices, weights, routed_scaling_factor, output_dtypes)
 
 
 @moe_gate.register("npu_moe_gating_top_k", available=has_torch_npu)
@@ -371,6 +394,8 @@ def moe_gate_npu_moe_gating_top_k(
     e_score_correction_bias=None,
     score_func="softmax",
     norm_prob: bool = False,
+    routed_scaling_factor: float = 1.0,
+    output_dtypes: Optional[tuple[torch.dtype, torch.dtype]] = None,
 ):
     assert norm_prob
     dtype = scores.dtype
@@ -418,7 +443,7 @@ def moe_gate_npu_moe_gating_top_k(
         eps=1e-20,
     )
     weights = weights.to(dtype)
-    return indices, weights
+    return _postprocess_moe_gate(indices, weights, routed_scaling_factor, output_dtypes)
 
 
 @moe_gate.register("npu_moe_gating_top_k_softmax", available=has_torch_npu)
@@ -431,6 +456,8 @@ def moe_gate_npu_moe_gating_top_k_softmax(
     e_score_correction_bias=None,
     score_func="softmax",
     norm_prob: bool = False,
+    routed_scaling_factor: float = 1.0,
+    output_dtypes: Optional[tuple[torch.dtype, torch.dtype]] = None,
 ):
     assert score_func == "softmax"
     assert e_score_correction_bias is None
@@ -438,7 +465,7 @@ def moe_gate_npu_moe_gating_top_k_softmax(
     weights, indices, row_idx = torch_npu.npu_moe_gating_top_k_softmax(scores, k=topk)
     if norm_prob:
         weights /= weights.sum(dim=-1, keepdim=True)
-    return indices, weights
+    return _postprocess_moe_gate(indices, weights, routed_scaling_factor, output_dtypes)
 
 
 @moe_gate.register("blackwell", available=has_hard_fp4_kernels)
@@ -451,6 +478,8 @@ def moe_gate_blackwell(
     e_score_correction_bias=None,
     score_func="softmax",
     norm_prob: bool = False,
+    routed_scaling_factor: float = 1.0,
+    output_dtypes: Optional[tuple[torch.dtype, torch.dtype]] = None,
 ):
     if topk_group > 1:
         # TODO: Pass `topk_as_topk_group_criteria` to the kernel
@@ -473,4 +502,4 @@ def moe_gate_blackwell(
         )
     else:
         raise ValueError(f"Unsupported score function: {score_func}")
-    return indices, weights
+    return _postprocess_moe_gate(indices, weights, routed_scaling_factor, output_dtypes)

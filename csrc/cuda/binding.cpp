@@ -50,7 +50,10 @@ void init_compute(py::module &m) {
     m.def("cuda_batched_routed_activation_indexed_to_expert_block_indexed",
           &batched_routed_activation_indexed_to_expert_block_indexed, "");
     m.def("cuda_add_shared_experts", &add_shared_experts, "");
-    m.def("cuda_moe_gate", &moe_gate, "");
+    m.def("cuda_moe_gate", &moe_gate, "scores"_a, "indices"_a, "weights"_a,
+          "num_expert_group"_a, "topk_group"_a, "topk_as_topk_group_criteria"_a,
+          "e_score_correction_bias"_a, "score_func"_a, "norm_prob"_a,
+          "routed_scaling_factor"_a = 1.0);
     m.def("cuda_hash_route_gate", &hash_route_gate, "");
     m.def("cuda_rotary_pos_emb_llama", &rotary_pos_emb_llama, "q"_a, "k"_a,
           "freqs_cis_cos"_a, "freqs_cis_sin"_a, "q_out"_a = std::nullopt,

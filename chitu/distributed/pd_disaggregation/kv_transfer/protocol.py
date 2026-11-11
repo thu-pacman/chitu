@@ -45,7 +45,11 @@ class DecodeAllocated:
     """
 
     type: ClassVar[str] = "DecodeAllocated"
-    decode_sid: int
+    # Keyword-only, so this field can carry the `None` default ("no Decode peer
+    # assigned yet") without forcing every required field below it to grow a
+    # default too: a dataclass rejects a field with a default that comes before
+    # a field without one. Every sender already passes it by keyword.
+    decode_sid: int | None = dataclasses.field(default=None, kw_only=True)
     dp_rank: int
     req_id: str
     rank_num: int

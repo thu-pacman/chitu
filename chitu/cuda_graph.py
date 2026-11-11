@@ -6,6 +6,7 @@ from typing import Callable, Sequence, Mapping, Any, Optional
 from logging import getLogger
 import functools
 import gc
+from weakref import WeakSet
 import torch
 
 from chitu.static_tensor import StaticTensor
@@ -16,6 +17,7 @@ logger = getLogger(__name__)
 _is_warming_up_before_cuda_graph_capture = False
 _currently_capturing_graph_object = None
 _post_hook_per_graph_object: dict[torch.cuda.CUDAGraph, list[Callable[[], None]]] = {}
+_captured_graphs: WeakSet[torch.cuda.CUDAGraph] = WeakSet()
 
 
 def weak_ref_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -49,6 +51,17 @@ def add_post_hook_for_currently_capturing_graph_object(hook: Callable[[], None])
     if _currently_capturing_graph_object not in _post_hook_per_graph_object:
         _post_hook_per_graph_object[_currently_capturing_graph_object] = []
     _post_hook_per_graph_object[_currently_capturing_graph_object].append(hook)
+
+
+def reset_cuda_graphs() -> None:
+    """Release captured graphs before their communicators are destroyed."""
+    graphs = list(_captured_graphs)
+    if graphs:
+        torch.cuda.synchronize()
+        for graph in graphs:
+            graph.reset()
+    _captured_graphs.clear()
+    _post_hook_per_graph_object.clear()
 
 
 def make_dispatched_graphed_callables(
@@ -198,6 +211,7 @@ def make_dispatched_graphed_callables(
                     _currently_capturing_graph_object = None
                     gc.enable()  # Always re-enable GC
                     gc.collect()  # Clean up anything that was delayed
+                _captured_graphs.add(graph_dict[key])
                 output_dict[key] = weak_ref_tensor(output)
                 if cuda_graph_pool is None:
                     cuda_graph_pool = graph_dict[key].pool()

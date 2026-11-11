@@ -7,7 +7,7 @@ import torch
 
 class CPUParameter(torch.nn.Parameter):
     """
-    A torch.nn.Parameter that always stay on CPU.
+    A torch.nn.Parameter that always stays on CPU.
     """
 
     pass

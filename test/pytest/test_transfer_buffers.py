@@ -43,6 +43,7 @@ class TestTransferBuffers:
         bufs.cache_block_ids["linear"] = np.array([4, 5], dtype=np.int32)
         serialized = bufs.to_msgpackable()
         restored = TransferBuffers.from_msgpackable(serialized)
+        assert not restored.sequence_page_indices
         assert "main" in restored.cache_block_ids
         assert "linear" in restored.cache_block_ids
         assert list(restored.cache_block_ids["main"]) == [1, 2, 3]
@@ -243,6 +244,48 @@ class TestCreateTransferPlan:
         assert "s1" in result.plans
         p = result.plans["s1"]
         assert p.lengths[0] == 512  # 2 × 256
+
+    @pytest.mark.parametrize(
+        "first_page, source_count, dst_pages",
+        [(0, 5, [1, 4]), (4, 5, [5, 8]), (4, 0, [])],
+    )
+    def test_owner_page_alignment(self, first_page, source_count, dst_pages):
+        plan = StaticTransferPlan(
+            per_session={
+                "owner-2": {
+                    "main": StaticTransferPlanPerCache(
+                        src_base_ptrs=np.array([1000], dtype=np.int64),
+                        dst_base_ptrs=np.array([2000], dtype=np.int64),
+                        src_block_stride=100,
+                        dst_block_stride=200,
+                        buffer_size=16,
+                    )
+                }
+            }
+        )
+        send = TransferBuffers(
+            cache_block_ids={"main": np.arange(10, 10 + source_count, dtype=np.int32)},
+            sequence_page_indices={
+                "main": np.arange(first_page, first_page + source_count, dtype=np.int32)
+            },
+        )
+        recv = TransferBuffers(
+            cache_block_ids={
+                "main": np.array([7, 8][: len(dst_pages)], dtype=np.int32)
+            },
+            sequence_page_indices={"main": np.array(dst_pages, dtype=np.int32)},
+        )
+
+        result = create_transfer_plan(plan, send, {"owner-2": recv})
+        if not dst_pages:
+            assert not result.plans
+            return
+        per_rank = result.plans["owner-2"]
+
+        # The selected sequence pages map to Prefill physical pages 11 and 14.
+        assert per_rank.ptrs.tolist() == [2100, 2400]
+        assert per_rank.remote_ptrs.tolist() == [3400, 3600]
+        assert per_rank.lengths.tolist() == [16, 16]
 
     def test_multi_cache(self):
         plan = StaticTransferPlan(

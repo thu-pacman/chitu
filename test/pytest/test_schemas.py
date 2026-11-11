@@ -47,6 +47,7 @@ class TestServeConfigRules:
                 },
                 "scheduler": {"type": "prefill_first"},
                 "multi_inst": {
+                    "inst_id": 0,
                     "n_insts": 1,
                     "router": {"is_router": False},
                 },

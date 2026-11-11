@@ -40,8 +40,8 @@ def append_to_paged_kv_cache(
     use_i64_offsets: bool = False,
     impl: str = "auto",
     *,
-    decode_cp_size: int = 1,
-    decode_cp_rank: int = 0,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ):
     """
     Read from ragged K/V, append to paged K/V cache.
@@ -57,10 +57,10 @@ def append_to_paged_kv_cache(
             the 8th, 9th token of the 1st sequence, and the 7th token of the 2nd sequence,
             delta_seq_ids = [1, 1, 2]. This parameter can be ignored if the number of incremented
             tokens of every sequence is 1.
-        decode_cp_size: Number of KV owners. Each page-table column addresses a
-            group of decode_cp_size sequence pages, with one physical page per owner.
-        decode_cp_rank: This owner's index. Only sequence pages whose index modulo
-            decode_cp_size equals decode_cp_rank are written. Callbacks, when
+        dcp_size: Number of KV owners. Each page-table column addresses a
+            group of dcp_size sequence pages, with one physical page per owner.
+        dcp_rank: This owner's index. Only sequence pages whose index modulo
+            dcp_size equals dcp_rank are written. Callbacks, when
             supplied, return owner-local physical page IDs and offsets.
     """
     raise NotImplementedError
@@ -142,8 +142,8 @@ def _auto_append_to_paged_kv_cache(
     get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None,
     use_i64_offsets: bool = False,
     *,
-    decode_cp_size: int = 1,
-    decode_cp_rank: int = 0,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ):
     if (
         kv_cache.device.type != "cpu"
@@ -167,13 +167,13 @@ def append_to_paged_kv_cache_torch(
     ] = None,  # fn -> (num_tokens,)
     use_i64_offsets: bool = False,
     *,
-    decode_cp_size: int = 1,
-    decode_cp_rank: int = 0,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ):
     # NOTE: PyTorch always use i64 offsets in its ops. So we can safely ignore use_i64_offsets
 
-    if not 0 <= decode_cp_rank < decode_cp_size:
-        raise ValueError("Require 0 <= decode_cp_rank < decode_cp_size")
+    if not 0 <= dcp_rank < dcp_size:
+        raise ValueError("Require 0 <= dcp_rank < dcp_size")
     if (
         get_page_ids is None
         and delta_seq_ids is None
@@ -184,11 +184,11 @@ def append_to_paged_kv_cache_torch(
         return
 
     page_size = kv_cache.shape[1]
-    if decode_cp_size > 1:
+    if dcp_size > 1:
 
         positions = delta_position_ids.long()
         sequence_pages = positions // page_size
-        valid = (positions >= 0) & (sequence_pages % decode_cp_size == decode_cp_rank)
+        valid = (positions >= 0) & (sequence_pages % dcp_size == dcp_rank)
         if delta_seq_ids is not None:
             valid &= delta_seq_ids >= 0
         rows = torch.where(valid)[0]
@@ -198,7 +198,7 @@ def append_to_paged_kv_cache_torch(
                 if delta_seq_ids is None
                 else delta_seq_ids.long()
             )
-            page_ids = page_table[seq_ids[rows], sequence_pages[rows] // decode_cp_size]
+            page_ids = page_table[seq_ids[rows], sequence_pages[rows] // dcp_size]
         else:
             page_ids = get_page_ids()[rows]
         offsets = (

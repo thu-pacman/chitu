@@ -10,8 +10,10 @@ ARG enable_test='false'
 ARG pypi_mirror=''
 ARG build_for_shca='false'
 # Pin the GPU arch so compilation does not depend on runtime device detection
-# (the `docker build` stage has no /dev/kfd device). This also keeps the hipcc
-# arch argument stable, which ccache relies on for cache hits.
+# (the `docker build` stage has no /dev/kfd device). PyTorch's ROCm build path
+# reads `PYTORCH_ROCM_ARCH`, not `TORCH_CUDA_ARCH_LIST`; the latter is CUDA-only
+# and rejects `gfx*` names. This also keeps the hipcc arch argument stable,
+# which ccache relies on for cache hits.
 ARG hygon_arch='gfx936'
 
 ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
@@ -125,6 +127,12 @@ RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wh
     "lmslim==0.3.1+das.opt4.dtk2604.torch290.2604281437.g61fdfe" \
     -c <(pip list --format freeze | grep -v -e "setuptools" -e "numpy" -e "triton" -e "aiter" -e "lightop" -e "lmslim")
 
+# Build dependencies are needed by the wheel stage and by some of the local
+# kernel packages installed in the dependency installer.
+COPY ./requirements-build.txt /tmp/requirements-build.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /tmp/requirements-build.txt
+
 # Download prometheus
 RUN --mount=type=secret,id=tos_id \
     --mount=type=secret,id=tos_key \
@@ -217,6 +225,10 @@ COPY ./chitu/metrics/grafana ./grafana
 
 ENV CHITU_HYGON_BUILD=1
 ENV CHITU_HYGON_BUILD_FOR_SHCA=$build_for_shca
+# Effective ROCm arch pin. `TORCH_CUDA_ARCH_LIST` above is CUDA-only and is kept
+# for any CUDA-style consumers; PyTorch's ROCm extension build reads
+# `PYTORCH_ROCM_ARCH`, which is what makes `/dev/kfd` unnecessary here.
+ENV PYTORCH_ROCM_ARCH=$hygon_arch
 ENV HIP_GRAPH_ACCUMULATE_DISPATCH=1
 ENV GPU_MAX_HW_QUEUES=3
 
@@ -235,5 +247,97 @@ ENV AITER_JIT_DIR=/tmp/chitu-aiter-jit
 COPY ./script/entrypoint-hygon.sh /chitu-entrypoint.sh
 ENTRYPOINT ["/chitu-entrypoint.sh", "/usr/local/bin/docker-entrypoint.sh"]
 
-# The actual installing procedure requries a NPU device, which is not available in the `docker build` stage.
-# We delay it to an additional `docker run` stage which runs `script/install.sh`.
+#####################################
+# Dependency resolver stage
+#
+# Generate the PyPI and local-package requirements files from get_requires.py,
+# including the selected optional extras. This stage needs torch only for
+# get_requires/csrc imports, hence the hyhal mount.
+FROM base AS dependency_resolver
+WORKDIR /workspace/chitu
+COPY . .
+RUN --mount=type=bind,from=hyhal,target=/opt/hyhal <<'EOF'
+set -e
+source /opt/hyhal/env.sh
+./gen_tmp_requirements_txt.py "${optional_deps}" --kind pypi > /tmp/requirements-pypi.txt
+./gen_tmp_requirements_txt.py "${optional_deps}" --kind local > /tmp/requirements-local.txt
+EOF
+
+#####################################
+# Dependency installer stage
+#
+# Install only the PyPI dependencies, with the base image's torch pinned by
+# `-c`. The local kernels are installed in the next stage, so changing a
+# kernel does not download these packages again.
+FROM base AS dependency_installer
+WORKDIR /workspace/chitu
+COPY --from=dependency_resolver /tmp/requirements-pypi.txt /tmp/requirements-pypi.txt
+COPY ./script/pip-multi-indices.sh ./script/pip-multi-indices.sh
+RUN ./script/pip-multi-indices.sh install --no-build-isolation -r /tmp/requirements-pypi.txt \
+    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "tokenizers" -e "xgrammar" -e "pytest" -e "build" -e "click") \
+    -i "${pypi_mirror}" \
+    -i https://pypi.org/simple \
+    --timeout 60 --retries 10
+
+#####################################
+# Local kernel stage
+#
+# Build and install the local kernel packages from third_party and
+# csrc/cpuinfer. The hyhal mount is only needed here (and in the wheel stage),
+# because building the kernels imports the vendor torch, while installing the
+# PyPI wheels above does not.
+FROM dependency_installer AS kernel_builder
+WORKDIR /workspace/chitu
+COPY ./third_party/sugon_mixq4_kernels ./third_party/sugon_mixq4_kernels
+COPY ./third_party/sugon_w4a8_kernels ./third_party/sugon_w4a8_kernels
+COPY ./third_party/hygon_w4a16_kernel ./third_party/hygon_w4a16_kernel
+COPY ./third_party/hygon_w8a8_kernel ./third_party/hygon_w8a8_kernel
+COPY ./third_party/boltops-hygon ./third_party/boltops-hygon
+COPY ./third_party/flashmla_hygon ./third_party/flashmla_hygon
+COPY ./third_party/deepgemm_hygon ./third_party/deepgemm_hygon
+COPY ./third_party/hygon_wheels ./third_party/hygon_wheels
+COPY ./csrc/cpuinfer ./csrc/cpuinfer
+COPY --from=dependency_resolver /tmp/requirements-local.txt /tmp/requirements-local.txt
+# Build wheels for the local kernels instead of installing them. The final
+# image only needs the wheels, so it does not have to copy the whole Python
+# tree from this stage (that copy duplicated about 10 GB of the base image).
+RUN --mount=type=bind,from=hyhal,target=/opt/hyhal <<'EOF'
+set -e
+source /opt/hyhal/env.sh
+pip wheel --no-build-isolation --no-deps -w /tmp/kernel-wheels -r /tmp/requirements-local.txt
+EOF
+
+#####################################
+# Wheel build stage
+#
+# Source is present only in the resolver/installer/wheel stages. The final
+# image copies just the wheel, so no source tree ends up in the image.
+FROM kernel_builder AS wheel_builder
+ARG enable_cython
+WORKDIR /workspace/chitu
+COPY . .
+# hyhal provides librocm_smi64.so.2, which the vendor torch loads at import
+# time. The wheel build runs setup.py, so it needs the same mount as the
+# dependency installer.
+RUN --mount=type=bind,from=hyhal,target=/opt/hyhal <<'EOF'
+set -e
+source /opt/hyhal/env.sh
+./script/build_for_dist.sh "${enable_cython}"
+EOF
+RUN mkdir -p /tmp/wheels && cp dist/*.whl /tmp/wheels/
+RUN rm -rf /workspace/chitu/*
+
+#####################################
+# Final image
+# Start from dependency_installer, not base: the PyPI dependencies are
+# installed there, and this stage must not copy the Python tree to get them.
+FROM dependency_installer AS final
+WORKDIR /workspace/chitu
+# Install the local kernel wheels and the chitu wheel. Both are already built,
+# and `--no-index --no-deps` keeps this stage from downloading anything.
+COPY --from=kernel_builder /tmp/kernel-wheels /tmp/kernel-wheels
+RUN --mount=from=wheel_builder,source=/tmp/wheels,target=/tmp/wheels <<'EOF'
+set -e
+pip install --no-index --no-deps /tmp/kernel-wheels/*.whl /tmp/wheels/*.whl
+rm -rf /tmp/kernel-wheels
+EOF

@@ -274,6 +274,7 @@ Build the image directly with the root `Dockerfile`:
 ```bash
 docker build \
   --build-arg torch_cuda_arch_list='<your_arch_list>' \
+  --build-arg is_at_least_blackwell='<true_or_false>' \
   --build-arg optional_deps='<comma_separated_optional_deps>' \
   --build-arg enable_cython='<true_or_false>' \
   --build-arg enable_test='<true_or_false>' \
@@ -284,98 +285,59 @@ docker build \
 
 #### MetaX GPU
 
-Some dependencies must be installed with device visible, so they must be installed with `docker run` rather than `docker build`. Therefore please prepare the build environment with at least one device, and use the two-stage build script with `muxi.Dockerfile`:
+Build the image with `muxi.Dockerfile`:
 
 ```bash
-bash ./script/two-stage-docker-build.sh \
-  'muxi.Dockerfile' \
-  '<your_image_name>' \
-  '<your_image_tag>' \
-  --optional_deps='<comma_separated_optional_deps>' \
-  --chitu_setup_jobs='<chitu_setup_jobs>' \
-  --enable_cython='<true_or_false>' \
-  --enable_test='<true_or_false>' \
-  --pypi_mirror='<your_pypi_mirror>' \
-  -- \
-  docker run \
-    --pid=host \
-    --device=/dev/dri \
-    --device=/dev/mxcd \
-    --group-add video \
-    --privileged=true \
-    --security-opt seccomp=unconfined \
-    --security-opt apparmor=unconfined \
-    --shm-size '<your_shm_size>' \
-    --ulimit memlock=-1 \
-    -w /workspace/chitu
+docker buildx build -f muxi.Dockerfile \
+  --build-arg optional_deps='<comma_separated_optional_deps>' \
+  --build-arg chitu_setup_jobs='<chitu_setup_jobs>' \
+  --build-arg enable_cython='<true_or_false>' \
+  --build-arg enable_test='<true_or_false>' \
+  --build-arg pypi_mirror='<your_pypi_mirror>' \
+  --load \
+  -t <your_image_name> \
+  .
 ```
 
 #### Ascend NPU
 
-Some dependencies must be installed with device visible, so they must be installed with `docker run` rather than `docker build`. Therefore please prepare the build environment with at least one device, and use the two-stage build script with `ascend.Dockerfile`:
+Build the image with `ascend.Dockerfile`, and pass the driver library directories with `--build-context`:
 
 ```bash
-bash ./script/two-stage-docker-build.sh \
-  'ascend.Dockerfile' \
-  '<your_image_name>' \
-  '<your_image_tag>' \
-  --optional_deps='<comma_separated_optional_deps>' \
-  --chitu_setup_jobs='<chitu_setup_jobs>' \
-  --enable_cython='<true_or_false>' \
-  --enable_test='<true_or_false>' \
-  --pypi_mirror='<your_pypi_mirror>' \
-  -- \
-  docker run \
-    --pid=host \
-    --privileged \
-    --device /dev/devmm_svm \
-    --device /dev/hisi_hdc \
-    -v /usr/local/dcmi:/usr/local/dcmi \
-    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
-    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-    -v /etc/ascend_install.info:/etc/ascend_install.info \
-    -v /dev/davinci<npu_id>:/dev/davinci<npu_id>
-    -w /workspace/chitu
+docker buildx build -f ascend.Dockerfile \
+  --build-context ascend_driver=/usr/local/Ascend/driver/lib64 \
+  --build-context ascend_dcmi=/usr/local/dcmi \
+  --build-arg optional_deps='<comma_separated_optional_deps>' \
+  --build-arg chitu_setup_jobs='<chitu_setup_jobs>' \
+  --build-arg enable_cython='<true_or_false>' \
+  --build-arg enable_test='<true_or_false>' \
+  --build-arg pypi_mirror='<your_pypi_mirror>' \
+  --load \
+  -t <your_image_name> \
+  .
 ```
 
 #### Hygon DCU
 
-Some dependencies must be installed with device visible, so they must be installed with `docker run` rather than `docker build`. Therefore please prepare the build environment with at least one device, and use the two-stage build script with `hygon.Dockerfile`:
+Build the image with `hygon.Dockerfile`, and pass hyhal with `--build-context`:
 
 ```bash
-bash ./script/two-stage-docker-build.sh \
-  'hygon.Dockerfile' \
-  '<your_image_name>' \
-  '<your_image_tag>' \
-  --optional_deps='<comma_separated_optional_deps>' \
-  --chitu_setup_jobs='<chitu_setup_jobs>' \
-  --enable_editable_install='<true_or_false>' \
-  --enable_cython='<true_or_false>' \
-  --enable_test='<true_or_false>' \
-  --pypi_mirror='<your_pypi_mirror>' \
-  -- \
-  docker run \
-    -u root \
-    --network=host \
-    --pid=host \
-    --privileged \
-    --device=/dev/kfd \
-    --device=/dev/dri \
-    --ipc=host \
-    --shm-size='<your_shm_size>' \
-    --group-add video \
-    --cap-add=SYS_PTRACE \
-    --security-opt seccomp=unconfined \
-    --ulimit stack=-1:-1 \
-    --ulimit memlock=-1:-1 \
-    -v /opt/hyhal:/opt/hyhal:ro \
-    -w /workspace/chitu
+docker buildx build -f hygon.Dockerfile \
+  --build-context hyhal=/usr/local/hyhal \
+  --build-arg optional_deps='<comma_separated_optional_deps>' \
+  --build-arg chitu_setup_jobs='<chitu_setup_jobs>' \
+  --build-arg enable_cython='<true_or_false>' \
+  --build-arg enable_test='<true_or_false>' \
+  --build-arg pypi_mirror='<your_pypi_mirror>' \
+  --build-arg build_for_shca='<true_or_false>' \
+  --load \
+  -t <your_image_name> \
+  .
 ```
 
 ### Build for Apptainer Image Distribution
 
-You can convert a Docker image to an Apptainer image. Apptainer is a good choice for deamonless execution.
+You can convert a Docker image to an Apptainer image. Apptainer is a good choice for daemonless execution.
 
 ```bash
 apptainer build <your_apptainer_image.sif> <your_docker_image>
@@ -542,6 +504,42 @@ torchrun --nnodes 1 \
     infer.max_seq_len=4096 \
     infer.use_cuda_graph=True
 ```
+
+#### Decode Context Parallelism
+
+`infer.dcp_size=1` disables Decode Context Parallelism (DCP). To shard
+historical KV pages across Decode ranks, set `infer.dcp_size` equal to
+`infer.tp_size`; DCP currently reuses the TP group. Enabling DCP requires
+`multi_inst.role=decode`, `infer.cache_type=paged`, and a
+GLM-5.2 model. In a disaggregated deployment, keep `infer.dcp_size=1`
+on Prefill instances and set it to the TP size on Decode instances. Prefill
+instances can continue to use PP with DCP disabled. With Decode PP enabled,
+each stage shards only its own layers' KV across its TP/DCP group; DCP
+collectives stay within that stage.
+
+`PagedKVCache` reserves one physical `S`-token page per rank for each logical
+`S * DCP`-token group. All ranks share the block IDs. Sequence page `p` belongs
+to rank `p % DCP` in group `p // DCP`. The append kernel maps token positions
+to local physical pages and masks non-owner writes. Ordinary and DCP writes
+use the same append interface and kernel. P-to-D transfers
+only each Decode rank's prompt pages. Decode prefix caching shares only complete,
+ready logical groups.
+
+The Decode attention path uses the following operations:
+
+1. Score owner-local indexer KV and select local top-k candidates.
+2. AllGather candidate scores and token IDs, then select the global top-k.
+3. Convert global token IDs to compact owner-local physical FlashMLA indices.
+4. AllGather Q head shards so every KV owner computes all query heads.
+5. Exchange partial outputs and LSE by head with AllToAll, then combine them
+   using LSE weights.
+
+Classic Decode and request-major MTP query rows use the same path. The formal
+BF16 path uses Hygon h64 FlashMLA with combined `kv_lora_k_pe[...,576]` records;
+selected latent KV is neither copied between ranks nor communicated. Local
+top-k reuses the backend selector. Global top-k compares unique 64-bit keys:
+larger scores win, and equal scores prefer smaller global token IDs. All KV
+owners therefore select the same token set without an additional broadcast.
 
 ### Multi-Node Parallelism with Slurm
 

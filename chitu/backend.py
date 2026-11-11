@@ -388,6 +388,7 @@ class Backend:
 
         initialize_parallel_groups(
             tp_size=parallelism_sizes.tp_size,
+            dcp_size=int(getattr(args.infer, "dcp_size", 1)),
             dp_size=parallelism_sizes.dp_size,
             etp_size=parallelism_sizes.etp_size,
             ep_size=parallelism_sizes.ep_size,

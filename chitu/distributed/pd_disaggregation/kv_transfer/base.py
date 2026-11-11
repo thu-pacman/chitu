@@ -76,6 +76,30 @@ class KVManagerBase:
         self._task_infos: dict[str, TaskInfo] = {}
         self._peer_cache_generations: dict[int, int] = {}
 
+        # Both roles read their stall-retire grace straight from this config
+        # object. `kv_transfer.transfer_timeout` is how long the RDMA engine may
+        # spend on one transfer, and a transfer past that point is already dead
+        # by the engine's own reckoning, so waiting longer would only hold
+        # blocks.
+        #
+        # Nothing narrows the value afterwards: `_info(create=True)` copies it
+        # into TaskInfo at creation time on both roles, and the Prefill subclass
+        # only checks (`assert`) that the configured value is below its Decode
+        # wait timeout.
+        self._kv_cfg = args.multi_inst.pd_disaggregation.kv_transfer
+        # How long the release of a request's KV blocks is postponed after its
+        # teardown trigger. Both roles need it: Prefill postpones while its KV
+        # send is still in flight, Decode postpones while PrefillDone has not
+        # arrived. An RDMA write cannot be cancelled, so a release that runs
+        # right at the trigger can free memory the wire is still writing or
+        # reading. The same value applies to both roles, so it lives here rather
+        # than in one subclass. This is `transfer_grace_timeout`, a different key
+        # from `transfer_timeout`: the former is the extra wait after the
+        # teardown trigger, the latter is the transfer budget itself.
+        self._release_defer_s = float(
+            getattr(self._kv_cfg, "transfer_grace_timeout", 0.0) or 60.0
+        )
+
         # transfer engine
         ib_device = detect_ib_devices()
         self.transfer_engine = MooncakeTransferEngine(
@@ -149,7 +173,10 @@ class KVManagerBase:
         """Get or create the TaskInfo for *request*."""
         info = self._task_infos.get(req_id)
         if info is None and create:
-            info = TaskInfo(req_id=req_id)
+            info = TaskInfo(
+                req_id=req_id,
+                transfer_grace_s=float(self._kv_cfg.transfer_timeout),
+            )
             self._task_infos[req_id] = info
         return info
 

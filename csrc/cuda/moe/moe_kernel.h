@@ -29,7 +29,7 @@ void moe_gate(torch::Tensor &linear_output, torch::Tensor &expertsIds,
               torch::Tensor &selectedExpertsWeights, int n_groups,
               int topK_groups, int topInGroup,
               c10::optional<torch::Tensor> bias, std::string score_func,
-              bool norm_prob);
+              bool norm_prob, double routed_scaling_factor = 1.0);
 
 void hash_route_gate(torch::Tensor &x, torch::Tensor &weight,
                      torch::Tensor &input_ids, torch::Tensor &tid2eid,

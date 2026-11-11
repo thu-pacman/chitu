@@ -157,6 +157,15 @@ RUN if [ "${enable_test}" = "true" ]; then \
     pip install pytest matplotlib; \
 fi
 
+# Build-only dependencies (Cython, pybind11, ninja, ...) are needed by the
+# local kernel packages and by the wheel stage. Install them in the base so
+# they stay cached when a dependency or kernel layer below changes. Keep this
+# at the end of the base stage so a change here does not rerun the heavy base
+# setup above.
+COPY ./requirements-build.txt /tmp/requirements-build.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /tmp/requirements-build.txt
+
 WORKDIR /workspace/chitu
 COPY ./test ./test
 COPY ./script ./script
@@ -164,6 +173,36 @@ COPY ./benchmarks ./benchmarks
 COPY ./chitu/metrics/grafana ./grafana
 
 ENV CHITU_MUXI_BUILD=1
+
+# MetaX's cpp_extension already adds --offload-arch=xcore1000 in
+# COMMON_MXCC_FLAGS. The generic CUDA _get_cuda_arch_flags path is CUDA-only and
+# needs a visible card, so make it a no-op for MACA builds. Patching the torch
+# module (rather than setting TORCH_CUDA_ARCH_LIST) keeps the native
+# --offload-arch=xcore1000 target and applies to the optional kernel packages
+# built below, not just to chitu itself.
+RUN python <<'PY'
+import pathlib
+p = pathlib.Path("/opt/conda/lib/python3.10/site-packages/torch/utils/cpp_extension.py")
+code = p.read_text()
+marker = "# CHITU_MACA_ARCH_PATCH"
+if marker not in code:
+    code += (
+        "\n# CHITU_MACA_ARCH_PATCH\n"
+        "if __import__('os').environ.get('CHITU_MUXI_BUILD', '0').strip() == '1':\n"
+        "    _get_cuda_arch_flags = lambda cflags=None: []\n"
+    )
+    p.write_text(code)
+PY
+
+# The MACA torch in the base image controls the compiled device targets with
+# TORCH_EXTENSION_ENABLE_XC1500_COMPILE:
+#   - unset (or empty): COMMON_MXCC_FLAGS only contains --offload-arch=xcore1000,
+#     so the image only carries C500 kernels;
+#   - set to a non-empty value: both xcore1000 and xcore1500 are compiled into
+#     the same binaries, so the image also runs on C600.
+# It is a build-time switch, not a per-device runtime choice, and the vendor
+# code checks it for truthiness: the string "0" counts as set, so leave it
+# unset for a C500-only image.
 
 # Update entrypoint, which calls the original entrypoint of the base image.
 #
@@ -173,5 +212,75 @@ ENV CHITU_MUXI_BUILD=1
 COPY ./script/entrypoint.sh /chitu-entrypoint.sh
 ENTRYPOINT ["/chitu-entrypoint.sh", "/bin/bash", "/entrypoint.sh"]
 
-# The actual installing procedure requries a GPU device, which is not available in the `docker build` stage.
-# We delay it to an additional `docker run` stage which runs `script/install.sh`.
+#####################################
+# Dependency resolver stage
+#
+# Generate the PyPI and local-package requirements files from get_requires.py,
+# including the selected optional extras. This stage needs torch only for
+# get_requires/csrc imports. Splitting the result keeps a local kernel change
+# from invalidating the PyPI dependency layer.
+FROM base AS dependency_resolver
+WORKDIR /workspace/chitu
+COPY . .
+RUN ./gen_tmp_requirements_txt.py "${optional_deps}" --kind pypi > /tmp/requirements-pypi.txt
+RUN ./gen_tmp_requirements_txt.py "${optional_deps}" --kind local > /tmp/requirements-local.txt
+
+#####################################
+# Dependency installer stage
+#
+# Install only the PyPI dependencies, with the base image's torch pinned by
+# `-c`. The local kernels are installed in the next stage, so changing a
+# kernel does not download these packages again.
+FROM base AS dependency_installer
+WORKDIR /workspace/chitu
+COPY --from=dependency_resolver /tmp/requirements-pypi.txt /tmp/requirements-pypi.txt
+COPY ./script/pip-multi-indices.sh ./script/pip-multi-indices.sh
+RUN ./script/pip-multi-indices.sh install --no-build-isolation -r /tmp/requirements-pypi.txt \
+    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "tokenizers" -e "xgrammar" -e "pytest" -e "build" -e "click") \
+    -i "${pypi_mirror}" \
+    -i https://pypi.org/simple \
+    --timeout 60 --retries 10
+
+#####################################
+# Local kernel stage
+#
+# Build and install the local kernel packages from third_party and
+# csrc/cpuinfer. This stage depends only on those sources, so changing one of
+# them does not reinstall the PyPI dependencies from the stage above.
+FROM dependency_installer AS kernel_builder
+WORKDIR /workspace/chitu
+COPY ./third_party/muxi_layout_kernels ./third_party/muxi_layout_kernels
+COPY ./third_party/muxi_w8a8_kernels ./third_party/muxi_w8a8_kernels
+COPY ./third_party/metax_soft_fp4_kernels ./third_party/metax_soft_fp4_kernels
+COPY ./csrc/cpuinfer ./csrc/cpuinfer
+COPY --from=dependency_resolver /tmp/requirements-local.txt /tmp/requirements-local.txt
+# Build wheels for the local kernels instead of installing them, so the final
+# image can install them without copying the whole conda environment.
+RUN pip wheel --no-build-isolation --no-deps -w /tmp/kernel-wheels -r /tmp/requirements-local.txt
+
+#####################################
+# Wheel build stage
+#
+# Source is present only in the resolver/installer/wheel stages. The final
+# image copies just the wheel, so no source tree ends up in the image.
+FROM kernel_builder AS wheel_builder
+ARG enable_cython
+WORKDIR /workspace/chitu
+COPY . .
+RUN ./script/build_for_dist.sh "${enable_cython}"
+RUN mkdir -p /tmp/wheels && cp dist/*.whl /tmp/wheels/
+RUN rm -rf /workspace/chitu/*
+
+#####################################
+# Final image
+# Start from dependency_installer, not base: the PyPI dependencies are
+# installed there, and this stage must not copy the conda tree to get them.
+FROM dependency_installer AS final
+WORKDIR /workspace/chitu
+# Install the local kernel wheels and the chitu wheel; both are prebuilt.
+COPY --from=kernel_builder /tmp/kernel-wheels /tmp/kernel-wheels
+RUN --mount=from=wheel_builder,source=/tmp/wheels,target=/tmp/wheels <<'EOF'
+set -e
+pip install --no-index --no-deps /tmp/kernel-wheels/*.whl /tmp/wheels/*.whl
+rm -rf /tmp/kernel-wheels
+EOF

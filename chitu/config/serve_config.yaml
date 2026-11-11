@@ -328,6 +328,9 @@ infer:
 
   #: Token layout used by Prefill Context Parallel: "interleaved" or "contiguous".
   pcp_layout: interleaved
+  #: Number of Decode Context Parallel ranks used to shard historical KV pages.
+  #: See `docs/en/DEVELOPMENT.md#parallelism` for details.
+  dcp_size: 1
 
   #: Number of Tensor Parallel ranks for non-MoE models or non-MoE modules in MoE models.
   #: See `docs/en/DEVELOPMENT.md#parallelism` for details.
@@ -766,7 +769,10 @@ multi_inst:
     #: Additional configs for KV transfer
     kv_transfer:
       buffer_size: 2048
-      transfer_timeout: 30.0
+      #: How long the RDMA engine may spend on one transfer. Both roles derive
+      #: their stall-retire grace from it, because a transfer past this point is
+      #: dead by the engine's own reckoning, so waiting longer only holds blocks.
+      transfer_timeout: 120.0
       max_concurrent_transfers: 8
       decode_wait_timeout_s: 300.0
       decode_resend_interval_s: 0.5
@@ -774,6 +780,11 @@ multi_inst:
       #: Message-loss fallback on the Prefill side: how long to wait for the
       #: DecodeAllocated signal before failing the request at request level.
       prefill_wait_timeout_s: 600.0
+      #: How long both sides postpone releasing a request's KV blocks after that
+      #: request's teardown trigger. An RDMA write cannot be cancelled, so
+      #: releasing the blocks right at the trigger would let the next request
+      #: overwrite memory the wire is still reading or writing.
+      transfer_grace_timeout: 60.0
       decode_prealloc_max_pending: null
       decode_prealloc_poll_interval_s: 0.01
       decode_prealloc_token_budget: null

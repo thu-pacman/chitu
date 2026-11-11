@@ -193,6 +193,8 @@ class HygonIndexer(DSAIndexer):
             get_page_ids=cache_accessor.get_page_ids,
             get_offs_in_page=cache_accessor.get_offs_in_page,
             use_i64_offsets=cache_accessor.use_i64_offsets,
+            dcp_size=cache_accessor.dcp_size,
+            dcp_rank=cache_accessor.dcp_rank,
         )
 
     def bf16_index_score_ragged_qk_dsv32_hygon(
@@ -267,22 +269,19 @@ class HygonIndexer(DSAIndexer):
         weights: torch.Tensor,  # [s_q, h], fp32
         k: torch.Tensor,  # [n_pages, page_size, d=128]
         seq_len_delta: BatchedSeqLenDelta,
-        k_page_table: torch.Tensor,  # [b, n_pages_per_seq]
+        k_page_table: torch.Tensor,
+        *,
+        context_lens=None,
+        score_width=None,
     ):
-        """
-        Indexer score by Hygon DeepGEMM paged_mqa_logits() for decode stage.
-
-        The main decode pass supplies all configured MTP queries together,
-        while each draft-layer pass supplies one query per request. Infer the
-        actual query group size from the tensor instead of assuming that every
-        call contains ``self.mtp_size`` queries.
-        """
+        """Score paged K with request groups or independent per-query lengths."""
         s_q, h, d = q.shape
-        batch_size = seq_len_delta.batch_size
+        if context_lens is None:
+            context_lens = seq_len_delta.new.lens_tensor_device
+        batch_size = context_lens.shape[0]
+        width = self.static_max_n if score_width is None else score_width
         if batch_size == 0:
-            return torch.empty(
-                (0, self.static_max_n), dtype=torch.float32, device=q.device
-            )
+            return torch.empty((0, width), dtype=torch.float32, device=q.device)
         if s_q % batch_size != 0:
             raise ValueError(
                 f"Hygon paged MQA requires query rows divisible by batch size, "
@@ -294,7 +293,8 @@ class HygonIndexer(DSAIndexer):
                 "Hygon paged MQA query group must be between 1 and the "
                 f"configured mtp_size={self.mtp_size}, got {next_n}"
             )
-
+        if k.shape[1] != 64:
+            raise NotImplementedError("Hygon paged MQA requires page_size=64")
         # reshape as batch view
         q = q.view(batch_size, next_n, h, d)
 
@@ -302,7 +302,7 @@ class HygonIndexer(DSAIndexer):
         assert k.dim() == 3
         k = k.unsqueeze(2)
 
-        context_lens = seq_len_delta.new.lens_tensor_device
+        context_lens = context_lens.to(torch.int32).contiguous()
         schedule_meta = hygon_deepgemm.get_paged_mqa_logits_metadata(
             context_lens,
             64,  # DeepGEMM paged MQA metadata uses page_size=64
@@ -315,7 +315,7 @@ class HygonIndexer(DSAIndexer):
             context_lens,
             k_page_table,
             schedule_meta,
-            self.static_max_n,
+            width,
             clean_logits=True,
         )
 
@@ -328,19 +328,21 @@ class HygonIndexer(DSAIndexer):
         is_causal: bool = True,
         ke: Optional[torch.Tensor] = None,
         ks: Optional[torch.Tensor] = None,
+        *,
+        page_table=None,
+        context_lens=None,
+        score_width=None,
     ):
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
-        # CP: k is allgathered global K (n_local*pcp_size tokens), k_append is local K (n_local tokens).
-        # When k's size doesn't match delta_position_ids (warmup/decode with few tokens),
-        # fall back to k_append which has the matching size.
-
-        if seq_len_delta.is_decode_stage:
+        if seq_len_delta.is_decode_stage or context_lens is not None:
             index_score = self.bf16_index_score_ragged_q_paged_k_dsv32_hygon(
                 q,
                 weights,
                 cache_accessor.kv["indexer_k"],
                 seq_len_delta,
-                cache_accessor.block_table,
+                cache_accessor.block_table if page_table is None else page_table,
+                context_lens=context_lens,
+                score_width=score_width,
             )
         else:
             k = read_from_paged_kv_cache(

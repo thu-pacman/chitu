@@ -13,6 +13,7 @@ from chitu.kv_cache import (
 )
 from chitu.kv_cache.builders import (
     CacheBuildBundle,
+    _dcp_size,
     _device_from_args,
     _resolve_default_num_blocks,
     register_cache_manager_builder,
@@ -211,6 +212,9 @@ def _deepseek_v4_compress_ratios(args) -> list[int]:
 
 @register_cache_manager_builder(model_types=[ModelType.DEEPSEEK_V4], priority=4)
 def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
+    if _dcp_size(args) > 1:
+        raise ValueError("Decode CP does not support CSA/HCA caches")
+
     if _is_deepseek_v4_flash_mla_backend(attn_backend_type) and (
         args.infer.cache_type != "paged"
     ):

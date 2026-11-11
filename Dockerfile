@@ -217,31 +217,31 @@ fi
 #####################################
 # Dependency Resolver Stage
 #
-# The only purpose of this stage is to generate a requirements.txt file. This
-# stage may trigger rebuild whenever there is any change in the source code,
-# but this stage runs fast.
+# The only purpose of this stage is to generate the PyPI requirements file and
+# the local-package requirements file. This stage may trigger rebuild whenever
+# there is any change in the source code, but this stage runs fast.
 FROM basic_deps AS dependency_resolver
 
 WORKDIR /workspace/chitu
 COPY . .
 
-RUN ./gen_tmp_requirements_txt.py "${optional_deps}" > /tmp/requirements.txt
+RUN ./gen_tmp_requirements_txt.py "${optional_deps}" --kind pypi > /tmp/requirements-pypi.txt
+RUN ./gen_tmp_requirements_txt.py "${optional_deps}" --kind local > /tmp/requirements-local.txt
 
 
 #####################################
 # Dependency Installer Stage
 #
-# This stage installs the dependencies listed in requirements.txt. Some of the
-# dependencies may require compilation, so this stage may take a long time, but
-# this stage only triggers rebuild when the requirements.txt file changes, or
-# this source of the dependencies changes.
+# This stage installs the PyPI dependencies listed in requirements-pypi.txt.
+# The local kernel packages in requirements-local.txt are installed by the next
+# stage, so a kernel change does not reinstall these packages. Some of them may
+# require compilation, so this stage may take a long time, but this stage only
+# triggers rebuild when the PyPI requirements or the base stage changes.
 FROM basic_deps AS dependency_installer
 
 WORKDIR /workspace/chitu
-COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
+COPY --from=dependency_resolver /tmp/requirements-pypi.txt /tmp/requirements-pypi.txt
 
-COPY ./third_party ./third_party
-COPY ./csrc/cpuinfer ./csrc/cpuinfer
 COPY ./script/pip-multi-indices.sh ./script/pip-multi-indices.sh
 
 # NOTE: Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
@@ -253,7 +253,7 @@ COPY ./script/pip-multi-indices.sh ./script/pip-multi-indices.sh
 # NOTE: We use `./script/pip-multi-indices.sh` to set `https://pypi.org/simple` as a fallback,
 #       because some optional dependencies (e.g. `mooncake-transfer-engine-cuda13`) is not avaiable
 #       in some PyPI mirrors.
-RUN ./script/pip-multi-indices.sh install --no-build-isolation -r /tmp/requirements.txt \
+RUN ./script/pip-multi-indices.sh install --no-build-isolation -r /tmp/requirements-pypi.txt \
     -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest" -e "build" -e "click") \
     -i "${pypi_mirror}" \
     -i https://pypi.org/simple \
@@ -280,10 +280,39 @@ print(next((d.version for d in m.distributions() if (d.metadata.get('Name') or '
 
 
 #####################################
+# Local Kernel Stage
+#
+# Build and install the local kernel packages from third_party and
+# csrc/cpuinfer. This stage depends only on those sources, so changing one of
+# them does not reinstall the PyPI dependencies from the stage above.
+FROM dependency_installer AS kernel_builder
+
+WORKDIR /workspace/chitu
+COPY ./third_party/DeepEP ./third_party/DeepEP
+COPY ./third_party/DeepGEMM ./third_party/DeepGEMM
+COPY ./third_party/FlashMLA ./third_party/FlashMLA
+COPY ./third_party/flash-attention ./third_party/flash-attention
+# hard_fp4_kernels includes headers from ../../cutlass.
+COPY ./third_party/cutlass ./third_party/cutlass
+COPY ./third_party/hard_fp4_kernels ./third_party/hard_fp4_kernels
+COPY ./third_party/fast-hadamard-transform ./third_party/fast-hadamard-transform
+COPY ./third_party/hpc-ops ./third_party/hpc-ops
+# cpuinfer vendors llama.cpp and llamafile from these two directories.
+COPY ./third_party/llama.cpp ./third_party/llama.cpp
+COPY ./third_party/llamafile ./third_party/llamafile
+COPY ./csrc/cpuinfer ./csrc/cpuinfer
+COPY --from=dependency_resolver /tmp/requirements-local.txt /tmp/requirements-local.txt
+
+# Build wheels for the local kernels instead of installing them, so the final
+# image can install them without copying the whole conda environment.
+RUN pip wheel --no-build-isolation --no-deps -w /tmp/kernel-wheels -r /tmp/requirements-local.txt
+
+
+#####################################
 # Wheel build Stage
 #
 # This stage build wheel file of chitu.
-FROM dependency_installer AS wheel_builder
+FROM kernel_builder AS wheel_builder
 
 ARG enable_cython
 
@@ -299,18 +328,20 @@ RUN rm -rf /workspace/chitu/*
 
 
 #####################################
-# Build Stage
+# Final Stage
 # 
-FROM basic_deps AS build
+# Start from dependency_installer, not basic_deps: the PyPI dependencies are
+# installed there, and this stage must not copy the conda tree to get them.
+FROM dependency_installer AS final
 
 WORKDIR /workspace/chitu
-COPY --from=dependency_installer /opt/conda /opt/conda
+COPY --from=kernel_builder /tmp/kernel-wheels /tmp/kernel-wheels
 
-# Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
-# compile at install time, and the compile results are environment dependent.
+# Install prebuilt wheels only. `--no-index --no-deps` keeps this stage from
+# downloading or resolving anything.
 RUN --mount=from=wheel_builder,source=/tmp/wheels,target=/tmp/wheels \
-  pip install /tmp/wheels/*.whl \
-    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest" -e 'typing-extensions' -e 'typing_extensions' -e "build" -e "click" -e "idna")
+  pip install --no-index --no-deps /tmp/kernel-wheels/*.whl /tmp/wheels/*.whl \
+  && rm -rf /tmp/kernel-wheels
 
 RUN rm -rf /tmp/*
 COPY ./test ./test

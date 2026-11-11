@@ -6,6 +6,7 @@
 
 from chitu.backend import Backend
 from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
+from chitu.kv_cache.utils import kv_cache_block_layout
 from chitu.utils import ceil_div
 from typing import TYPE_CHECKING, Optional
 
@@ -68,7 +69,7 @@ def get_prealloc_blocks(dp_size: int) -> Optional[dict[int, int]]:
         return None
     if not hasattr(Backend.cache_dict[MAIN_CACHE_NAME], "block_size"):
         return None
-    block_size = Backend.cache_dict[MAIN_CACHE_NAME].block_size
+    block_size = kv_cache_block_layout(Backend.cache_dict[MAIN_CACHE_NAME])[1]
     if block_size <= 0:
         return None
     tokens_by_dp = getattr(scheduler, "_decode_prealloc_tokens_inflight_by_dp", None)

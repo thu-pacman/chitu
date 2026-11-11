@@ -345,9 +345,10 @@ class Scheduler:
             # Skip Cache that does not support prefix caching e.g. singleton without checkpoint_interval
             if not manager.enable_prefix_caching:
                 continue
-            cache_manager_block_sizes.append(manager.block_size)
+            cache_manager_block_sizes.append(manager.block_size * manager.dcp_size)
             num_cached_tokens = min(
-                num_cached_tokens, manager.num_cached_blocks(task) * manager.block_size
+                num_cached_tokens,
+                manager.num_cached_blocks(task) * manager.block_size * manager.dcp_size,
             )
             if num_cached_tokens <= completed_tokens:
                 return completed_tokens
@@ -587,8 +588,20 @@ class Scheduler:
             for cache_manager in self.cache_manager_dict.values()
         )
         if has_kv_cache:
-            for cache_manager in self.cache_manager_dict.values():
+            released = [
                 cache_manager.finalize_metadata_all_decode(task)
+                for cache_manager in self.cache_manager_dict.values()
+            ]
+            if not all(released):
+                # A cache manager is postponing the release: this request's KV
+                # blocks are still on the RDMA wire, so freeing them now would let
+                # the next request overwrite pages being read. Keep the task in
+                # the pool (it is already Stopped, so need_remove() is True) and
+                # let Scheduler.update() retry the finalize next step; the
+                # postponement is bounded by transfer_grace_timeout. Removing the
+                # task here would leave nobody to finalize those blocks, i.e. a
+                # permanent block leak.
+                return
             Backend.executor.end_task_step([task_id])
 
         TaskPool.remove(task_id)
@@ -811,6 +824,7 @@ class Scheduler:
                 # 发给 prefill 端"跳过的块数"，只能是被 prefix cache 命中的可复用块，
                 # 所以用 token 位置映射的块数（不含固定预留）
                 manager.num_token_mapped_blocks_for_seq_len(num_cached_tokens)
+                * manager.dcp_size
                 if getattr(manager, "enable_prefix_caching", False)
                 else 0
             )
@@ -1234,16 +1248,27 @@ class Scheduler:
         for task_id in task_ids:
             task = TaskPool.pool[task_id]
             if task.need_remove():
-                removed_task_ids.append(task_id)
                 if type(self) != SkewScheduler:
-                    for cache_manager in self.cache_manager_dict.values():
+                    released = [
                         cache_manager.finalize_metadata_all_decode(task)
+                        for cache_manager in self.cache_manager_dict.values()
+                    ]
+                    if not all(released):
+                        # A cache manager is postponing the release: this
+                        # request's KV blocks are still on the RDMA wire, and
+                        # freeing them now would let the next request overwrite
+                        # what is being read. Keep the task in the pool so this
+                        # loop retries next step; the postponement is bounded by
+                        # transfer_grace_timeout, after which the release runs
+                        # as usual.
+                        continue
                     self.kvcache_block_threshold = self.cache_manager_dict[
                         MAIN_CACHE_NAME
                     ].num_blocks
                     logger.debug(
                         f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {self.cache_manager_dict[MAIN_CACHE_NAME].num_blocks}"
                     )
+                removed_task_ids.append(task_id)
                 TaskPool.remove(task_id)
                 self._task_evict_hook.on_task_remove(task)
 

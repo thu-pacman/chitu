@@ -148,7 +148,7 @@ Decode Scheduler 收到请求后入队到 `_decode_incoming_q`。后台推进线
 
 Decode ctrl rank 通过 PUB/SUB relay 广播 `DecodePrepare` 到所有 Decode rank。dp_rank 匹配的 rank 调用 `prepare_kv_transfer()`：
 - 为每个 cache 分配 block（`PagedKVCache` 或 `SingletonPagedKVCache`）
-- 调用 `cache.构造 TransferBuffers (block_ids)()` 收集 recv_buffers（物理地址 + key）
+- 构造 `TransferBuffers`。普通路径使用全部 destination physical IDs；DecodeCP下 rank 只发布本 rank 拥有的 `physical_page_ids[Nowned]`，并携带对齐的 `sequence_page_indices[Nowned]`
 - 记录 `recv_bytes` 用于后续字节校验
 - 发送 `DecodeAllocated` 到 Prefill ctrl rank
 
@@ -157,7 +157,7 @@ Decode ctrl rank 通过 PUB/SUB relay 广播 `DecodePrepare` 到所有 Decode ra
 Prefill ctrl rank 收到 `DecodeAllocated` 后通过 PUB/SUB relay 广播到所有 Prefill rank。Scheduler 侧的队列推进（`_prefill_incoming_q → _prefill_bootstrap_q → _prefill_ready_q`）等待 `is_decode_allocated` 就绪后创建 Task 执行 prefill。
 
 Prefill 完成后触发 `MooncakeKVTransferHook.on_prefill_done()`，每个 Prefill rank 调用 `KVManagerPrefill.send_kv_cache()`：
-- 遍历 `Backend.cache_dict` 中所有 cache，调用 `cache.构造 TransferBuffers (block_ids)()` 收集 send_buffers
+- 遍历 `Backend.cache_dict` 中所有 cache，收集 Prefill physical block IDs 和对齐的 sequence page indices
 - `create_transfer_plan(static_plan, send_buffers, recv_buffers)` 生成 `TransferPlan`
 - 提交到 `ThreadPoolExecutor` 异步执行 RDMA
 
@@ -300,6 +300,8 @@ class CacheInfo:
 **per-rank 交换**：每个 rank 收集自身 `RankCacheInfos` → `all_gather_object` 汇聚 → coordinator 交换 → Prefill 侧用 `build_static_transfer_plan()` 构建 per-rank `StaticTransferPlan`。`kv_recv_reorder()` 通过 `local_dists.get(key)` 和 `remote_dists.get_any(key)` 动态计算 `n_chunks`。
 
 通过 `gcd(local.split_len, remote.split_len)` 动态对齐——无论 P/D 两端的 TP 大小如何，chunking 总能自动匹配。
+
+Decode-CP storage 虽不是 tensor replica，仍复用 `replica_id/replica_size` 完成静态 source-rank → destination-owner 配对；随后由 per-request sequence page indices 选择该 owner 的 pages。固定的 `sequence_page_index % dcp_size` 归属规则保持相同前缀的 owner 一致；P/D 按统一完整块命中长度跳传，目的端只发布本 owner 尚需接收的页。
 ### PDCoordinationService（`pd_coordination.py`）
 
 运行在 Router 进程中，负责调度器注册与 P/D 配对的状态管理（`register_scheduler` / `register_pd_pair` / `get_pd_stats`）。
@@ -384,7 +386,7 @@ multi_inst:
 
     kv_transfer:
       buffer_size: 2048
-      transfer_timeout: 30.0
+      transfer_timeout: 120.0
       max_concurrent_transfers: 8
       decode_wait_timeout_s: 300.0     # Decode 等待 KV 传输完成的超时
       decode_resend_interval_s: 0.5    # Decode 重发 DecodePrepare 间隔

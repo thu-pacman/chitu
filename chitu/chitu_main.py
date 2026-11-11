@@ -260,7 +260,7 @@ def _direct_warmup_num_blocks_for_cache(
     storage_len = target_len // int(ratio) if ratio is not None else target_len
     if storage_len <= 0:
         return 0
-    return ceil_div(storage_len, int(cache.block_size))
+    return ceil_div(storage_len, kv_cache_block_layout(cache)[1])
 
 
 def _build_direct_warmup_new_cache_ids_list(
@@ -508,7 +508,7 @@ def _auto_set_deepseek_v4_num_blocks_after_warmup(
                 sorted(block_counts),
             )
         cap = min(int(cache.get_allocatable_max_num_blocks()) for _, cache in caches)
-        block_sizes = {int(cache.block_size) for _, cache in caches}
+        block_sizes = {int(cache.block_size * cache.dcp_size) for _, cache in caches}
         if len(block_sizes) != 1:
             logger.warning(
                 "DeepSeek-V4 manager group %s has mismatched block sizes: %s; "
@@ -843,8 +843,9 @@ def _auto_set_num_blocks_after_warmup(args):
             )
             cleanup_cuda_if_needed()
 
-    get_global_args().infer.num_blocks = (
-        max_tokens // Backend.cache_dict[MAIN_CACHE_NAME].block_size
+    get_global_args().infer.num_blocks = max_tokens // (
+        Backend.cache_dict[MAIN_CACHE_NAME].block_size
+        * Backend.cache_dict[MAIN_CACHE_NAME].dcp_size
     )
 
     # reallocate blocks for cache managers (skip fixed-capacity managers, whose
@@ -858,7 +859,8 @@ def _auto_set_num_blocks_after_warmup(args):
                 if not is_reallocable_kv_cache(manager):
                     continue
                 target_blocks = _kv_cache_target_blocks(manager, max_tokens)
-                if target_blocks != manager.num_blocks:
+                current_blocks = int(manager.num_blocks)
+                if target_blocks != current_blocks:
                     manager.realloc(target_blocks)
                     logger.info(
                         "scheduler dp_rank=%d %s cache manager synced to %d blocks after warmup",
@@ -1613,7 +1615,9 @@ def _update_tasks_preferred_dp_rank(
                 cached_tokens = task.prefix_tokens_len
                 for cache_manager in cache_managers:
                     manager_cached_tokens = (
-                        cache_manager.num_cached_blocks(task) * cache_manager.block_size
+                        cache_manager.num_cached_blocks(task)
+                        * cache_manager.block_size
+                        * cache_manager.dcp_size
                     )
                     cached_tokens = min(cached_tokens, manager_cached_tokens)
                 if task.prefix_tokens_len > 0:
@@ -1998,9 +2002,16 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
                     num_managers = len(Backend.cache_managers)
                     for cache_manager_dict in Backend.cache_managers:
                         if block_size is None:
-                            block_size = cache_manager_dict[MAIN_CACHE_NAME].block_size
+                            # Router's wire block_size is the prefix-hash token span:
+                            # physical page tokens * DCP size, matching manager hashes.
+                            block_size = (
+                                cache_manager_dict[MAIN_CACHE_NAME].block_size
+                                * cache_manager_dict[MAIN_CACHE_NAME].dcp_size
+                            )
                         assert (
-                            block_size == cache_manager_dict[MAIN_CACHE_NAME].block_size
+                            block_size
+                            == cache_manager_dict[MAIN_CACHE_NAME].block_size
+                            * cache_manager_dict[MAIN_CACHE_NAME].dcp_size
                         ), f"The block size of all main cache managers in the same instance should be the same. "
 
                         num_blocks += cache_manager_dict[MAIN_CACHE_NAME].num_blocks

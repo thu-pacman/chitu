@@ -21,6 +21,7 @@ from chitu.moe.batched_expert_result import (
 )
 from chitu.ops import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant
+from chitu.ops.quant.blockfp8.matmul import blockfp8_gemm_wants_packed_ue8m0_scale
 from chitu.ops.triton_ops.quant_gemm import tma_align_input_scale
 from chitu.utils import try_import_opt_dep
 from chitu.lazy import eval_lazy
@@ -321,6 +322,12 @@ def _(
         intermediate_cache2,
         scale_block_shape=block_shape,
         round_scale_to_pow2=round_scale_to_pow2,
+        # `m_grouped_fp8_gemm_nt_contiguous` transforms the (ungrouped) sfa just
+        # like the dense GEMM, so the packed UE8M0 layout is passed through.
+        packed_ue8m0=blockfp8_gemm_wants_packed_ue8m0_scale(
+            round_scale_to_pow2=round_scale_to_pow2,
+            scale_block_shape=block_shape,
+        ),
     )
     del intermediate_cache2
 

@@ -411,7 +411,11 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                     self.num_global_experts * self.etp_group.group_size,
                     use_fp8=dispatch_use_fp8,
                     round_scale=round_scale_to_pow2,
-                    use_ue8m0=False,  # Not using 8bit storage for now
+                    use_ue8m0=(
+                        dispatch_use_fp8
+                        and round_scale_to_pow2
+                        and torch.cuda.get_device_capability()[0] == 10
+                    ),
                     cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                     async_finish=async_finish,
                     return_recv_hook=return_recv_hook,

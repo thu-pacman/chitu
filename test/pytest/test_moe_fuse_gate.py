@@ -8,7 +8,6 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
 )
 
-triton, has_triton = try_import_platform_dep("triton")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
@@ -201,3 +200,70 @@ def test_moe_fused_gate(
             / weights.nelement()
             < tolerate_ratio
         )
+
+
+@pytest.mark.parametrize(
+    "dtype,norm_prob,num_experts,topk",
+    [(torch.bfloat16, True, 256, 8), (torch.float32, False, 8, 6)],
+)
+def test_moe_gate_scaled_output_dtypes(dtype, norm_prob, num_experts, topk):
+    if not has_chitu_backend:
+        pytest.skip("chitu_backend is not available")
+
+    torch.manual_seed(7)
+    scores = torch.randn(17, num_experts, device="cuda", dtype=dtype)
+    # All selection scores are negative; selecting an expert must exclude it
+    # with -inf, rather than allowing it to win again with a cleared score of 0.
+    bias = torch.arange(num_experts, device="cuda", dtype=torch.float32) * 0.01 - 4.0
+    kwargs = dict(
+        num_expert_group=1,
+        topk_group=1,
+        topk_as_topk_group_criteria=None,
+        e_score_correction_bias=bias,
+        score_func="sigmoid",
+        norm_prob=norm_prob,
+    )
+    ref_ids, ref_weights = moe_gate(scores, topk, impl="torch", **kwargs)
+    for impl in ["torch", "cuda"]:
+        ids, weights = moe_gate(scores, topk, impl=impl, **kwargs)
+        converted_ids, converted_weights = moe_gate(
+            scores,
+            topk,
+            impl=impl,
+            routed_scaling_factor=2.5,
+            output_dtypes=(torch.int64, torch.float32),
+            **kwargs,
+        )
+        torch.testing.assert_close(converted_ids, ids.long(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            converted_weights, (weights * 2.5).float(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(ids.long(), ref_ids.long(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            weights,
+            ref_weights,
+            rtol=0.01 if dtype == torch.bfloat16 else 1e-6,
+            atol=1e-6,
+        )
+        empty_ids, empty_weights = moe_gate(
+            scores[:0],
+            topk,
+            impl=impl,
+            output_dtypes=(torch.int64, torch.float32),
+            **kwargs,
+        )
+        assert empty_ids.shape == empty_weights.shape == (0, topk)
+        assert empty_ids.dtype == torch.int64 and empty_weights.dtype == torch.float32
+
+    tied_ids, _ = moe_gate(
+        torch.zeros_like(scores[:1]),
+        topk,
+        impl="cuda",
+        **{**kwargs, "e_score_correction_bias": torch.full_like(bias, -4)},
+    )
+    torch.testing.assert_close(
+        tied_ids,
+        torch.arange(topk, device="cuda", dtype=tied_ids.dtype)[None],
+        rtol=0,
+        atol=0,
+    )

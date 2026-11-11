@@ -278,6 +278,7 @@ TORCH_CUDA_ARCH_LIST=9.0 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
 ```bash
 docker build \
   --build-arg torch_cuda_arch_list='<your_arch_list>' \
+  --build-arg is_at_least_blackwell='<true_or_false>' \
   --build-arg optional_deps='<comma_separated_optional_deps>' \
   --build-arg enable_cython='<true_or_false>' \
   --build-arg enable_test='<true_or_false>' \
@@ -288,93 +289,54 @@ docker build \
 
 #### 沐曦 GPU
 
-由于部分依赖需要在构建时访问设备，因此这些依赖必须在 `docker run` 中安装，而不是 `docker build`。因此请在构建环境中至少准备一个设备，然后向两阶段构建脚本传入 `muxi.Dockerfile` 安装：
+使用 `muxi.Dockerfile` 构建镜像：
 
 ```bash
-bash ./script/two-stage-docker-build.sh \
-  'muxi.Dockerfile' \
-  '<your_image_name>' \
-  '<your_image_tag>' \
-  --optional_deps='<comma_separated_optional_deps>' \
-  --chitu_setup_jobs='<chitu_setup_jobs>' \
-  --enable_cython='<true_or_false>' \
-  --enable_test='<true_or_false>' \
-  --pypi_mirror='<your_pypi_mirror>' \
-  -- \
-  docker run \
-    --pid=host \
-    --device=/dev/dri \
-    --device=/dev/mxcd \
-    --group-add video \
-    --privileged=true \
-    --security-opt seccomp=unconfined \
-    --security-opt apparmor=unconfined \
-    --shm-size '<your_shm_size>' \
-    --ulimit memlock=-1 \
-    -w /workspace/chitu
+docker buildx build -f muxi.Dockerfile \
+  --build-arg optional_deps='<comma_separated_optional_deps>' \
+  --build-arg chitu_setup_jobs='<chitu_setup_jobs>' \
+  --build-arg enable_cython='<true_or_false>' \
+  --build-arg enable_test='<true_or_false>' \
+  --build-arg pypi_mirror='<your_pypi_mirror>' \
+  --load \
+  -t <your_image_name> \
+  .
 ```
 
 #### 昇腾 NPU
 
-由于部分依赖需要在构建时访问设备，因此这些依赖必须在 `docker run` 中安装，而不是 `docker build`。因此请在构建环境中至少准备一个设备，然后向两阶段构建脚本传入 `ascend.Dockerfile` 安装：
+使用 `ascend.Dockerfile` 构建镜像，并通过 `--build-context` 传入驱动库目录：
 
 ```bash
-bash ./script/two-stage-docker-build.sh \
-  'ascend.Dockerfile' \
-  '<your_image_name>' \
-  '<your_image_tag>' \
-  --optional_deps='<comma_separated_optional_deps>' \
-  --chitu_setup_jobs='<chitu_setup_jobs>' \
-  --enable_cython='<true_or_false>' \
-  --enable_test='<true_or_false>' \
-  --pypi_mirror='<your_pypi_mirror>' \
-  -- \
-  docker run \
-    --pid=host \
-    --privileged \
-    --device /dev/devmm_svm \
-    --device /dev/hisi_hdc \
-    -v /usr/local/dcmi:/usr/local/dcmi \
-    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
-    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-    -v /etc/ascend_install.info:/etc/ascend_install.info \
-    -v /dev/davinci<npu_id>:/dev/davinci<npu_id>
-    -w /workspace/chitu
+docker buildx build -f ascend.Dockerfile \
+  --build-context ascend_driver=/usr/local/Ascend/driver/lib64 \
+  --build-context ascend_dcmi=/usr/local/dcmi \
+  --build-arg optional_deps='<comma_separated_optional_deps>' \
+  --build-arg chitu_setup_jobs='<chitu_setup_jobs>' \
+  --build-arg enable_cython='<true_or_false>' \
+  --build-arg enable_test='<true_or_false>' \
+  --build-arg pypi_mirror='<your_pypi_mirror>' \
+  --load \
+  -t <your_image_name> \
+  .
 ```
 
 #### 海光 DCU
 
-由于部分依赖需要在构建时访问设备，因此这些依赖必须在 `docker run` 中安装，而不是 `docker build`。因此请在构建环境中至少准备一个设备，然后向两阶段构建脚本传入 `hygon.Dockerfile` 安装：
+使用 `hygon.Dockerfile` 构建镜像，并通过 `--build-context` 传入 hyhal：
 
 ```bash
-bash ./script/two-stage-docker-build.sh \
-  'hygon.Dockerfile' \
-  '<your_image_name>' \
-  '<your_image_tag>' \
-  --optional_deps='<comma_separated_optional_deps>' \
-  --chitu_setup_jobs='<chitu_setup_jobs>' \
-  --enable_editable_install='<true_or_false>' \
-  --enable_cython='<true_or_false>' \
-  --enable_test='<true_or_false>' \
-  --pypi_mirror='<your_pypi_mirror>' \
-  -- \
-  docker run \
-    -u root \
-    --network=host \
-    --pid=host \
-    --privileged \
-    --device=/dev/kfd \
-    --device=/dev/dri \
-    --ipc=host \
-    --shm-size='<your_shm_size>' \
-    --group-add video \
-    --cap-add=SYS_PTRACE \
-    --security-opt seccomp=unconfined \
-    --ulimit stack=-1:-1 \
-    --ulimit memlock=-1:-1 \
-    -v /opt/hyhal:/opt/hyhal:ro \
-    -w /workspace/chitu
+docker buildx build -f hygon.Dockerfile \
+  --build-context hyhal=/usr/local/hyhal \
+  --build-arg optional_deps='<comma_separated_optional_deps>' \
+  --build-arg chitu_setup_jobs='<chitu_setup_jobs>' \
+  --build-arg enable_cython='<true_or_false>' \
+  --build-arg enable_test='<true_or_false>' \
+  --build-arg pypi_mirror='<your_pypi_mirror>' \
+  --build-arg build_for_shca='<true_or_false>' \
+  --load \
+  -t <your_image_name> \
+  .
 ```
 
 ### 构建 Apptainer 镜像分发产物

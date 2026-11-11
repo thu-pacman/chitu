@@ -5,6 +5,7 @@
 from typing import Optional, TYPE_CHECKING
 from logging import getLogger
 from collections import deque, OrderedDict
+import time
 
 from chitu.global_vars import get_global_args, is_independent_multi_inst
 from chitu.kv_cache.manager_names import MAIN_CACHE_NAME, MTP_CACHE_NAME
@@ -42,7 +43,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
     """Block allocator for paged KV caches with optional prefix caching.
 
     Maintains:
-    - ``task_to_cache_ids``: maps each task to its allocated physical block IDs.
+    - ``task_to_cache_ids``: maps each task to its allocated block IDs. With
+      DCP, an ID reserves one physical page on every rank.
     - Free block pool (reclaimed when tasks finish or blocks are evicted).
     - Optional prefix-cache metadata: tracks block hashes and reference counts
       to enable block sharing across requests with shared prefixes.
@@ -59,10 +61,16 @@ class PagedKVCacheManager(KVCacheManagerBase):
         enable_prefix_caching=False,
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
         manager_name: str = MAIN_CACHE_NAME,
+        dcp_size: int = 1,
     ):
-
+        self.dcp_size = int(dcp_size)
+        if self.dcp_size < 1:
+            raise ValueError("dcp_size must be positive")
+        self.block_size = int(block_size)
         # 单个请求可能写入 kv cache 的最大长度：decode 最后一步可能比 max_seq_len 多出推测段
-        self.max_blocks_per_req = ceil_div(max_alloc_seq_len(max_seq_len), block_size)
+        self.max_blocks_per_req = ceil_div(
+            max_alloc_seq_len(max_seq_len), self.block_size * self.dcp_size
+        )
 
         # Page-table capacity, not the physical block pool size (see PagedKVCache).
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
@@ -77,7 +85,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.dp_rank = dp_rank
         self.manager_name = manager_name
 
-        self.block_size = block_size
         self.task_to_cache_ids: defaultdict[str, set[int]] = defaultdict(
             set
         )  # {task_id: {block_idx,...}}
@@ -101,7 +108,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.enable_prefix_caching: bool = enable_prefix_caching
         self.identity_builder = BlockIdentityChainBuilder.acquire(
             self.manager_name,
-            self.block_size,
+            self.block_size * self.dcp_size,
         )
         # 保存块身份到运行时状态的映射, 数据含义: {blk_hash: BlockRuntime}
         self.identity_runtime_pool: dict[str, BlockRuntime] = {}
@@ -117,6 +124,13 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # (prepare_metadata_before_decode)发布，届时recv_kv_cache_and_insert
         # (KV插入 + kv_recv_reorder)必然已完成。
         self._deferred_prefix_publish: dict[str, int] = {}
+
+        # 请求的 KV 传输还在途时不能释放它的块：RDMA 还在读写这些内存，提前释放后
+        # 下一个请求会覆盖它们。所以第一次尝试释放时记下时刻，延后期内先不释放
+        # （见 finalize_metadata_all_decode）。数据含义: {task_id: 第一次尝试释放的时刻}。
+        # 元素生命周期: 第一次尝试释放时写入，释放成功、或传输已经不在途时删除，
+        # 所以字典里只留得住"正在推迟"的请求。
+        self._release_defer_since: dict[str, float] = {}
 
     def has_active_blocks(self):
         if len(self.active_blocks) > 0:
@@ -141,6 +155,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.identity_runtime_pool.clear()
         self.cache_idx_to_hash.clear()
         self._deferred_prefix_publish.clear()
+        self._release_defer_since.clear()
         self.identity_builder.hashed_block_pool.clear()
         self.identity_builder.tid_to_identities.clear()
 
@@ -151,11 +166,12 @@ class PagedKVCacheManager(KVCacheManagerBase):
         """``seq_len`` 个 token 所占的、与 token 位置存在映射的块数。
 
         如：
-        PagedKVCacheManager: block_id = p // block_size, block_offset = p % block_size
+        PagedKVCacheManager: group_index = p // (block_size * dcp_size),
+            owner = (p // block_size) % dcp_size, offset = p % block_size
         D-V4 sliding: block_id = 0, block_offset = p % block_size
         singleton 的 ckpt 块: p // C, block_offset = 0
         """
-        return ceil_div(int(seq_len), self.block_size)
+        return ceil_div(int(seq_len), self.block_size * self.dcp_size)
 
     def num_fixed_blocks_per_req(self) -> int:
         """每个请求固定预留的块数：与 token 长度无关。"""
@@ -274,7 +290,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         count may include a non-full trailing block and must not go through here.
         """
         n = len(self.task_to_cache_ids.get(task.task_id, set()))
-        return min(n, task.cached_seq_len // self.block_size)
+        return min(n, task.cached_seq_len // (self.block_size * self.dcp_size))
 
     def num_cached_blocks(self, task: "Task") -> int:
         """Number of contiguous cached blocks hit from prompt start."""
@@ -484,12 +500,14 @@ class PagedKVCacheManager(KVCacheManagerBase):
             # PD分离Decode-Only节点：此时KV cache还未从prefill传输并reorder就绪，
             # 不能视为可复用的cache blocks。推迟到该任务首个decode step
             # (prepare_metadata_before_decode)再发布。
-            self._deferred_prefix_publish[task.task_id] = target_seq_len
+            self._deferred_prefix_publish[task.task_id] = min(
+                target_seq_len, task.prefix_tokens_len
+            )
         return new_cache_ids
 
     def publish_prefix_cache_blocks(self, task: "Task", target_seq_len: int) -> None:
         for idx, block in enumerate(self.task_to_token_blocks[task.task_id]):
-            if (idx + 1) * self.block_size <= target_seq_len:
+            if (idx + 1) * self.block_size * self.dcp_size <= target_seq_len:
                 self.upload_to_identity_runtime_pool(block)
 
     def prepare_metadata_before_decode(self, task: "Task") -> list[int]:
@@ -531,9 +549,84 @@ class PagedKVCacheManager(KVCacheManagerBase):
             self.task_to_token_blocks[task.task_id].append(block)
         return new_cache_ids
 
-    def finalize_metadata_all_decode(self, task: "Task"):
+    def _read_release_defer_s(self) -> float:
+        """KV 传输在途时，释放最多能推迟多少秒。
+
+        这个数字由 KV manager 从 `transfer_grace_timeout` 读出来（见
+        KVManagerBase.__init__），P 和 D 用同一个值；cache manager 再算一遍就变成
+        两份真相了。不跑 PD 时 Backend.kv_manager 是 None，这里返回 0，也就是照
+        常释放。
+        """
+        # 局部 import：chitu.backend 在模块加载期会反向 import 本模块，把这一行
+        # 提到模块顶部就成环了。
+        from chitu.backend import Backend
+
+        kv_manager = getattr(Backend, "kv_manager", None)
+        return float(getattr(kv_manager, "_release_defer_s", 0.0) or 0.0)
+
+    def _should_postpone_release(self, task_id: str) -> bool:
+        """这次释放要不要先缓一缓：KV 还在 RDMA 上，且还没过延后期。
+
+        "KV 还在不在 RDMA 上"问的是 kv_manager，因为只有它同时看得到 P 侧的
+        在途标记和 D 侧的 PrefillDone 到没到；cache manager 只管延后时钟。
+        判据只用进程内已有状态，不引入跨进程查询。
+        """
+        defer_s = self._read_release_defer_s()
+        if defer_s <= 0.0:
+            return False
+        # 局部 import：chitu.backend 在模块加载期会反向 import 本模块，把这一行
+        # 提到模块顶部就成环了。
+        from chitu.backend import Backend
+
+        kv_manager = getattr(Backend, "kv_manager", None)
+        if kv_manager is None:
+            # 不跑 PD 时没有 KV 传输，照常释放。
+            return False
+        still_on_the_wire = kv_manager.should_postpone_release(task_id)
+        # 只留"还该延后"的请求的时刻。别的请求的传输早就结束了的话，这一刻起照常
+        # 释放；顺手清掉它们的时钟，字典就不会越攒越大。
+        for req_id in list(self._release_defer_since):
+            if req_id == task_id:
+                continue
+            if not kv_manager.should_postpone_release(req_id):
+                self._release_defer_since.pop(req_id, None)
+        if not still_on_the_wire:
+            self._release_defer_since.pop(task_id, None)
+            return False
+        now = time.monotonic()
+        since = self._release_defer_since.get(task_id)
+        if since is None:
+            # 第一次尝试：这次也不释放，只把时钟立起来，让调用方下一轮再来。
+            self._release_defer_since[task_id] = now
+        elif now - since >= defer_s:
+            # 延后期过了就照常释放——传输要么其实已经停了，要么在途记录本身就是
+            # 陈的，再等下去只会一直占着块。
+            return False
+        # 下面只用这一轮已经拿到的 `still_on_the_wire`，不再回头去问
+        # kv_manager：传输 worker 线程随时会清掉在途标记，出口处再查一次会把
+        # "正常完成"读成"没有在途传输"，然后断言炸掉整个实例。
+        # 时钟只在第一次推迟时写一次，之后不再重置，所以它到 now 的跨度就是"已经
+        # 推迟了多久"。超过窗口的请求走上面的 return False，走不到这里。
+        started_at = self._release_defer_since[task_id]
+        assert (
+            now - started_at <= defer_s + 1e-6
+        ), f"{task_id} postponed for {now - started_at:.3f}s, defer={defer_s}s"
+        return True
+
+    def finalize_metadata_all_decode(self, task: "Task") -> bool:
+        """释放 `task` 的 KV 块和 prefix 元数据。
+
+        返回 False 表示这一轮先不释放（该请求的 KV 还在 RDMA 上），调用方下一轮
+        重试；返回 True 表示已经释放完（或者本来就没有东西可释放）。
+        """
         if task.task_id not in self.task_to_token_blocks:
-            return
+            # 没有块可释放：这时连延后时钟都不该留，否则字典里会攒下永远不释放的
+            # 请求（任务在别处被删掉了，这里再也等不到下一次调用）。
+            self._release_defer_since.pop(task.task_id, None)
+            return True
+
+        if self._should_postpone_release(task.task_id):
+            return False
 
         # 任务结束时用已同步的 prefix 一次性补全满块 identity，
         # 便于后续请求的 prefix cache 命中 identity_builder.hashed_block_pool / identity_runtime_pool。
@@ -565,7 +658,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             if (
                 blk_hash is not None
                 and prefix_ready
-                and (i + 1) * self.block_size <= valid_kv_len
+                and (i + 1) * self.block_size * self.dcp_size <= valid_kv_len
             ):
                 if (
                     blk_hash not in self.identity_runtime_pool
@@ -591,6 +684,10 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.task_to_cache_ids.pop(task.task_id)
         self.task_to_token_blocks.pop(task.task_id)
         self.identity_builder.forget_task(task)
+        # 释放成功，延后时钟一并删掉：下次同名请求从头计时。
+        self._release_defer_since.pop(task.task_id, None)
+        assert task.task_id not in self._release_defer_since
+        return True
 
 
 class _DeepSeekV4LogicalBlockMetadataMixin:
@@ -701,7 +798,7 @@ class DeepSeekV4CompressedKVCacheManager(
                 ceil_div(
                     max_alloc_seq_len(int(kwargs["max_seq_len"])), self.compress_ratio
                 ),
-                self.block_size,
+                self.block_size * self.dcp_size,
             ),
         )
         self.max_num_blocks = self.max_blocks_per_req * int(kwargs["num_hot_req"])
@@ -716,7 +813,7 @@ class DeepSeekV4CompressedKVCacheManager(
         compressed_len = seq_len // self.compress_ratio
         if compressed_len == 0:
             return 0
-        return ceil_div(compressed_len, self.block_size)
+        return ceil_div(compressed_len, self.block_size * self.dcp_size)
 
 
 class SingletonPagedKVCacheManager(PagedKVCacheManager):
@@ -865,9 +962,13 @@ class SingletonPagedKVCacheManager(PagedKVCacheManager):
             return []
         return super().prepare_metadata_before_decode(task)
 
-    def finalize_metadata_all_decode(self, task: "Task"):
-        super().finalize_metadata_all_decode(task)
+    def finalize_metadata_all_decode(self, task: "Task") -> bool:
+        # in-place/spec 块和基类的块是一起用的：基类说"这一轮先不释放"，这里也
+        # 不能先把 spec 块放掉，否则请求还占着主 cache 的块却没有状态块了。
+        if not super().finalize_metadata_all_decode(task):
+            return False
         self._release_spec_blocks(task)
+        return True
 
     def clear_prefix_cache(self):
         super().clear_prefix_cache()

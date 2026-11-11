@@ -7,6 +7,8 @@ from omegaconf import DictConfig, OmegaConf
 import sys
 from logging import getLogger
 
+from chitu.boot.arg_utils import apply_multi_inst_override
+
 logger = getLogger(__name__)
 
 
@@ -29,6 +31,24 @@ class ServeConfigRules(Callback):
             self._exit_with_error(
                 f"num_blocks must be positive or -1 (got {num_blocks})"
             )
+
+        # 目前decode cp需要和TP复用同一组rank（要么开启cp CP = TP > 1；要么不开启cp CP = 1）
+        dcp_config = (
+            apply_multi_inst_override(config)
+            if config.multi_inst.inst_id is not None
+            else config
+        )
+        dcp_size = int(dcp_config.infer.get("dcp_size", 1))
+        tp_size = int(dcp_config.infer.get("tp_size", 1))
+        if dcp_size < 1 or dcp_size not in {1, tp_size}:
+            self._exit_with_error(
+                "dcp_size must be 1 or equal tp_size while Decode CP "
+                f"reuses the TP group (got dcp_size={dcp_size}, "
+                f"tp_size={tp_size})"
+            )
+
+        if dcp_size > 1 and dcp_config.multi_inst.role != "decode":
+            self._exit_with_error("Decode CP requires multi_inst.role=decode (PD)")
 
         attn_type = config.infer.attn_type
         if attn_type == "npu":

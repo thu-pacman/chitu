@@ -92,6 +92,10 @@ from chitu.ops.triton_ops.fused_recurrent import (
 )
 from chitu.ops.triton_ops.mhc import mhc_pre_triton, mhc_post_triton
 from chitu.ops.triton_ops.indexer_score_bf16 import (
-    bf16_index_score_ragged_qk_dsv32_triton,
     bf16_index_score_paged_kv_triton,
+    bf16_index_score_ragged_qk_dsv32_triton,
+)
+from chitu.ops.triton_ops.decode_cp import (
+    dcp_global_topk_triton,
+    merge_dcp_attention_partials_triton,
 )

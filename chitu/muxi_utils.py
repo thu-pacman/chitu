@@ -514,7 +514,7 @@ class NormalMoeExpertsMuxiLayout(NativeLayoutMixin, NormalMoeExpertsMerged):
         )
 
 
-class Blockfp8MoeExpertsMuxiLayout(NativeLayoutMixin, Blockfp8MoeExpertsMerged):
+class Blockfp8MoeExpertsMuxiLayout(Blockfp8MoeExpertsMerged):
     def __init__(
         self,
         ############################################

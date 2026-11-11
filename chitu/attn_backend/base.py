@@ -24,9 +24,17 @@ from chitu.ops import (
     append_to_sliding_window_paged_kv_cache,
     read_from_dense_kv_cache,
     read_from_paged_kv_cache,
+    merge_dcp_attention_partials,
 )
 from chitu.ops.deepseek_compressor import pack_prefill_kv
 from chitu.utils import try_import_platform_dep
+from chitu.ops.decode_cp import (
+    compact_dcp_indices,
+    unpack_dcp_q,
+    pack_dcp_partials,
+)
+from chitu.distributed.parallel_state import get_dcp_group
+from chitu.distributed.comm_group import CommGroup
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -204,6 +212,9 @@ class AttnBackend(abc.ABC):
             out: (total, nheads, headdim).
         """
 
+        if isinstance(kv_cache, PagedKVCacheAccessor):
+            assert kv_cache.dcp_size == 1, "Standard attention does not support DCP"
+
         if self.route_to_decode(seq_len_delta):
             return self.decode(
                 q,
@@ -257,6 +268,85 @@ class AttnBackend(abc.ABC):
             # while query is split into multiple sub-batches causing dimension mismatch
             # so Prefill with PCP should always use prefill kernel
             return False
+
+    @staticmethod
+    def _update_local_paged_mla_kv(
+        kv_cache: PagedKVCacheAccessor,
+        kv: torch.Tensor,
+        seq_len_delta: BatchedSeqLenDelta,
+    ) -> None:
+
+        positions = seq_len_delta.delta_position_ids_tensor_device
+        seq_ids = seq_len_delta.delta_seq_ids_tensor_device
+
+        append_to_paged_kv_cache(
+            kv_cache.kv["kv_lora_k_pe"],
+            kv_cache.block_table,
+            kv,
+            positions,
+            seq_ids,
+            use_i64_offsets=kv_cache.use_i64_offsets,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
+            dcp_size=kv_cache.dcp_size,
+            dcp_rank=kv_cache.dcp_rank,
+        )
+
+    @staticmethod
+    def _all_gather_q(
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        comm_group: "CommGroup",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather TP head shards into contiguous Q tensors [T,H(global),D]."""
+        size = comm_group.group_size
+        if size == 1:
+            return q_nope.contiguous(), q_pe.contiguous()
+
+        q = torch.cat((q_nope, q_pe), dim=-1)
+        gathered = q.new_empty((size * q.shape[0], *q.shape[1:]))
+        comm_group.all_gather_into_tensor(gathered, q)
+
+        return unpack_dcp_q(
+            gathered.view(size, *q.shape),
+            q_nope.shape[-1],
+        )
+
+    @staticmethod
+    def _dcp_exchange_and_combine_partials(
+        partial_o: torch.Tensor,
+        partial_lse: torch.Tensor,
+        comm_group: "CommGroup",
+    ) -> torch.Tensor:
+        """Exchange head shards and combine partial attention using LSE."""
+        size = comm_group.group_size
+        rows, heads, width = partial_o.shape
+        if rows == 0:
+            return partial_o.new_empty((0, heads // size, width))
+
+        send = pack_dcp_partials(partial_o, partial_lse, size)
+        if size == 1:
+            received = send
+        else:
+            received = torch.empty_like(send)
+            comm_group.all_to_all_single(received, send)
+
+        return merge_dcp_attention_partials(received)
+
+    def mla_dcp_local(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        flash_indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        softmax_scale=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return local mla result (partial_o, partial_lse)."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement local MLA for decode cp"
+        )
 
     def mla(
         self,
@@ -1398,7 +1488,7 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache: KVCacheAccessor,
         kv,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
         topk_page_table: Optional[torch.Tensor] = None,
@@ -1417,6 +1507,17 @@ class AttnBackend(abc.ABC):
                 topk_indices=topk_indices,
             )
         elif isinstance(kv_cache, PagedKVCacheAccessor):
+            if kv_cache.dcp_size > 1:
+                return self.mla_dcp(
+                    q_nope,
+                    q_pe,
+                    kv_cache,
+                    kv,
+                    seq_len_delta=seq_len_delta,
+                    softmax_scale=softmax_scale,
+                    topk_indices=topk_indices,
+                    topk_page_table=topk_page_table,
+                )
             # Call self.mla_decode_paged_kv here instead of directly calling
             # self._mla_to_mqa, because we want to make self.mla_decode_paged_kv
             # overridable
@@ -1432,6 +1533,69 @@ class AttnBackend(abc.ABC):
             )
         else:
             raise NotImplementedError()
+
+    def mla_dcp(
+        self,
+        q_nope: torch.Tensor,  # [T, heads//tp_size, 512]
+        q_pe: torch.Tensor,  # [T, heads//tp_size, 64]
+        kv_cache: PagedKVCacheAccessor,
+        kv: torch.Tensor,  # [T,1,576] current decode token's kv_latent
+        seq_len_delta: BatchedSeqLenDelta,
+        softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
+        topk_page_table: Optional[torch.Tensor] = None,
+    ):
+
+        comm_group = get_dcp_group()
+
+        # Input Check
+        if topk_page_table is not None:
+            raise NotImplementedError("MLA does not support topk_page_table")
+        if topk_indices is None:
+            raise NotImplementedError("Decode-CP MLA requires global top-k token IDs")
+        if comm_group.group_size != kv_cache.dcp_size:
+            raise ValueError("Decode CP group size must match dcp_size")
+
+        # Append kv_latent/kv_cache which is assigned to this rank
+        self._update_local_paged_mla_kv(kv_cache, kv, seq_len_delta)
+
+        # Construct req_id of each token e.g. 2Req+MTP3 [0, 0, 0, 1, 1, 1]
+        # None means classic decoding(i-th token belongs to i-th request)
+        request_seq_ids = (
+            None
+            if seq_len_delta.is_classic_decoding
+            else seq_len_delta.delta_seq_ids_tensor_device
+        )
+        # Map global top-k IDs to a compact prefix of owner-local physical slots.
+        cache_tensor = kv_cache.kv["kv_lora_k_pe"]
+        compact_indices, topk_length = compact_dcp_indices(
+            topk_indices,
+            kv_cache.block_table,
+            request_seq_ids,
+            kv_cache.block_size,
+            kv_cache.dcp_rank,
+            kv_cache.dcp_size,
+            cache_tensor.shape[0],
+        )
+        # Gather the query heads assigned to this DCP group.
+        q_nope_full, q_pe_full = self._all_gather_q(q_nope, q_pe, comm_group)
+
+        # Compute local partial results for this rank
+        partial_o, partial_lse = self.mla_dcp_local(
+            q_nope_full,
+            q_pe_full,
+            cache_tensor,
+            compact_indices,
+            topk_length,
+            softmax_scale=softmax_scale,
+        )
+
+        # A2A communication: Get Complete Output for current head
+        output = self._dcp_exchange_and_combine_partials(
+            partial_o, partial_lse, comm_group
+        )
+
+        return output
 
     def _mla_to_mqa(
         self,

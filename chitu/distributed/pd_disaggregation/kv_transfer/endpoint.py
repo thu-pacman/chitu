@@ -183,9 +183,19 @@ class KVManagerEndpoint:
                     f"KV recv_thread handler crashed ({self.role}:{self.name})"
                 )
 
-    def send(self, data: bytes):
+    def send(self, data: bytes, block: bool = True):
+        """Push one frame to the peer.
+
+        With ``block=True`` this keeps the historical behavior: the socket's
+        SNDTIMEO lets a send to a dead or non-draining peer wait up to 60 s and
+        then raise ``zmq.Again``. Pass ``block=False`` to raise ``zmq.Again``
+        right away instead, so a caller on a latency-sensitive thread (e.g. the
+        stall sweep) can drop the frame rather than stall the whole thread.
+        """
         with self._send_lock:
-            return self.send_socket.send(data)
+            if block:
+                return self.send_socket.send(data)
+            return self.send_socket.send(data, flags=zmq.NOBLOCK)
 
 
 class DecodeEndpoints:

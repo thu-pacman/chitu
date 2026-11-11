@@ -570,3 +570,100 @@ def test_blockfp8_index_score_ragged_q_paged_k_dsv32(
     )
 
     assert_close(output, output_ref, atol=0.15, rtol=0.15)
+
+
+@pytest.mark.parametrize("shape", [(3, 640), (2, 7, 640)])
+def test_blockfp8_packed_scales(shape):
+    from chitu.device_type import is_nvidia
+
+    if not is_nvidia() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Packed scales require SM100")
+    deep_gemm = pytest.importorskip("deep_gemm")
+    x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    groups = shape[0] if len(shape) == 3 else None
+    for quantize in (blockfp8_act_quant, silu_and_mul_and_blockfp8_act_quant):
+        inputs, kwargs = x, {}
+        if quantize is silu_and_mul_and_blockfp8_act_quant:
+            inputs = torch.cat((x, x), dim=-1)
+            if groups is not None:
+                kwargs["expert_n_tokens"] = torch.full(
+                    (groups,), shape[-2], device="cuda", dtype=torch.int32
+                )
+        ref, scale = quantize(inputs, round_scale_to_pow2=True, **kwargs)
+        actual, packed = quantize(
+            inputs, round_scale_to_pow2=True, packed_ue8m0=True, **kwargs
+        )
+        expected_scale = deep_gemm.transform_sf_into_required_layout(
+            scale,
+            shape[-2],
+            shape[-1],
+            recipe=(1, 128, 128),
+            num_groups=groups,
+            is_sfa=True,
+            disable_ue8m0_cast=False,
+        )
+        assert torch.equal(actual.view(torch.uint8), ref.view(torch.uint8))
+        assert torch.equal(packed, expected_scale)
+        assert packed.stride() == expected_scale.stride()
+
+
+def test_blockfp8_linear_quantized_on_load():
+    from chitu.device_type import is_nvidia
+    from chitu.quantization.registry import QuantizationRegistry
+
+    if not is_nvidia() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("This test requires SM100")
+    pytest.importorskip("deep_gemm")
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "raise_lower_bit_float_to": "float8_e4m3fn",
+                    "op_impl": "auto",
+                },
+                "models": {
+                    "quant_config": {
+                        "rules": [{"regex": "lm_head", "type": "blockfp8_from_bf16"}]
+                    },
+                    "backend_config": {"rules": []},
+                },
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    torch.set_default_dtype(torch.bfloat16)
+    cls = QuantizationRegistry.get_quantized_linear_class_from_global_args(
+        checkpoint_prefix="lm_head"
+    )
+    layer = cls(512, 256, False).cuda()
+    weight = torch.randn(256, 512, device="cuda") * 0.02
+    layer.load_state_dict({"weight": weight})
+    x = torch.randn(3, 512, device="cuda")
+    expected = torch.nn.functional.linear(x, weight).float()
+    assert layer.weight.numel() == 0
+    assert (layer(x).float() - expected).norm() / expected.norm() < 0.05
+
+
+@pytest.mark.parametrize("round_scale_to_pow2", [False, True])
+def test_blockfp8_weight_quant_rounding(round_scale_to_pow2):
+    from chitu.ops.quant import blockfp8_weight_quant
+
+    w = torch.linspace(-2, 2, 256 * 256, dtype=torch.float32).reshape(256, 256)
+    w[:128, :128] = 0
+    q, scale = blockfp8_weight_quant(
+        w, round_scale_to_pow2=round_scale_to_pow2, rows_per_chunk=128
+    )
+    blocks = w.view(2, 128, 2, 128)
+    amax = blocks.abs().amax(dim=(1, 3))
+    expected_scale = amax / 448 if round_scale_to_pow2 else amax
+    if round_scale_to_pow2:
+        expected_scale = expected_scale.log2().ceil().exp2()
+    expected_scale = torch.where(amax > 0, expected_scale, 1.0)
+    expected_q = (
+        (blocks / expected_scale[:, None, :, None])
+        .to(torch.float8_e4m3fn)
+        .reshape_as(w)
+    )
+    torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
+    assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))

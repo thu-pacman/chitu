@@ -1,5 +1,4 @@
 import logging
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -145,6 +144,7 @@ def test_auto_resolver_keyword_only_params_not_passed_positional_args():
 
 def test_warmup_engine_emits_impl_summary_after_auto_set(monkeypatch):
     events = []
+    monkeypatch.setattr(chitu_main.torch.distributed, "get_rank", lambda: 0)
 
     monkeypatch.setattr(
         chitu_main, "clear_observed_op_impl_selections", lambda: events.append("clear")

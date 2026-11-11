@@ -22,6 +22,7 @@ from chitu.moe.batched_expert_result import (
     PerExpertDenseBatchedExpertResult,
 )
 from chitu.ops.quant import blockfp8_act_quant, silu_and_mul_and_blockfp8_act_quant
+from chitu.ops.quant.blockfp8.matmul import blockfp8_gemm_wants_packed_ue8m0_scale
 from chitu.utils import try_import_opt_dep
 from chitu.ops import silu_and_mul
 from chitu.lazy import eval_lazy
@@ -242,6 +243,14 @@ def _(
                 f"deep_gemm only supports bfloat16 activation output, but got {torch.get_default_dtype()}"
             )
 
+        # On SM100 DeepGEMM consumes activation scales in its packed UE8M0
+        # layout; producing them here removes one `pack_fp32_into_ue8m0` kernel
+        # per masked grouped GEMM. (DeepEP's `use_ue8m0=True` dispatch already
+        # hands us that layout for `activation_scale_per_expert`.)
+        packed_ue8m0 = blockfp8_gemm_wants_packed_ue8m0_scale(
+            round_scale_to_pow2=round_scale_to_pow2,
+            scale_block_shape=block_shape,
+        )
         if isinstance(
             hidden_states, PerExpertDenseBatchedRoutedActivationWithScaleMinimal
         ):
@@ -252,6 +261,7 @@ def _(
                 hidden_states.activation_per_expert,
                 scale_block_shape=block_shape,
                 round_scale_to_pow2=round_scale_to_pow2,
+                packed_ue8m0=packed_ue8m0,
             )
 
         intermediate_cache1 = torch.empty(
@@ -273,6 +283,7 @@ def _(
             swiglu_limit=swiglu_limit,
             scale_block_shape=block_shape,
             round_scale_to_pow2=round_scale_to_pow2,
+            packed_ue8m0=packed_ue8m0,
         )
         del intermediate_cache1
 

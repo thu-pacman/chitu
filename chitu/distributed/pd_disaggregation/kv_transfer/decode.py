@@ -134,7 +134,9 @@ class KVManagerDecode(KVManagerBase):
         including reserved MTP lookahead pages. For token-mapped caches, transfer
         only prompt pages after skipping decode-side prefix-cache hits.
         Singleton caches (linear attn / MTP state) have no hit blocks, so all
-        their pre-allocated in-place blocks are transferred.
+        their pre-allocated in-place blocks are transferred. For Decode CP, additionally
+        return the page indices of the transferred blocks, so that each owner rank can
+        select only the pages it owns.
         """
         info = self._info(req_id)
         recv_buffers = TransferBuffers()
@@ -156,24 +158,52 @@ class KVManagerDecode(KVManagerBase):
                 full_block_ids = list(new_block_ids)
                 skip = 0
             else:
-                need = ceil_div(info.prefix_len, cache.block_size)
+                need = ceil_div(info.prefix_len, cache.block_size * cache.dcp_size)
                 full_block_ids = new_block_ids[:need]
+                # Prefix hits are counted in block_size-token sequence pages.
                 skip = min(
                     max(
                         0,
                         info.cache_manager_hit_block_counts.get(cache.manager_name, 0),
                     ),
-                    len(full_block_ids),
+                    ceil_div(info.prefix_len, cache.block_size),
                 )
-            transfer_block_ids = full_block_ids[skip:]
-            ids = np.array(transfer_block_ids, dtype=np.int32)
-            # Already allocated lookahead pages will not be sent again by the
-            # scheduler. Install them even though they need no RDMA transfer.
+
+            sequence_page_indices = None
+            if cache.dcp_size > 1:
+                if len(full_block_ids) != need:
+                    raise ValueError(
+                        f"KV transfer needs {need} logical blocks for decode cp, got {len(full_block_ids)}"
+                    )
+                num_sequence_pages = ceil_div(info.prefix_len, cache.block_size)
+                # indices of page which belong to this rank
+                sequence_page_indices = [
+                    page_index
+                    for page_index in range(skip, num_sequence_pages)
+                    if page_index % cache.dcp_size == cache.dcp_rank
+                ]
+                # indices of physical block
+                transfer_block_ids = []
+                for page_index in sequence_page_indices:
+                    group_index = page_index // cache.dcp_size
+                    # full_block_ids is indexed by group_index
+                    transfer_block_ids.append(full_block_ids[group_index])
+            else:
+                transfer_block_ids = full_block_ids[skip:]
+
+            # Keep lookahead allocations addressable without transferring
+            # unwritten pages beyond the prompt.
             info.cache_new_block_ids[cache_name] = list(new_block_ids)
             info.cache_transfer_block_ids[cache_name] = transfer_block_ids
 
+            ids = np.array(transfer_block_ids, dtype=np.int32)
             for key in cache.paged_kv_cache:
                 recv_buffers.cache_block_ids[key] = ids
+                if sequence_page_indices is not None:
+                    recv_buffers.sequence_page_indices[key] = np.array(
+                        sequence_page_indices, dtype=np.int32
+                    )
+
         return recv_buffers
 
     def prepare_kv_transfer(self, req_id: str) -> None:
@@ -348,6 +378,20 @@ class KVManagerDecode(KVManagerBase):
 
     def is_prefill_done(self, req_id: str):
         return self._transfer_done_states.get(req_id, TransferStatus())
+
+    def should_postpone_release(self, task_id: str) -> bool:
+        """Whether this request's KV blocks may still be written by RDMA.
+
+        True while this rank has not received PrefillDone for the request.
+        `handle_decode_prepare` creates the TaskInfo and
+        `recv_kv_cache_and_insert` removes it once the KV is installed, so a
+        normal request stops postponing at the latest there. A request Prefill
+        failed never receives PrefillDone, so it keeps postponing until the
+        grace expires. That is what the grace is for: the RDMA write it gave up
+        on may still be running.
+        """
+        info = self._info(task_id, create=False)
+        return info is not None and not info.is_prefill_done
 
     def is_prefill_failed(self, req_id: str) -> bool:
         """Whether the Prefill side reported a request-level failure for this

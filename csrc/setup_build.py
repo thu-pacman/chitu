@@ -11,6 +11,14 @@ from torch.utils.cpp_extension import CUDAExtension
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
+if os.environ.get("CHITU_MUXI_BUILD", "0").strip() == "1":
+    import torch.utils.cpp_extension as _cpp_extension
+
+    # MetaX's cpp_extension already adds --offload-arch=xcore1000 in
+    # COMMON_MXCC_FLAGS. The generic CUDA arch flags are CUDA-only and need a
+    # visible card; drop them so the build can run without a device.
+    _cpp_extension._get_cuda_arch_flags = lambda cflags=None: []
+
 
 def get_version_from_gplusplus_executable(gplusplus_executable):
     return int(os.popen(gplusplus_executable + " -dumpversion").read().strip())

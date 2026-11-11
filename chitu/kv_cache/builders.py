@@ -36,8 +36,41 @@ from chitu.kv_cache.registry import (
 from chitu.kv_cache.utils import build_layer_id_map, build_layer_id_map_lastlayer
 from chitu.models.registry import ModelType
 from chitu.utils import ceil_div
+from chitu.distributed.parallel_state import get_dcp_group
 
 logger = getLogger(__name__)
+
+
+def _dcp_size(args) -> int:
+    """Read Decode-CP size while keeping old configs equivalent to size 1."""
+
+    return int(getattr(args.infer, "dcp_size", 1))
+
+
+def _validate_dcp_config(args) -> int:
+    """Check supported Decode-CP layouts; size 1 keeps the ordinary path."""
+
+    dcp_size = _dcp_size(args)
+    if dcp_size < 1:
+        raise ValueError(f"infer.dcp_size must be positive, got {dcp_size}")
+    if dcp_size == 1:
+        return dcp_size
+    if args.multi_inst.role != "decode":
+        raise ValueError("Decode CP requires multi_inst.role=decode (PD)")
+    if dcp_size != int(args.infer.tp_size):
+        raise ValueError(
+            "Decode CP currently reuses the TP group, so infer.dcp_size "
+            f"must be 1 or infer.tp_size ({args.infer.tp_size}), got {dcp_size}"
+        )
+    if args.infer.cache_type != "paged":
+        raise ValueError("Decode CP requires infer.cache_type=paged")
+    return dcp_size
+
+
+def _dcp_rank() -> int:
+    """Return the current rank in the Decode CP owner group."""
+
+    return int(get_dcp_group().rank_in_group)
 
 
 @dataclass(frozen=True)
@@ -111,6 +144,7 @@ def register_cache_manager_builder(
 
 
 def build_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
+    _validate_dcp_config(args)
     for _prio, pred, fn in _BUILDER_REGISTRY:
         if pred(args):
             bundle = fn(args, attn_backend_type)
@@ -169,6 +203,7 @@ def _build_main_cache_bundle(
     )
 
     if args.infer.cache_type == "paged":
+        dcp_size = _dcp_size(args)
         block_size = (
             int(spec.block_size)
             if spec.block_size is not None
@@ -176,8 +211,16 @@ def _build_main_cache_bundle(
         )
         num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
         max_seq_len = args.infer.max_seq_len
-        resolved_num_blocks = _resolve_default_num_blocks(args, block_size, num_blocks)
+        resolved_num_blocks = _resolve_default_num_blocks(
+            args, block_size * dcp_size, num_blocks
+        )
 
+        cache_kwargs = {}
+        if dcp_size > 1:
+            cache_kwargs.update(
+                dcp_rank=_dcp_rank(),
+                dcp_size=dcp_size,
+            )
         main_cache = PagedKVCache(
             layer_id_map,
             num_hot_req=num_hot_req,
@@ -186,6 +229,7 @@ def _build_main_cache_bundle(
             block_size=block_size,
             device=device,
             split_size=spec.split_size,
+            **cache_kwargs,
             **kvargs,
         )
 
@@ -202,6 +246,7 @@ def _build_main_cache_bundle(
                         enable_prefix_caching=args.infer.enable_prefix_caching,
                         block_size=block_size,
                         manager_name=MAIN_CACHE_NAME,
+                        dcp_size=dcp_size,
                     )
                 }
                 for i in range(args.infer.dp_size)
@@ -222,7 +267,7 @@ def _build_main_cache_bundle(
 
 
 def _main_cache_block_size(main_cache) -> Optional[int]:
-    """main KV cache 的 block size，作为 linear checkpoint 间隔的默认基准。"""
+    """main KV 物理页大小，作为 Prefill linear checkpoint 间隔的默认基准。"""
     if isinstance(main_cache, PagedKVCache):
         return int(main_cache.block_size)
     return None
@@ -231,6 +276,9 @@ def _main_cache_block_size(main_cache) -> Optional[int]:
 def _build_linear_cache(
     args, *, layer_filter_fn=lambda x: x, main_block_size: Optional[int] = None
 ):
+    if _dcp_size(args) > 1:
+        raise ValueError("Decode CP does not support linear attention caches")
+
     device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
     layer_id_map = build_layer_id_map(args, layer_filter_fn=layer_filter_fn)
 
@@ -416,6 +464,7 @@ def _build_indexer_cache(args, *, layer_filter_fn=lambda x: x):
     num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
 
     if args.infer.cache_type == "paged":
+        dcp_size = _dcp_size(args)
 
         block_size = (
             int(spec.block_size)
@@ -423,8 +472,16 @@ def _build_indexer_cache(args, *, layer_filter_fn=lambda x: x):
             else default_paged_block_size_policy(args)
         )
 
-        resolved_num_blocks = _resolve_default_num_blocks(args, block_size, None)
+        resolved_num_blocks = _resolve_default_num_blocks(
+            args, block_size * dcp_size, None
+        )
 
+        cache_kwargs = {}
+        if dcp_size > 1:
+            cache_kwargs.update(
+                dcp_rank=_dcp_rank(),
+                dcp_size=dcp_size,
+            )
         return PagedKVCache(
             layer_id_map,
             num_hot_req=num_hot_req,
@@ -433,6 +490,7 @@ def _build_indexer_cache(args, *, layer_filter_fn=lambda x: x):
             block_size=block_size,
             device=device,
             split_size=spec.split_size,
+            **cache_kwargs,
             **spec.kvargs,
         )
 
@@ -468,6 +526,7 @@ def _attach_indexer_cache_managers(
         # indexer 的 block size 与 main 相同时，两者共用 main 的 manager（下面的 assert
         # 也要求两边 num_blocks 一致）：这样 indexer 拿到的 block ids 与 main 完全对齐
         use_indexer_manager = indexer.block_size != main_cache.block_size
+        # Shared manager IDs keep main/indexer physical page tables aligned.
         indexer.manager_name = (
             INDEXER_CACHE_NAME if use_indexer_manager else MAIN_CACHE_NAME
         )
@@ -482,6 +541,7 @@ def _attach_indexer_cache_managers(
                     enable_prefix_caching=args.infer.enable_prefix_caching,
                     block_size=indexer.block_size,
                     manager_name=INDEXER_CACHE_NAME,
+                    dcp_size=indexer.dcp_size,
                 )
 
     if (

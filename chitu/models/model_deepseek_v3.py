@@ -327,6 +327,18 @@ class Indexer(torch.nn.Module):
             k_append=k_append,
         )
 
+        if (
+            isinstance(cache_accessor, PagedKVCacheAccessor)
+            and cache_accessor.dcp_size > 1
+        ):
+            return self.indexer_impl.dcp_topk(
+                q_indexer,
+                weights,
+                seq_len_delta,
+                cache_accessor,
+                self.index_topk,
+            )
+
         # Get chunk_size before the fast exit below, so as to trigger auto chunk
         # size decision during engine warmup.
         chunk_size = self.indexer_impl.chunk_size(seq_len_delta)
@@ -1266,14 +1278,16 @@ class AttentionDeepSeekV3(Attention):
                         seq_len_delta,
                         freqs_cis,
                         is_causal=True,
-                        cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
+                        cache_accessor=self.indexer_cache.get_accessor(
+                            self.layer_id, is_mtp
+                        ),
                     )
                 else:
                     topk_indices = None
 
                 x = self.attn_backend(
                     q,
-                    self.cache.get_accessor(self.layer_id),
+                    self.cache.get_accessor(self.layer_id, is_mtp),
                     k,
                     v,
                     seq_len_delta=seq_len_delta,
@@ -1313,12 +1327,13 @@ class AttentionDeepSeekV3(Attention):
                     and seq_len_delta.is_classic_decoding
                     and self.attn_backend.route_to_decode(query_seq_len_delta)
                     and isinstance(main_cache_accessor, PagedKVCacheAccessor)
+                    and main_cache_accessor.dcp_size == 1
                 )
 
                 if has_indexer_weights:
                     assert self.indexer_cache is not None
                     indexer_cache_accessor = self.indexer_cache.get_accessor(
-                        self.layer_id
+                        self.layer_id, is_mtp
                     )
                     force_topk_indices = self.indexer.must_materialize_topk_indices()
 

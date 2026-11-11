@@ -5,13 +5,23 @@
 """Common DSA indexer interface; one backend instance is shared by model layers."""
 
 from logging import getLogger
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 import torch
 
 from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.ops.topk import topk_indices, topk_page_table_decode_cuda
 from chitu.utils import get_global_args, max_alloc_seq_len
 from chitu.kv_cache.utils import allreduce_min_int
+
+from chitu.kv_cache import PagedKVCacheAccessor
+from chitu.distributed.parallel_state import get_dcp_group
+from chitu.ops.decode_cp import (
+    dcp_global_topk,
+    build_dcp_local_metadata,
+)
+
+if TYPE_CHECKING:
+    from chitu.distributed.comm_group import CommGroup
 
 logger = getLogger(__name__)
 
@@ -170,7 +180,53 @@ class DSAIndexer:
         is_causal=True,
         ke=None,
         ks=None,
+        *,
+        local_lengths=None,
     ):
+        """Score request KV or DCP-local KV with per-query visible lengths.
+
+        DCP page tables follow query-row order, and compact score columns
+        address this rank's local tokens. The width covers index_topk slots.
+        """
+        is_dcp = (
+            isinstance(cache_accessor, PagedKVCacheAccessor)
+            and cache_accessor.dcp_size > 1
+        )
+        if is_dcp:
+            if self.impl not in ("hygon", "torch_bf16", "triton_bf16"):
+                raise NotImplementedError(
+                    f"Decode CP indexer scoring requires a BF16 backend, got {self.impl}"
+                )
+            if local_lengths is None:
+                raise ValueError("Decode CP index_score requires local_lengths")
+            k_cache = cache_accessor.kv["indexer_k"]
+            if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
+                raise ValueError("Decode CP indexer scoring requires BF16 Q and K")
+
+            page_table = cache_accessor.block_table
+            if not seq_len_delta.is_classic_decoding:
+                page_table = page_table.index_select(
+                    0, seq_len_delta.delta_seq_ids_tensor_device
+                )
+            score_width = max(
+                page_table.shape[1] * cache_accessor.block_size, self.index_topk
+            )
+
+            if q.numel() == 0:
+                return torch.empty(0, score_width, dtype=torch.float32, device=q.device)
+
+            return self._index_score(
+                q,
+                weights,
+                seq_len_delta,
+                cache_accessor,
+                is_causal,
+                ke=ke,
+                ks=ks,
+                page_table=page_table,
+                context_lens=local_lengths,
+                score_width=score_width,
+            )
         if q.numel() == 0:
             return torch.empty(
                 0, self.static_max_n, dtype=torch.float32, device=q.device
@@ -178,6 +234,68 @@ class DSAIndexer:
         return self._index_score(
             q, weights, seq_len_delta, cache_accessor, is_causal, ke=ke, ks=ks
         )
+
+    def dcp_topk(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        seq_len_delta: BatchedSeqLenDelta,
+        cache_accessor: PagedKVCacheAccessor,
+        k: int,
+        *,
+        comm_group: Optional["CommGroup"] = None,
+    ) -> torch.Tensor:
+        """Score local KV, exchange candidates, and return global int32 IDs [T,K].
+
+        Q[T,H,D] contains all indexer heads. Each MTP query has its own local
+        causal length. Only candidate scores and IDs are communicated.
+        """
+        if comm_group is None:
+            comm_group = get_dcp_group()
+        if comm_group.group_size != cache_accessor.dcp_size:
+            raise ValueError("Decode CP group size must match dcp_size")
+
+        # calculate local number of visible tokens for each query
+        page_size = cache_accessor.block_size
+        dcp_size = cache_accessor.dcp_size
+        ends = seq_len_delta.delta_position_ids_tensor_device + 1
+        local_lengths = ends // (page_size * dcp_size) * page_size + (
+            ends % (page_size * dcp_size) - cache_accessor.dcp_rank * page_size
+        ).clamp(0, page_size)
+
+        scores = self.index_score(
+            q,
+            weights,
+            seq_len_delta,
+            cache_accessor,
+            local_lengths=local_lengths,
+        )
+
+        selected = self.topk_indices(scores, k, seq_len_delta, lengths=local_lengths)
+
+        local_metadata = build_dcp_local_metadata(
+            scores,
+            selected,
+            local_lengths,
+            page_size,
+            cache_accessor.dcp_rank,
+            dcp_size,
+        )
+
+        if dcp_size == 1:
+            gathered_metadata = local_metadata.unsqueeze(0)
+        else:
+            query_rows = q.shape[0]
+            gathered_flat = torch.empty(
+                (dcp_size * query_rows, k, 2),
+                dtype=torch.int32,
+                device=scores.device,
+            )
+            comm_group.all_gather_into_tensor(gathered_flat, local_metadata)
+            gathered_metadata = gathered_flat.view(dcp_size, query_rows, k, 2)
+
+        # Unique keys give every owner the same set, including boundary ties.
+        return dcp_global_topk(gathered_metadata, k)
 
     def _index_score(self, *args, **kwargs):
         raise NotImplementedError

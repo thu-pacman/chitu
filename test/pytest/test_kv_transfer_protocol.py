@@ -65,10 +65,13 @@ class TestDecodeAllocated:
         assert unpacked.req_id == "empty"
         assert not unpacked.buffers.cache_block_ids
 
-    def test_roundtrip_preserves_block_ids(self):
+    @pytest.mark.parametrize("with_sequence_page_indices", [False, True])
+    def test_block_id_roundtrip(self, with_sequence_page_indices):
         """Verify that block IDs survive serialization."""
         bufs = TransferBuffers()
         bufs.cache_block_ids["main"] = np.array([7, 8, 9, 10], dtype=np.int32)
+        if with_sequence_page_indices:
+            bufs.sequence_page_indices["main"] = np.array([1, 5, 9, 13], dtype=np.int32)
 
         msg = DecodeAllocated(
             decode_sid=0,
@@ -86,6 +89,29 @@ class TestDecodeAllocated:
         ids = list(restored.cache_block_ids["main"])
         assert ids == [7, 8, 9, 10]
         assert restored.cache_block_ids["main"].dtype == np.int32
+        if with_sequence_page_indices:
+            assert restored.sequence_page_indices["main"].tolist() == [1, 5, 9, 13]
+            assert restored.sequence_page_indices["main"].dtype == np.int32
+        else:
+            assert not restored.sequence_page_indices
+
+    def test_decode_sid_defaults_to_none(self):
+        # `None` is the "no Decode peer assigned yet" placeholder, so the message
+        # has to carry it through msgpack unchanged instead of inventing a
+        # sentinel number that a receiver could mistake for a real slot.
+        msg = DecodeAllocated(
+            dp_rank=0,
+            req_id="unset",
+            rank_num=1,
+            session_id="s1",
+            buffers=TransferBuffers(),
+        )
+        assert msg.decode_sid is None
+
+        unpacked = ProtocolSerializer.unpack(ProtocolSerializer.pack(msg))
+
+        assert unpacked.decode_sid is None
+        assert unpacked.req_id == "unset"
 
 
 class TestDecodePrepare:
