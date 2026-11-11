@@ -2115,7 +2115,10 @@ def test_deepseek_v4_decode_postprocess_dispatch_dense_kv_cache(use_hadamard):
     cache_seq_ids = torch.arange(bsz, device=device, dtype=torch.long)
     kv_compress = torch.randn(bsz, dim, device=device, dtype=torch.float32)
     norm_weight = torch.randn(dim, device=device, dtype=torch.float32)
-    freqs_cis = torch.ones(300, 32, device=device, dtype=torch.complex64)
+    freqs_cis = BatchedFreqsCis(
+        torch.ones(300, 32, device=device, dtype=torch.float32),
+        torch.zeros(300, 32, device=device, dtype=torch.float32),
+    )
     kv_cache = torch.full((bsz, 4, dim), -9.0, device=device, dtype=torch.bfloat16)
 
     expected_impl = "kv_cache_hadamard" if use_hadamard else "kv_cache"
@@ -2196,7 +2199,10 @@ def test_deepseek_v4_decode_postprocess_dispatch_resolves_flashmla_packed_cache(
     device = torch.device("cuda")
     kv_compress = torch.empty(1, 512, device=device, dtype=torch.float32)
     norm_weight = torch.empty(512, device=device, dtype=torch.float32)
-    freqs_cis = torch.empty(1, 32, device=device, dtype=torch.complex64)
+    freqs_cis = BatchedFreqsCis(
+        torch.empty(1, 32, device=device, dtype=torch.float32),
+        torch.empty(1, 32, device=device, dtype=torch.float32),
+    )
     kv_cache = torch.empty(1, 1, 584, device=device, dtype=torch.uint8)
     block_table = torch.zeros(1, 1, device=device, dtype=torch.int32)
     start_positions = torch.zeros(1, device=device, dtype=torch.long)
