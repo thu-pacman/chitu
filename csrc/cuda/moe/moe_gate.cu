@@ -36,8 +36,11 @@ namespace chitu {
 enum class GateScoreFunc { Softmax, Sigmoid, SqrtSoftplus };
 enum class GateTopkMode { Plain, Grouped };
 
-// FIXME: set it as a template parameter according to the device
-#define WARP_SIZE 32
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+constexpr int WARP_SIZE = 64;
+#else
+constexpr int WARP_SIZE = 32;
+#endif
 // HIP requires 64-bit mask for shuffle operations
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #define WARP_SHFL_MASK 0xffffffffffffffffULL
@@ -52,27 +55,38 @@ enum class GateTopkMode { Plain, Grouped };
 // template that bitcasts 2-byte types through int via __builtin_memcpy so the
 // bit pattern is preserved across the shuffle.
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-template <typename T>
-__device__ __forceinline__ T chitu_shfl_xor_sync(T var,
-                                                 unsigned long long /*mask*/,
-                                                 int lane, int width) {
+template <bool XOR, typename T>
+__device__ __forceinline__ T chitu_shfl_sync(T var, unsigned long long /*mask*/,
+                                             int lane, int width) {
     if constexpr (sizeof(T) == 4) {
-        return __shfl_xor(var, lane, width);
+        if constexpr (XOR) {
+            return __shfl_xor(var, lane, width);
+        } else {
+            return __shfl(var, lane, width);
+        }
     } else if constexpr (sizeof(T) == 2) {
         int tmp = 0;
         __builtin_memcpy(&tmp, &var, sizeof(T));
-        tmp = __shfl_xor(tmp, lane, width);
+        if constexpr (XOR) {
+            tmp = __shfl_xor(tmp, lane, width);
+        } else {
+            tmp = __shfl(tmp, lane, width);
+        }
         T out;
         __builtin_memcpy(&out, &tmp, sizeof(T));
         return out;
     } else {
         static_assert(sizeof(T) == 4 || sizeof(T) == 2,
-                      "chitu_shfl_xor_sync: unsupported element size");
+                      "chitu_shfl_sync: unsupported element size");
     }
 }
+#define CHITU_SHFL_SYNC(var, mask, lane, width)                                \
+    chitu_shfl_sync<false>((var), (unsigned long long)(mask), (lane), (width))
 #define CHITU_SHFL_XOR_SYNC(var, mask, lane, width)                            \
-    chitu_shfl_xor_sync((var), (unsigned long long)(mask), (lane), (width))
+    chitu_shfl_sync<true>((var), (unsigned long long)(mask), (lane), (width))
 #else
+#define CHITU_SHFL_SYNC(var, mask, lane, width)                                \
+    __shfl_sync((mask), (var), (lane), (width))
 #define CHITU_SHFL_XOR_SYNC(var, mask, lane, width)                            \
     __shfl_xor_sync((mask), (var), (lane), (width))
 #endif
@@ -114,15 +128,29 @@ __device__ __forceinline__ void store_gate_row(DST *output,
     }
 }
 
+template <typename T, int EXPERTS, int BYTES_PER_LDG>
+consteval bool is_topk_geometry_valid() {
+    constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
+    constexpr int ELTS_PER_LDG_WARP = ELTS_PER_LDG * WARP_SIZE;
+    constexpr int VECs_PER_THREAD =
+        EXPERTS / ELTS_PER_LDG_WARP > 0 ? EXPERTS / ELTS_PER_LDG_WARP : 1;
+    constexpr int VPT = VECs_PER_THREAD * ELTS_PER_LDG;
+    constexpr int THREADS_PER_ROW = EXPERTS / VPT;
+    return ELTS_PER_LDG > 0 && EXPERTS >= VPT &&
+           (EXPERTS / ELTS_PER_LDG_WARP == 0 ||
+            EXPERTS % ELTS_PER_LDG_WARP == 0) &&
+           THREADS_PER_ROW <= WARP_SIZE &&
+           THREADS_PER_ROW == (THREADS_PER_ROW & -THREADS_PER_ROW) &&
+           WARP_SIZE % THREADS_PER_ROW == 0;
+}
+
 template <typename T, int EXPERTS, int BYTES_PER_LDG,
           int _ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T),
           int _VECs_PER_THREAD = (EXPERTS / (_ELTS_PER_LDG * WARP_SIZE) > 0)
                                      ? (EXPERTS / (_ELTS_PER_LDG * WARP_SIZE))
                                      : 1,
           int _VPT = _VECs_PER_THREAD * _ELTS_PER_LDG>
-    requires((EXPERTS / (_ELTS_PER_LDG * WARP_SIZE) == 0 ||
-              EXPERTS % (_ELTS_PER_LDG * WARP_SIZE) == 0) &&
-             EXPERTS >= _VPT)
+    requires(is_topk_geometry_valid<T, EXPERTS, BYTES_PER_LDG>())
 struct TopkConstants {
     static constexpr int ELTS_PER_LDG = _ELTS_PER_LDG;
     static constexpr int VECs_PER_THREAD = _VECs_PER_THREAD;
@@ -186,6 +214,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     const int blockBaseRow = blockIdx.x * ROWS_PER_BLOCK;
     const int warpBaseRow = blockBaseRow + threadIdx.y * ROWS_PER_WARP;
     const int threadRow = warpBaseRow + threadIdx.x / THREADS_PER_ROW;
+
+    // No shuffle in this warp can involve a valid row. Invalid lanes in the
+    // last active warp still stay to participate in its subgroup shuffles.
+    if (warpBaseRow >= batchSize) {
+        return;
+    }
 
     // On HIP platform, all threads in wavefront must participate in shuffle
     // ops. Invalid threads will contribute zeros and skip writing results.
@@ -494,6 +528,33 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
                 }
             }
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+            // Reduce only the score, then use the lowest set ballot bit to
+            // select the lowest expert ID among ties.
+            const BIAS_T thread_max_val = max_val;
+#pragma unroll
+            for (int mask = THREADS_PER_ROW / 2; mask > 0; mask >>= 1) {
+                BIAS_T other_max_val = CHITU_SHFL_XOR_SYNC(
+                    max_val, WARP_SHFL_MASK, mask, THREADS_PER_ROW);
+                if (gt(other_max_val, max_val)) {
+                    max_val = other_max_val;
+                }
+            }
+            const int first_thread_in_group = threadIdx.x - threadIdInGroup;
+            const unsigned long long group_mask =
+                (WARP_SHFL_MASK >> (WARP_SIZE - THREADS_PER_ROW))
+                << first_thread_in_group;
+            const unsigned long long winner_mask =
+                __ballot_sync(WARP_SHFL_MASK, eq(thread_max_val, max_val)) &
+                group_mask;
+            const int thread_with_winner =
+                __ffsll(winner_mask) - 1 - first_thread_in_group;
+            expert_id = CHITU_SHFL_SYNC(expert_id, WARP_SHFL_MASK,
+                                        thread_with_winner, THREADS_PER_ROW);
+            max_val_no_bias =
+                CHITU_SHFL_SYNC(max_val_no_bias, WARP_SHFL_MASK,
+                                thread_with_winner, THREADS_PER_ROW);
+#else
 // Second, use butterfly to find the global max
 #pragma unroll
             for (int mask = THREADS_PER_ROW / 2; mask > 0; mask >>= 1) {
@@ -513,6 +574,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
                     max_val_no_bias = other_max_val_no_bias;
                 }
             }
+#endif
         }
         // Third, record the winner. Only the first thread of the sub-group
         // writes, for which start_expert_id is 0, so the recorded id is the
@@ -609,21 +671,20 @@ void fused_moe_gate_launcher(const torch::Tensor &input, const int batchSize,
             ? reinterpret_cast<const BIAS_T *>(bias.value().data_ptr())
             : nullptr;
 
-    dispatchToStaticInts<8, 16, 32, 64, 128, 256,
-                         384>(numExperts, [&]<int EXPERTS>() {
-        // 384 is not a power of two. With 8-byte vector loads, each row
-        // uses 32 threads, so warp-shuffle reductions still have a
-        // power-of-two width.
-        constexpr int BYTES_PER_LDG = EXPERTS == 384 ? 8 : 16;
+    dispatchToStaticInts<8, 16, 32, 64, 128, 256, 384,
+                         896>(numExperts, [&]<int EXPERTS>() {
+        // Use the widest load that maps each row to whole warp-sized
+        // sub-groups.
+        constexpr int BYTES_PER_LDG =
+            is_topk_geometry_valid<T, EXPERTS, 16>()
+                ? 16
+                : (is_topk_geometry_valid<T, EXPERTS, 8>() ? 8 : 4);
+        static_assert(is_topk_geometry_valid<T, EXPERTS, BYTES_PER_LDG>());
         using Constants = TopkConstants<T, EXPERTS, BYTES_PER_LDG>;
         constexpr int THREADS_PER_ROW = Constants::THREADS_PER_ROW;
         constexpr int VPT = Constants::VPT;
-#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__) && !CHITU_MUXI_BUILD
         constexpr int BLOCK_SIZE =
             THREADS_PER_ROW == WARP_SIZE ? WARP_SIZE : 256;
-#else
-        constexpr int BLOCK_SIZE = 256;
-#endif
         const int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
 
         if (n_groups > 1) {
@@ -641,7 +702,7 @@ void fused_moe_gate_launcher(const torch::Tensor &input, const int batchSize,
             (numWarps + BLOCK_SIZE / WARP_SIZE - 1) / (BLOCK_SIZE / WARP_SIZE);
         dim3 block_dim(WARP_SIZE, BLOCK_SIZE / WARP_SIZE);
 
-        dispatchToStaticInts<6, 8>(topK, [&]<int TOPK>() {
+        dispatchToStaticInts<6, 8, 16>(topK, [&]<int TOPK>() {
             if (n_groups > 1) {
                 TORCH_CHECK(topK_groups <= TOPK, "topk_group (", topK_groups,
                             ") must not exceed topk (", TOPK, ")");

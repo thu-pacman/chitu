@@ -111,10 +111,10 @@ def _auto_moe_gate(
         return "blackwell"
     if (
         has_chitu_backend
-        and topk in [6, 8]
+        and topk in [6, 8, 16]
         and (
             (8 <= num_experts <= 256 and is_power_of_two(num_experts))
-            or num_experts == 384
+            or num_experts in [384, 896]
         )
         # The CUDA kernel keeps softmax selection scores in fp32, so a softmax
         # bias must be fp32; otherwise fall back to the torch impl.
