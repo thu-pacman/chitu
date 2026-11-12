@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.device_type import has_accelerator
+from chitu.device_type import has_accelerator, is_enflame
 from chitu.utils import (
     try_import_platform_dep,
     try_import_and_setup_torch_npu,
@@ -28,6 +28,14 @@ triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 has_triton_impl = has_triton and has_accelerator()
+
+
+def _triton_rope_supported(rotary_type: str) -> bool:
+    """Return whether the Triton RoPE kernels support `rotary_type` here."""
+    # The Triton compiler packaged with GCU cannot compile the interleaved
+    # kernels. The separated kernels are supported.
+    return not (is_enflame() and rotary_type == "interleaved")
+
 
 if has_triton_impl:
     from chitu.ops.triton_ops import (
@@ -99,6 +107,7 @@ def _auto_apply_rotary_pos_emb(
         q_out is None
         and k_out is None
         and has_triton_impl
+        and _triton_rope_supported(rotary_type)
         and (
             rotary_type == "separated"
             or (
@@ -146,6 +155,7 @@ def _auto_apply_rotary_pos_emb_single(
     if (
         x.is_cuda
         and has_triton_impl
+        and _triton_rope_supported(rotary_type)
         and (
             rotary_type == "separated"
             or (rotary_type == "interleaved" and hasattr(triton.language, "interleave"))

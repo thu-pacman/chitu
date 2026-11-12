@@ -27,7 +27,40 @@ def _auto_hadamard_transform():
         return "fast_hadamard_transform"
     if has_scipy:
         return "scipy"
-    raise NotImplementedError("Please install either scipy or fast_hadamard_transform")
+    return "torch"
+
+
+@functools.cache
+def get_hadamard_matrix_torch(
+    dim: int, dtype: torch.dtype, device: torch.device | str
+) -> torch.Tensor:
+    """Sylvester Hadamard matrix, built once per (dim, dtype, device) and cached.
+
+    This mirrors :func:`hadamard_transform_scipy`: the transform is a single
+    matmul against a cached matrix, which is faster than a butterfly for any
+    realistically sized hidden dimension.
+    """
+    h = torch.ones((1, 1), dtype=torch.float32)
+    while h.shape[0] < dim:
+        h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
+    return h.to(dtype=dtype, device=device)
+
+
+@hadamard_transform.register("torch")
+def hadamard_transform_torch(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Portable fallback for platforms without scipy / fast_hadamard_transform."""
+    dim = x.shape[-1]
+    if not is_power_of_two(dim):
+        dim_padded = next_power_of_two(dim)
+        x = torch.nn.functional.pad(x, (0, dim_padded - dim))
+    else:
+        dim_padded = dim
+    return (
+        torch.nn.functional.linear(
+            x, get_hadamard_matrix_torch(dim_padded, x.dtype, x.device)
+        )[..., :dim]
+        * scale
+    )
 
 
 @functools.cache

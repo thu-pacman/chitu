@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.device_type import is_enflame
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
 
 # FIXME: The ragged metadata tensors and most pointer-offset arithmetic in this
@@ -24,6 +26,20 @@ from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
 # int64 offsets for large tensors; do the same here before relying on these
 # kernels when the flat buffers or KV state/cache can exceed the int32-safe
 # address range, e.g. multi-GB KV-cache tensors.
+
+
+_is_enflame = tl.constexpr(is_enflame())
+
+
+@triton.jit
+def _is_power_of_two(n: int) -> bool:
+    """
+    Similar to chitu.utils.is_power_of_two, but callable from inside a triton kernel.
+
+    TODO: Use triton.constexpr_function to make chitu.utils.is_power_of_two dual-
+    purpose, after we have sufficient triton version on all platforms
+    """
+    return (n != 0) and (n & (n - 1)) == 0
 
 
 @triton.jit
@@ -177,7 +193,11 @@ def _gather_kernel(
     # may remain physically present, but the rolled-back logical position makes
     # them invisible to this gather.
     pend_pos = pending_abs_start + t_offs
-    pend_row = pend_pos % STATE_ROWS
+    if _is_power_of_two(STATE_ROWS):
+        pend_row = pend_pos & (STATE_ROWS - 1)
+    else:
+        pend_row = pend_pos % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
     pend_kv_ptr = (
         kv_state_ptr + slot * state_s0 + pend_row[:, None] * state_s1 + d_offs[None, :]
     )
@@ -196,7 +216,11 @@ def _gather_kernel(
 
     # ---- load score ----
     # pending part: kv_state stores score WITH ape already added; subtract ape back.
-    ape_row = pend_pos % RATIO
+    if _is_power_of_two(RATIO):
+        ape_row = pend_pos & (RATIO - 1)
+    else:
+        ape_row = pend_pos % RATIO
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
     ape_ptr2 = ape_ptr + ape_row[:, None] * D + d_offs[None, :]
     ape_val = tl.load(ape_ptr2, mask=mask2d, other=0.0)
 
@@ -617,8 +641,16 @@ def _writeback_pending_kernel(
     )
 
     pos = suffix_abs_start + r_offs
-    dst_row = pos % STATE_ROWS
-    ape_row = pos % RATIO
+    if _is_power_of_two(STATE_ROWS):
+        dst_row = pos & (STATE_ROWS - 1)
+    else:
+        dst_row = pos % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
+    if _is_power_of_two(RATIO):
+        ape_row = pos & (RATIO - 1)
+    else:
+        ape_row = pos % RATIO
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
     ape_val = tl.load(
         ape_ptr + ape_row[:, None] * D + d_offs[None, :], mask=mask2d, other=0.0
     )
@@ -735,7 +767,11 @@ def _decode_mtp_hca_compress_kernel(
     r_offs = tl.arange(0, RATIO)
     is_pending = r_offs < pending
     new_idx = r_offs - pending
-    state_rows = (group_start + r_offs) % STATE_ROWS
+    if _is_power_of_two(STATE_ROWS):
+        state_rows = (group_start + r_offs) & (STATE_ROWS - 1)
+    else:
+        state_rows = (group_start + r_offs) % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
 
     state_kv = tl.load(
         kv_state_ptr
@@ -810,8 +846,16 @@ def _decode_mtp_hca_update_kernel(
     t_mask = t_offs < Q_LEN
     d_mask = d_offs < D
     positions = sp + t_offs
-    dst_rows = positions % STATE_ROWS
-    ape_rows = positions % RATIO
+    if _is_power_of_two(STATE_ROWS):
+        dst_rows = positions & (STATE_ROWS - 1)
+    else:
+        dst_rows = positions % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
+    if _is_power_of_two(RATIO):
+        ape_rows = positions & (RATIO - 1)
+    else:
+        ape_rows = positions % RATIO
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
     src_rows = req * Q_LEN + t_offs
     kv = tl.load(
         kv_cat_ptr + src_rows[:, None] * D + d_offs[None, :],
@@ -876,7 +920,11 @@ def _decode_mtp_csa_kernel(
     is_pending = r_offs < pending
     new_idx = r_offs - pending
     cur_pos = group_start + r_offs
-    cur_rows = cur_pos % STATE_ROWS
+    if _is_power_of_two(STATE_ROWS):
+        cur_rows = cur_pos & (STATE_ROWS - 1)
+    else:
+        cur_rows = cur_pos % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
 
     # Save every draft token to the logical ring. If a suffix is rejected, the
     # scheduler rolls back the logical length; these physical rows are then
@@ -886,8 +934,16 @@ def _decode_mtp_csa_kernel(
     t_mask = t_offs < Q_LEN
     d_mask = d_offs < FULL_D
     positions = sp + t_offs
-    dst_rows = positions % STATE_ROWS
-    ape_rows = positions % RATIO
+    if _is_power_of_two(STATE_ROWS):
+        dst_rows = positions & (STATE_ROWS - 1)
+    else:
+        dst_rows = positions % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
+    if _is_power_of_two(RATIO):
+        ape_rows = positions & (RATIO - 1)
+    else:
+        ape_rows = positions % RATIO
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
     src_rows = req * Q_LEN + t_offs
     new_kv = tl.load(
         kv_cat_ptr + src_rows[:, None] * FULL_D + d_offs[None, :],
@@ -1143,8 +1199,16 @@ def _decode_hca_kernel(
 
     d_offs = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
-    ape_row = sp % RATIO
-    dst_row = sp % STATE_ROWS
+    if _is_power_of_two(RATIO):
+        ape_row = sp & (RATIO - 1)
+    else:
+        ape_row = sp % RATIO
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
+    if _is_power_of_two(STATE_ROWS):
+        dst_row = sp & (STATE_ROWS - 1)
+    else:
+        dst_row = sp % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
 
     kv = tl.load(kv_ptr + req * D + d_offs, mask=d_mask, other=0.0)
     score = tl.load(score_ptr + req * D + d_offs, mask=d_mask, other=0.0)
@@ -1172,7 +1236,11 @@ def _decode_hca_kernel(
 
     group_start = sp - (RATIO - 1)
     r_offs = tl.arange(0, RATIO)
-    rows = (group_start + r_offs) % STATE_ROWS
+    if _is_power_of_two(STATE_ROWS):
+        rows = (group_start + r_offs) & (STATE_ROWS - 1)
+    else:
+        rows = (group_start + r_offs) % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
 
     state_kv = tl.load(
         kv_state_ptr + slot * state_s0 + rows[:, None] * state_s1 + d_offs[None, :],
@@ -1361,7 +1429,7 @@ def _hadamard_128(x):
 def postprocess_write_kv_cache_hadamard(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     kv_cache: torch.Tensor,
     block_table: torch.Tensor | None,
     start_positions: torch.Tensor,
@@ -1378,8 +1446,8 @@ def postprocess_write_kv_cache_hadamard(
     if bsz == 0:
         return
     paged = block_table is not None
-    freqs_real = freqs_cis.real
-    freqs_imag = freqs_cis.imag
+    freqs_real = freqs_cis.cos
+    freqs_imag = freqs_cis.sin
     D = kv_compress.shape[-1]
     BLOCK_D = triton.next_power_of_2(D)
     _postprocess_write_kv_cache_kernel[(bsz,)](
@@ -1415,7 +1483,7 @@ def postprocess_write_kv_cache_hadamard(
 def postprocess_write_kv_cache(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     kv_cache: torch.Tensor,
     block_table: torch.Tensor | None,
     start_positions: torch.Tensor,
@@ -1431,8 +1499,8 @@ def postprocess_write_kv_cache(
     if bsz == 0:
         return
     paged = block_table is not None
-    freqs_real = freqs_cis.real
-    freqs_imag = freqs_cis.imag
+    freqs_real = freqs_cis.cos
+    freqs_imag = freqs_cis.sin
     D = kv_compress.shape[-1]
     BLOCK_D = triton.next_power_of_2(D)
     _postprocess_write_kv_cache_kernel[(bsz,)](
@@ -1468,7 +1536,7 @@ def postprocess_write_kv_cache(
 def _postprocess_write_flashmla_kernel(
     kv_ptr,  # [bsz, D] fp32 compressed KV
     norm_weight_ptr,  # [D]
-    freqs_real_ptr,  # [max_seq, ROPE_DIM // 2], view of complex freqs
+    freqs_real_ptr,  # [max_seq, ROPE_DIM // 2], cos/sin table
     freqs_imag_ptr,
     kv_cache_ptr,  # [num_blocks, page_size, 584] uint8
     block_table_ptr,
@@ -1585,7 +1653,7 @@ def _postprocess_write_flashmla_kernel(
 def postprocess_write_flashmla(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     kv_cache: torch.Tensor,
     block_table: torch.Tensor,
     start_positions: torch.Tensor,
@@ -1602,8 +1670,8 @@ def postprocess_write_flashmla(
     bsz = start_positions.shape[0]
     if bsz == 0:
         return
-    freqs_real = freqs_cis.real
-    freqs_imag = freqs_cis.imag
+    freqs_real = freqs_cis.cos
+    freqs_imag = freqs_cis.sin
     _postprocess_write_flashmla_kernel[(bsz,)](
         kv_compress,
         norm_weight,

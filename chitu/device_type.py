@@ -2,7 +2,19 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
+
 import torch
+
+# Enflame GCU: apply the torch_gcu CUDA-compat shim (".cuda()"->".gcu()", the
+# "nccl" process-group backend->"eccl", torch.cuda.*->torch.gcu.*) at import time,
+# BEFORE any device detection. get_device_name() caches its result, so the shim
+# must be active first for the GCU device to be observed. No-op without torch_gcu.
+try:
+    importlib.import_module("torch_gcu.transfer_to_gcu")
+except Exception:
+    # torch_gcu is optional; without it the CUDA-compat shim is not applied.
+    pass
 
 _device_name = None
 
@@ -78,6 +90,11 @@ def is_moore():
     MOORE_DEVICE_PATTERNS = ["MTT"]
     device_name = get_device_name()
     return any(pattern in device_name for pattern in MOORE_DEVICE_PATTERNS)
+
+
+def is_enflame():
+    # Enflame GCU (e.g. L600). torch_gcu reports the device name as "GCU".
+    return "GCU" in get_device_name()
 
 
 if hasattr(torch, "musa") and torch.musa.is_available():

@@ -6,11 +6,9 @@ import logging
 from typing import Optional
 from dataclasses import dataclass, field, replace
 import torch
-from xgrammar import (
-    allocate_token_bitmask,
-    GrammarMatcher,
-    BatchGrammarMatcher,
-)
+import xgrammar
+from xgrammar import GrammarMatcher, allocate_token_bitmask
+
 from chitu.global_vars import get_global_args, is_pd_prefill_only
 from chitu.task import Task, SampleParams, PackedTasks, PackedTasksResult, TaskType
 from chitu.ops.sampling import (
@@ -23,11 +21,15 @@ from chitu.ops.sampling import (
     resample_mtp_rejected,
     batch_append_tokens,
 )
-from chitu.utils import ceil_div, create_tensor, get_chitu_bool_env, step_timer
+from chitu.utils import ceil_div, create_tensor, step_timer
 
 from .utils import get_tokenizer_info, get_op_device
 
 logger = logging.getLogger(__name__)
+
+# Older xgrammar releases lack BatchGrammarMatcher. Fall back to filling each
+# task's bitmask with its own matcher in that case.
+BatchGrammarMatcher = getattr(xgrammar, "BatchGrammarMatcher", None)
 
 TOKEN_BLOCK_SIZE = 256
 "token block size for frequency penalty"
@@ -214,7 +216,9 @@ class Sampler:
         self.states: dict[str, TaskSampleState] = {}
         # The rows of the step whose draft has run but whose verify has not.
         self._draft_batch: DraftBatch | None = None
-        self.batch_matcher = BatchGrammarMatcher()
+        self.batch_matcher = (
+            BatchGrammarMatcher() if BatchGrammarMatcher is not None else None
+        )
 
         # Draft proposal params (per-request), set by `prepare_draft_sample_params`
         # before each draft loop. The model reads them via `sample_draft_tokens`
@@ -661,9 +665,13 @@ class Sampler:
                     batch_matchers.append(state.matcher)
                     batch_indices.append(ti)
             if batch_matchers:
-                self.batch_matcher.batch_fill_next_token_bitmask(
-                    batch_matchers, bitmask, batch_indices
-                )
+                if self.batch_matcher is not None:
+                    self.batch_matcher.batch_fill_next_token_bitmask(
+                        batch_matchers, bitmask, batch_indices
+                    )
+                else:
+                    for matcher, batch_index in zip(batch_matchers, batch_indices):
+                        matcher.fill_next_token_bitmask(bitmask, batch_index)
                 all_filled_indices.extend(batch_indices)
             if all_filled_indices:
                 bitmask_gpu = bitmask.to(logits.device, non_blocking=True)
@@ -680,6 +688,10 @@ class Sampler:
             dtype=torch.int64,
         )
         retrieve_sibling = torch.tensor([-1] * node_count, dtype=torch.int64)
+
+        # Reaching here means some task has an active matcher, which also made
+        # `_rebuild_mtp_draft_inputs` materialize the host draft rows.
+        assert draft_tokens_list is not None
 
         for ti, state in enumerate(states):
             if not state.matcher or state.matcher.is_terminated():

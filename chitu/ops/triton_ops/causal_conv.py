@@ -212,6 +212,88 @@ def causal_conv1d_update_triton(
 
 
 @triton.jit
+def causal_conv1d_update_gcu_b1_inplace_kernel(
+    this_ptr,
+    state_ptr,
+    weight_ptr,
+    out_ptr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Exact 4-tap (conv state width 4), B=1 (one sequence) decode kernel.
+
+    Qwen3-Next decode calls this op once per layer with one new token. The
+    generic kernel's 16-way batch lane and per-step state allocation are wasted
+    for that shape. This kernel updates the 4-token state in place and keeps
+    the generic kernel's BF16/FP32 reduction boundary.
+    """
+    h = tl.program_id(0) * BLOCK_H + tl.arange(0, BLOCK_H)
+    taps = tl.arange(0, 4)
+    mask = h < HIDDEN_SIZE
+    state_offsets = h[:, None] * 4 + taps[None, :]
+    shifted_offsets = h[:, None] * 4 + (taps[None, :] + 1)
+
+    shifted = tl.load(
+        state_ptr + shifted_offsets,
+        mask=mask[:, None] & (taps[None, :] < 3),
+        other=0.0,
+    )
+    current = tl.load(this_ptr + h, mask=mask, other=0.0)
+    weight = tl.load(weight_ptr + state_offsets, mask=mask[:, None], other=0.0)
+    new_state = tl.where(taps[None, :] == 3, current[:, None], shifted).to(weight.dtype)
+    result = tl.sum(new_state.to(tl.float32) * weight, axis=1)
+    output = result * tl.sigmoid(result)
+
+    tl.store(out_ptr + h, output.to(current.dtype), mask=mask)
+    tl.store(state_ptr + state_offsets, new_state, mask=mask[:, None])
+
+
+def causal_conv1d_update_gcu_b1_inplace(
+    this_hidden_states: torch.Tensor,
+    old_hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+):
+    """B=1 Qwen3-Next decode with an explicitly permitted state mutation."""
+    if tuple(this_hidden_states.shape) != (1, 10240):
+        raise ValueError(f"unexpected input shape {tuple(this_hidden_states.shape)}")
+    if tuple(old_hidden_states.shape) != (1, 10240, 4):
+        raise ValueError(f"unexpected state shape {tuple(old_hidden_states.shape)}")
+    if tuple(weight.shape) != (10240, 1, 4):
+        raise ValueError(f"unexpected weight shape {tuple(weight.shape)}")
+    if not (
+        this_hidden_states.dtype == torch.bfloat16
+        and old_hidden_states.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+    ):
+        raise ValueError("input/state/weight must be BF16")
+    if not (
+        this_hidden_states.device.type == "gcu"
+        and this_hidden_states.device == old_hidden_states.device
+        and this_hidden_states.device == weight.device
+    ):
+        raise ValueError("input/state/weight must be colocated GCU tensors")
+    if not (
+        this_hidden_states.is_contiguous()
+        and old_hidden_states.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        raise ValueError("input/state/weight must be contiguous")
+
+    out = torch.empty_like(this_hidden_states)
+    causal_conv1d_update_gcu_b1_inplace_kernel[(40,)](
+        this_hidden_states,
+        old_hidden_states,
+        weight,
+        out,
+        HIDDEN_SIZE=10240,
+        BLOCK_H=256,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out, old_hidden_states
+
+
+@triton.jit
 def causal_conv1d_prefill_kernel(
     inputs_ptr,
     old_state_ptr,
