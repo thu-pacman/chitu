@@ -1077,6 +1077,23 @@ Install time:
 
 Runtime:
 
+Mooncake RDMA KV transfer honors `NCCL_IB_HCA`, or `NVSHMEM_HCA_LIST` when
+`NCCL_IB_HCA` is unset or empty. NCCL selectors use prefix matching; `=` selects
+exact names and `^` excludes matches. NVSHMEM uses exact names and supports `^`
+exclusion. For example, `NCCL_IB_HCA='^=mlx5_3,mlx5_4'` excludes those two NICs.
+Automatic environment setup preserves explicit selections.
+
+Explicit filters are resolved against `/sys/class/infiniband`, which must be
+visible to the worker. Only devices with an Active port matching `MC_IB_PORT`
+(default `1`, valid range `1`–`255`) are selected; link rate does not narrow an
+explicit selection. Optional `:port` qualifiers must match that port. NCCL's
+optional rail/plane fields do not affect Mooncake device selection. A malformed
+filter or a filter with no active match raises an error instead of allowing
+Mooncake to fall back to unrestricted detection. Explicit selection does not
+require `ibstat`. With neither selector set, the existing highest-rate automatic
+detection is used. TCP, Ascend HCCL, and mock mode retain optional autodetection.
+SSH, Docker, and Apptainer launchers forward both HCA variables and `MC_IB_PORT`.
+
 | Name                            | Possible Values              | Description                                            |
 | ------------------------------- | ---------------------------- | ------------------------------------------------------ |
 | `CHITU_LOGGING_LEVEL`           | `<level>` or `<module1>:<level1>;<module2>:<level2>;...`. Each level can be `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. If set, each module can be any module path in the source tree, like `chitu.ops`. | Logging level. |
