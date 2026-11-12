@@ -30,9 +30,10 @@ from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
 
 _is_enflame = tl.constexpr(is_enflame())
 
+
 @triton.jit
 def _is_power_of_two(n: int) -> bool:
-    "
+    """
     Similar to chitu.utils.is_power_of_two, but callable from inside a triton kernel.
 
     TODO: Use triton.constexpr_function to make chitu.utils.is_power_of_two dual-
