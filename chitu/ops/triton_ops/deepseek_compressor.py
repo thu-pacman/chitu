@@ -18,33 +18,27 @@ import triton
 import triton.language as tl
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.device_type import is_enflame
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
-
-
-# --- GCU: Triton's vectorized int64 `%` returns negative residues on this
-# backend, so the decode fast paths use a bit mask instead (STATE_ROWS / RATIO
-# are powers of two). Verify that precondition cheaply, once per value.
-_POW2_OK: set[int] = set()
-
-
-def _check_pow2(name, value):
-    value = int(value)
-    if value in _POW2_OK:
-        return
-    if value <= 0 or (value & (value - 1)) != 0:
-        raise ValueError(
-            f"{name}={value} must be a power of two: the DSV4 decode fast paths "
-            "use a bit mask instead of `%` to avoid negative residues from the "
-            "GCU int64 vectorized modulo"
-        )
-    _POW2_OK.add(value)
-
 
 # FIXME: The ragged metadata tensors and most pointer-offset arithmetic in this
 # file currently assume int32 indices. Other KV-cache Triton ops switch to
 # int64 offsets for large tensors; do the same here before relying on these
 # kernels when the flat buffers or KV state/cache can exceed the int32-safe
 # address range, e.g. multi-GB KV-cache tensors.
+
+
+_is_enflame = tl.constexpr(is_enflame())
+
+@triton.jit
+def _is_power_of_two(n: int) -> bool:
+    "
+    Similar to chitu.utils.is_power_of_two, but callable from inside a triton kernel.
+
+    TODO: Use triton.constexpr_function to make chitu.utils.is_power_of_two dual-
+    purpose, after we have sufficient triton version on all platforms
+    """
+    return (n != 0) and (n & (n - 1)) == 0
 
 
 @triton.jit
@@ -198,7 +192,11 @@ def _gather_kernel(
     # may remain physically present, but the rolled-back logical position makes
     # them invisible to this gather.
     pend_pos = pending_abs_start + t_offs
-    pend_row = pend_pos & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
+    if _is_power_of_two(STATE_ROWS):
+        pend_row = pend_pos & (STATE_ROWS - 1)
+    else:
+        pend_row = pend_pos % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
     pend_kv_ptr = (
         kv_state_ptr + slot * state_s0 + pend_row[:, None] * state_s1 + d_offs[None, :]
     )
@@ -217,7 +215,11 @@ def _gather_kernel(
 
     # ---- load score ----
     # pending part: kv_state stores score WITH ape already added; subtract ape back.
-    ape_row = pend_pos & (RATIO - 1)  # gcu: vector % returns negative residues
+    if _is_power_of_two(RATIO):
+        ape_row = pend_pos & (RATIO - 1)
+    else:
+        ape_row = pend_pos % RATIO
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
     ape_ptr2 = ape_ptr + ape_row[:, None] * D + d_offs[None, :]
     ape_val = tl.load(ape_ptr2, mask=mask2d, other=0.0)
 
@@ -638,8 +640,16 @@ def _writeback_pending_kernel(
     )
 
     pos = suffix_abs_start + r_offs
-    dst_row = pos & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
-    ape_row = pos & (RATIO - 1)  # gcu: vector % returns negative residues
+    if _is_power_of_two(STATE_ROWS):
+        dst_row = pos & (STATE_ROWS - 1)
+    else:
+        dst_row = pos % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
+    if _is_power_of_two(RATIO):
+        ape_row = pos & (RATIO - 1)
+    else:
+        ape_row = pos % RATIO
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
     ape_val = tl.load(
         ape_ptr + ape_row[:, None] * D + d_offs[None, :], mask=mask2d, other=0.0
     )
@@ -679,8 +689,6 @@ def writeback_pending_triton(
         return
     D = flat_kv.shape[1]
     state_rows = kv_state.shape[1]
-    _check_pow2("STATE_ROWS", state_rows)
-    _check_pow2("RATIO", ratio)
     BLOCK_R = triton.next_power_of_2(state_rows)
     BLOCK_D = triton.next_power_of_2(D)
     _writeback_pending_kernel[(n,)](
@@ -758,9 +766,11 @@ def _decode_mtp_hca_compress_kernel(
     r_offs = tl.arange(0, RATIO)
     is_pending = r_offs < pending
     new_idx = r_offs - pending
-    state_rows = (group_start + r_offs) & (
-        STATE_ROWS - 1
-    )  # gcu: vector % returns negative residues
+    if _is_power_of_two(STATE_ROWS):
+        state_rows = (group_start + r_offs) & (STATE_ROWS - 1)
+    else:
+        state_rows = (group_start + r_offs) % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
 
     state_kv = tl.load(
         kv_state_ptr
@@ -835,8 +845,16 @@ def _decode_mtp_hca_update_kernel(
     t_mask = t_offs < Q_LEN
     d_mask = d_offs < D
     positions = sp + t_offs
-    dst_rows = positions & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
-    ape_rows = positions & (RATIO - 1)  # gcu: vector % returns negative residues
+    if _is_power_of_two(STATE_ROWS):
+        dst_rows = positions & (STATE_ROWS - 1)
+    else:
+        dst_rows = positions % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
+    if _is_power_of_two(RATIO):
+        ape_rows = positions & (RATIO - 1)
+    else:
+        ape_rows = positions % RATIO
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
     src_rows = req * Q_LEN + t_offs
     kv = tl.load(
         kv_cat_ptr + src_rows[:, None] * D + d_offs[None, :],
@@ -901,7 +919,11 @@ def _decode_mtp_csa_kernel(
     is_pending = r_offs < pending
     new_idx = r_offs - pending
     cur_pos = group_start + r_offs
-    cur_rows = cur_pos & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
+    if _is_power_of_two(STATE_ROWS):
+        cur_rows = cur_pos & (STATE_ROWS - 1)
+    else:
+        cur_rows = cur_pos % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
 
     # Save every draft token to the logical ring. If a suffix is rejected, the
     # scheduler rolls back the logical length; these physical rows are then
@@ -911,8 +933,16 @@ def _decode_mtp_csa_kernel(
     t_mask = t_offs < Q_LEN
     d_mask = d_offs < FULL_D
     positions = sp + t_offs
-    dst_rows = positions & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
-    ape_rows = positions & (RATIO - 1)  # gcu: vector % returns negative residues
+    if _is_power_of_two(STATE_ROWS):
+        dst_rows = positions & (STATE_ROWS - 1)
+    else:
+        dst_rows = positions % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
+    if _is_power_of_two(RATIO):
+        ape_rows = positions & (RATIO - 1)
+    else:
+        ape_rows = positions % RATIO
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
     src_rows = req * Q_LEN + t_offs
     new_kv = tl.load(
         kv_cat_ptr + src_rows[:, None] * FULL_D + d_offs[None, :],
@@ -1048,8 +1078,6 @@ def decode_mtp_hca(
         return
     D = kv_cat.shape[1]
     state_rows = kv_state.shape[1]
-    _check_pow2("STATE_ROWS", state_rows)
-    _check_pow2("RATIO", ratio)
     BLOCK_Q = triton.next_power_of_2(q_len)
     BLOCK_D = triton.next_power_of_2(D)
     n_compressed = 0 if compressed_reqs is None else compressed_reqs.shape[0]
@@ -1111,8 +1139,6 @@ def decode_mtp_csa(
         return
     full_d = kv_cat.shape[1]
     state_rows = kv_state.shape[1]
-    _check_pow2("STATE_ROWS", state_rows)
-    _check_pow2("RATIO", ratio)
     BLOCK_Q = triton.next_power_of_2(q_len)
     BLOCK_HD = triton.next_power_of_2(head_dim)
     BLOCK_FULL_D = triton.next_power_of_2(full_d)
@@ -1172,8 +1198,16 @@ def _decode_hca_kernel(
 
     d_offs = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
-    ape_row = sp & (RATIO - 1)  # gcu: vector % returns negative residues
-    dst_row = sp & (STATE_ROWS - 1)  # gcu: vector % returns negative residues
+    if _is_power_of_two(RATIO):
+        ape_row = sp & (RATIO - 1)
+    else:
+        ape_row = sp % RATIO
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
+    if _is_power_of_two(STATE_ROWS):
+        dst_row = sp & (STATE_ROWS - 1)
+    else:
+        dst_row = sp % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
 
     kv = tl.load(kv_ptr + req * D + d_offs, mask=d_mask, other=0.0)
     score = tl.load(score_ptr + req * D + d_offs, mask=d_mask, other=0.0)
@@ -1201,9 +1235,11 @@ def _decode_hca_kernel(
 
     group_start = sp - (RATIO - 1)
     r_offs = tl.arange(0, RATIO)
-    rows = (group_start + r_offs) & (
-        STATE_ROWS - 1
-    )  # gcu: vector % returns negative residues
+    if _is_power_of_two(STATE_ROWS):
+        rows = (group_start + r_offs) & (STATE_ROWS - 1)
+    else:
+        rows = (group_start + r_offs) % STATE_ROWS
+        tl.static_assert(not _is_enflame)  # gcu: vector % returns negative residues
 
     state_kv = tl.load(
         kv_state_ptr + slot * state_s0 + rows[:, None] * state_s1 + d_offs[None, :],
@@ -1241,8 +1277,6 @@ def decode_hca(
         return
     D = out_kv.shape[1]
     BLOCK_D = min(64, triton.next_power_of_2(D))
-    _check_pow2("STATE_ROWS", kv_state.shape[1])
-    _check_pow2("RATIO", ratio)
     grid = (bsz, triton.cdiv(D, BLOCK_D))
     _decode_hca_kernel[grid](
         kv,
