@@ -27,8 +27,6 @@ from chitu.global_vars import (
     is_classic_pd_disagg,
     is_independent_multi_inst,
     set_global_variables,
-    set_quant_variables,
-    set_backend_variables,
     set_rank,
 )
 from chitu.models.registry import ModelType
@@ -56,7 +54,10 @@ from chitu.utils import (
     get_chitu_bool_env,
     should_pretty_log,
 )
-from chitu.distributed.parallel_state import get_pp_group
+from chitu.distributed.parallel_state import (
+    get_pp_group,
+    get_embed_tokens_lm_head_tp_group,
+)
 from chitu.distributed.partition import compute_prefill_chunk_size_dist_in_dp
 from chitu.logging_utils import setup_chitu_logging
 from chitu.metrics import (
@@ -1118,6 +1119,8 @@ def _warmup_backend_direct(
                 dtype=payload_dtype,
             )
     all_tasks = PackedTasksBase(local_max_bs, task_ids=req_ids)
+    all_tasks.task_type = TaskType.Prefill
+    all_tasks.num_tokens = local_max_bs * prefill_seq_len
     all_tasks.new_cache_ids_list = _build_direct_warmup_new_cache_ids_list(
         local_max_bs,
         decode_steps,
@@ -1150,6 +1153,10 @@ def _warmup_backend_direct(
 
     if not skip_model_prefill:
         # Direct warmup bypasses the executor's per-step MoE preparation.
+        if Backend.model.specialize_embed_tokens_lm_head_parallel:
+            Backend.model.prepare_global_num_tokens(
+                all_tasks, get_embed_tokens_lm_head_tp_group()
+            )
         num_tokens = Backend.model.cp_context.prepare_prefill(
             local_max_bs * prefill_seq_len
         )
@@ -1168,12 +1175,21 @@ def _warmup_backend_direct(
             curr_req_ids = req_ids[:curr_bs]
 
             cur_tasks = PackedTasksBase(curr_bs, task_ids=curr_req_ids)
+            cur_tasks.task_type = TaskType.Decode
+            cur_tasks.num_tokens = curr_bs
             cur_tasks.new_cache_ids_list = []
             cur_tasks.tokens = [[1] for _ in range(curr_bs)]
 
             for cache in Backend.cache_dict.values():
                 cache.prepare_cache_decode(cur_tasks)
             PrometheusMetricsCollector.update_GPU_usage()
+
+            # Direct warmup skips the executor. Prepare vocabulary-parallel
+            # token counts before embedding or LM head.
+            if Backend.model.specialize_embed_tokens_lm_head_parallel:
+                Backend.model.prepare_global_num_tokens(
+                    cur_tasks, get_embed_tokens_lm_head_tp_group()
+                )
 
             # direct warmup 绕过了 executor，因此必须在这里显式设置
             if Backend.model.moe_impl is not None:
@@ -1427,8 +1443,6 @@ def chitu_init(args):
 
     init_logger()
 
-    set_quant_variables(args)
-    set_backend_variables(args)
     set_global_variables(args, debug=debug)
     args = get_global_args()  # Get the pre-processed global args
 

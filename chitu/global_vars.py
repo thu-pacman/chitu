@@ -502,10 +502,15 @@ def set_global_args(raw_args, need_ensure=True, need_preprocess=True):
 
     args = raw_args
     if need_preprocess:
+        # Keep the original rules for each instance. Apply model overrides
+        # before normalizing the rules and validating the KV-cache configuration.
+        args = copy.deepcopy(raw_args)
         if (multi_inst := getattr(args, "multi_inst", None)) and getattr(
             multi_inst, "inst_id", None
         ) is not None:
             args = apply_multi_inst_override(args)
+        set_quant_variables(args)
+        set_backend_variables(args)
         args = resolve_full_default_args(StaticConfig(args))
     _GLOBAL_ARGS = args
 

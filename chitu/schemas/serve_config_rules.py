@@ -247,14 +247,20 @@ class ServeConfigRules(Callback):
         prepare_local_lengths）。所以能不能开 cp，取决于各 rank 拿到的是不是「全局位置」
         的输入 —— 是全局位置，state / checkpoint 就与 cp=1 时逐字节一致。
 
-        - ``glm-5-next``（chitu/models/model_glm5_next.py）：已支持 cp prefill。层里把投影
-        后的 qkv/beta/f_a/g_a all-gather 成全局序列，在全局序列上跑完短卷积和递归，再把本
-        rank 的行切回来（索引器同理），所以每个 rank 算出的 state 都是全局位置上的量；写
-        进 page 的内容也就与 cp=1 时相同（cp rank 之间只是重复计算）。而 prefix caching 只
-        按「序列绝对位置」决定 state 落在哪一页（``_ckpt_page_id`` / ``_upd_ckpt_write_pages``
-        用绝对 position ids，chunk 起点由调度器对齐到 C 的网格），与 cp 怎么切无关，所以
-        cp 和 prefix caching 可以同时开。注意 ``infer.pcp_size > 1`` 还有并行度上的限制
-        （``dp_size`` 必须为 1，见 chitu/boot/arg_utils.py），那是另一回事。
+        - ``glm-5-next``（chitu/models/model_glm5_next.py）：已支持 cp prefill。层内优先
+        走连续切分：每个 rank 只算 1/pcp 的 token，跨 rank 只交换段仿射映射
+        （M/S_ext，O(head_dim^2)）和短卷积的 tail，再用前缀链式合并出各 rank 的
+        incoming state（见 chitu/cp_linear_attention.py 与
+        Glm5NextLinearAttention._forward_prefill_cp）。段长按
+        ``floor(r * T / W)`` 划分，不要求 delta token 数能被 pcp_size 整除。
+        不满足连续切分条件时（delta token 太少、段长 < 卷积核 - 1、prefix caching
+        checkpoint 写页、V-first state 等）会自动退回 replicate：层里把投影后的
+        qkv/beta/f_a/g_a all-gather 成全局序列，在全局序列上跑完短卷积和递归，再把
+        本 rank 的行切回来。replicate 只作为正确性 fallback，不再作为用户可选配置。
+        prefix caching 只按「序列绝对位置」决定 state 落在哪一页
+        （``_ckpt_page_id`` / ``_upd_ckpt_write_pages`` 用绝对 position ids，chunk 起点由
+        调度器对齐到 C 的网格），与 cp 怎么切无关。注意 ``infer.pcp_size > 1`` 还有并行度
+        上的限制（``dp_size`` 必须为 1，见 chitu/boot/arg_utils.py），那是另一回事。
         - ``hf-qwen3-next`` / ``hf-qwen3-5``：模型里还没有 cp 路径，层拿到本 rank 的
         token 后仍把全局的 ``seq_len_delta`` 当 cu_seqlens 传给算子（见
         Qwen3NextGatedDeltaNet.forward），算子的 grid/索引按全局长度算会直接越界
@@ -264,7 +270,8 @@ class ServeConfigRules(Callback):
         # 有线性注意力层的模型类型，见 chitu/models/model_hf_qwen3_next.py、
         # chitu/models/model_hf_qwen3_5.py、chitu/models/model_glm5_next.py
         linear_attn_model_types = {"hf-qwen3-next", "hf-qwen3-5", "glm-5-next"}
-        # 已经有 cp prefill 实现的模型类型（层内 all-gather 出全局序列），其余一律不支持 cp
+        # 已经有 cp prefill 实现（连续切分 + replicate fallback）的模型类型，
+        # 其余一律不支持 cp。
         cp_prefill_model_types = {"glm-5-next"}
         model_type = config.models.type
         if model_type not in linear_attn_model_types:

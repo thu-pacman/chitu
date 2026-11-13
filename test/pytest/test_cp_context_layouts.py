@@ -167,6 +167,19 @@ def test_contiguous_position_owner_and_local_index():
     assert local.tolist() == [0, 1, 0, 1, 0, 1, 0, 1, 2]
 
 
+def test_contiguous_context_exposes_interleaved_view():
+    ctx = CPContextContiguous(4, _FakeCPGroup(1, torch.empty(0)))
+    ctx.split_prefill(torch.arange(10), None, _freqs(10), 10)
+
+    interleaved = ctx.as_interleaved()
+
+    assert interleaved.layout == "interleaved"
+    assert interleaved.orig_num_tokens == 10
+    assert interleaved.n_local == 3
+    indices, _ = interleaved.local_flat_indices(3, 10, torch.device("cpu"))
+    assert indices.tolist() == [1, 5, 9]
+
+
 def test_noop_context_is_identity():
     ctx = NoOpCPContext()
     tokens = torch.arange(10)

@@ -16,8 +16,10 @@ from chitu.attn_backend import FlashAttnBackend, RefAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.checkpoint_prefix import as_checkpoint_prefix
-from chitu.cp_utils import get_cp_context
+from chitu.cp_utils import from_layout, get_cp_context, to_layout, use_cp_context
+from chitu.cp_linear_attention import segment_affine_transition
 from chitu.global_vars import get_global_args
+from chitu.lazy import eval_lazy
 from chitu.kv_cache import (
     DenseKVCacheAccessor,
     KVCacheBase,
@@ -29,7 +31,13 @@ from chitu.models.model import (
     RMSNorm,
     RMSNormResidual,
     TransformerBlock,
+    all_gather_cp_last,
     get_linear_layout_contig_y,
+    merge_cp_initial_state,
+    patch_conv_state_with_prev_tail,
+    prepare_linear_attention_cp_chunk,
+    reduce_linear_attention_cp_state,
+    write_linear_attention_cp_state,
 )
 from chitu.models.model_deepseek_v3 import (
     TransformerDeepSeekV3,
@@ -730,6 +738,28 @@ class AttentionGLM5Next(AttentionGLM52):
             del self.indexer.index_kpool_compress_gate
 
     @override
+    def forward(self, x, freqs_cis, is_mtp=False):
+        cp = get_cp_context()
+        if not cp.step_active or getattr(cp, "layout", "interleaved") == "interleaved":
+            return super().forward(x, freqs_cis, is_mtp=is_mtp)
+
+        # Sparse MLA consumes interleaved local rows. Convert around the layer
+        # when the residual stream uses a different CP layout.
+        x_interleaved, restore_route = to_layout(
+            x, cp, cp.orig_num_tokens, "interleaved"
+        )
+        interleaved_ctx = cp.as_interleaved()
+        if interleaved_ctx.get_seq_len_delta_view() is None:
+            interleaved_ctx.prepare_local_lengths(
+                self.cache.get_seq_len_delta(is_mtp),
+                x_interleaved.shape[0],
+                is_decode_stage=False,
+            )
+        with use_cp_context(interleaved_ctx):
+            out = super().forward(x_interleaved, freqs_cis, is_mtp=is_mtp)
+        return from_layout(out, restore_route, cp)
+
+    @override
     def make_indexer(self, args, *, checkpoint_prefix, indexer_impl):
         mode = None
         if self._indexer_role_for_make == "shared":
@@ -921,6 +951,40 @@ class Glm5NextLinearAttention(nn.Module):
             checkpoint_prefix=checkpoint_prefix / "o_proj",
         )
 
+    def _project_qkv_gates(self, x):
+        """Project input tokens to QKV, beta, and gate latents."""
+        if self.merge_qkv:
+            projected = self.in_proj_qkvbfg_a(x)
+            return torch.split(
+                projected,
+                [
+                    self.local_qkv_dim * 3,
+                    self.n_local_heads,
+                    self.head_dim,
+                    self.head_dim,
+                ],
+                dim=-1,
+            )
+        return (
+            torch.cat([self.q_proj(x), self.k_proj(x), self.v_proj(x)], dim=-1),
+            self.b_proj(x),
+            self.forget_gate.f_a_proj(x),
+            self.g_a_proj(x),
+        )
+
+    def _split_qkv_heads(self, qkv):
+        """Split projected QKV into per-head tensors."""
+        q, k, v = torch.split(qkv, [self.local_qkv_dim] * 3, dim=-1)
+        return tuple(h.reshape(h.shape[0], -1, self.head_dim) for h in (q, k, v))
+
+    def _final_output(self, out, g_a, n_tokens):
+        """Apply the output gate, gated norm, and output projection."""
+        gate = self.g_b_proj(g_a).view(n_tokens, self.n_local_heads, self.head_dim)
+        out = self.o_norm(
+            out.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim)
+        ).view(n_tokens, -1)
+        return self.o_proj(out)
+
     def forward(self, x: torch.Tensor):
         seq_len_delta = self.cache.seq_len_delta
         use_precomputed_states = (
@@ -931,6 +995,16 @@ class Glm5NextLinearAttention(nn.Module):
         cp_active = cp_ctx.step_active and not seq_len_delta.is_decode_stage
 
         cache_accessor = self.cache.get_accessor(self.layer_id)
+
+        if cp_active:
+            # CP prefill: each rank computes 1/pcp tokens; residual layout is
+            # handled by to_layout/from_layout. None means the step is unsupported.
+            out = self._forward_prefill_cp(x, seq_len_delta, cp_ctx, cache_accessor)
+            if out is not None:
+                return out
+            # Unsupported cases (short prompt, checkpoint pages, V-first state)
+            # fall back to the replicated all-gather path below.
+
         # is_decode_stage 是 cache 的 step 级状态（prefill 置 False、decode 置 True）
         is_mtp_decode_stage = self.mtp_size > 1 and self.cache.is_decode_stage
 
@@ -973,23 +1047,7 @@ class Glm5NextLinearAttention(nn.Module):
                 device=recurrent_state.device,
             )
 
-        if self.merge_qkv:
-            projected = self.in_proj_qkvbfg_a(x)
-            qkv, beta_raw, f_a, g_a = torch.split(
-                projected,
-                [
-                    self.local_qkv_dim * 3,
-                    self.n_local_heads,
-                    self.head_dim,
-                    self.head_dim,
-                ],
-                dim=-1,
-            )
-        else:
-            qkv = torch.cat([self.q_proj(x), self.k_proj(x), self.v_proj(x)], dim=-1)
-            beta_raw = self.b_proj(x)
-            f_a = self.forget_gate.f_a_proj(x)
-            g_a = self.g_a_proj(x)
+        qkv, beta_raw, f_a, g_a = self._project_qkv_gates(x)
 
         if cp_active:
             # Both the causal conv and the gated-delta recurrence couple tokens
@@ -1041,10 +1099,7 @@ class Glm5NextLinearAttention(nn.Module):
                 seq_len_list=seq_len_delta.delta_lens_list,
             )
             # prefill 只写每个 seq 的第 0 个 in-place block，所以这里不需要为 mtp_size 复制
-        q, k, v = torch.split(qkv, [self.local_qkv_dim] * 3, dim=-1)
-        q, k, v = map(
-            lambda h: h.reshape(h.size(0), -1, self.head_dim), (q, k, v)
-        )  # (total_len, n_heads, head_dim)
+        q, k, v = self._split_qkv_heads(qkv)
 
         if use_precomputed_states:
             gate_shape = (q.shape[0], 1)
@@ -1160,11 +1215,124 @@ class Glm5NextLinearAttention(nn.Module):
                 ckpt_page_ids,
                 state_checkpoints,
             )
-        gate = self.g_b_proj(g_a).view(x.shape[0], self.n_local_heads, self.head_dim)
-        out = self.o_norm(
-            out.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim)
-        ).view(x.shape[0], -1)
-        return self.o_proj(out)
+        return self._final_output(out, g_a, x.shape[0])
+
+    # ------------------------------------------------------------------
+    # CP prefill (see chitu/cp_linear_attention.py)
+    # ------------------------------------------------------------------
+
+    def _forward_prefill_cp(self, x, seq_len_delta, cp_ctx, cache_accessor):
+        """CP prefill. Return ``None`` when the fallback path is needed.
+
+        Limits: prefill only; no V-first state layout; ``total >= pcp_size``;
+        each local part must cover ``conv_kernel_size - 1`` tokens; checkpoint
+        pages are unsupported because their positions assume chunk-aligned starts.
+
+        The split is ``floor(r * T / W)`` and does not require ``T % W == 0``.
+        The residual layout is handled by ``to_layout``/``from_layout``, so this
+        method stays shared by contiguous, interleaved, and future layouts.
+        Chunked prefill carries conv and recurrent state through the KV cache.
+
+        All eligibility checks use global metadata, so every CP rank takes the
+        same path; only the final row-count check is rank-local.
+        """
+        if self.kda_state_v_first:
+            # Affine merge is K-first; BoltOps prefill is V-first. With K == V
+            # the shapes match but the result would be silently wrong.
+            return None
+        prepared = prepare_linear_attention_cp_chunk(
+            x, seq_len_delta, cp_ctx, cache_accessor, self.conv_kernel_size
+        )
+        if prepared is None:
+            return None
+        (
+            plan,
+            x_local,
+            restore_route,
+            local_cu,
+            conv_state,
+            recurrent_state,
+            conv_state_local,
+            seq_lens,
+            cu,
+        ) = prepared
+        bsz = len(seq_lens)
+        world = cp_ctx.pcp_size
+        rank = cp_ctx.cp_rank
+        kernel = int(self.conv_kernel_size)
+
+        # ---- 2. Local projections ----
+        qkv, beta_raw, f_a, g_a = self._project_qkv_gates(x_local)
+
+        conv_state_local = patch_conv_state_with_prev_tail(
+            qkv, conv_state_local, plan, cp_ctx, kernel
+        )
+        qkv, new_conv_state_local = causal_conv1d_prefill(
+            qkv,
+            conv_state_local,
+            self.conv1d.weight,
+            local_cu,
+            impl=self.conv_impl,
+        )
+        q, k, v = self._split_qkv_heads(qkv)
+
+        # CP consumes g/beta directly, so materialize the lazy values.
+        g, beta = self.forget_gate(x_local, beta_raw, f_a=f_a)
+        g, beta = eval_lazy(g), eval_lazy(beta)
+
+        # Each rank exports the affine map of its last local sequence.
+        m_local, ext_local = segment_affine_transition(
+            chunk_kimi_delta_attention,
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            g.unsqueeze(0),
+            beta.unsqueeze(0),
+            local_cu,
+            plan.local_lens,
+            use_qk_l2norm_in_kernel=True,
+            impl=self.prefill_impl,
+        )
+
+        m_all = all_gather_cp_last(m_local, cp_ctx)
+        ext_all = all_gather_cp_last(ext_local, cp_ctx)
+        initial_state = merge_cp_initial_state(
+            recurrent_state, plan, m_all, ext_all, cp_ctx.cp_rank
+        )
+
+        out, last_state_local = chunk_kimi_delta_attention(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            g=g.unsqueeze(0),
+            beta=beta.unsqueeze(0),
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=local_cu,
+            seq_len_list=plan.local_lens,
+            impl=self.prefill_impl,
+        )
+        out = out[0]
+        out = self._final_output(out, g_a, x_local.shape[0])
+
+        # ---- 5. Restore the CP residual layout ----
+        out = from_layout(out, restore_route, cp_ctx)
+
+        # Only the rank owning a sequence's last token contributes its final
+        # state; all-reduce broadcasts the result to every CP rank.
+        conv_full, rec_full = reduce_linear_attention_cp_state(
+            conv_state,
+            new_conv_state_local,
+            recurrent_state,
+            last_state_local,
+            seq_lens,
+            cu,
+            plan,
+            cp_ctx,
+        )
+        write_linear_attention_cp_state(cache_accessor, conv_full, rec_full)
+        return out
 
 
 class TransformerBlockGLM5Next(TransformerBlock):

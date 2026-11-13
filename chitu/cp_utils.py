@@ -13,6 +13,8 @@ implementation: CPContextInterleaved or CPContextContiguous.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 from typing import Optional, Sequence, Tuple
 
@@ -67,6 +69,18 @@ def _reset_cp_context():
     """Reset singleton (for tests or re-init)."""
     global _CP_CONTEXT_INSTANCE
     _CP_CONTEXT_INSTANCE = None
+
+
+@contextmanager
+def use_cp_context(ctx: "CPContext | NoOpCPContext"):
+    """Temporarily use another CP context for a nested operation."""
+    global _CP_CONTEXT_INSTANCE
+    old = _CP_CONTEXT_INSTANCE
+    _CP_CONTEXT_INSTANCE = ctx
+    try:
+        yield
+    finally:
+        _CP_CONTEXT_INSTANCE = old
 
 
 def build_cp_reorder_idx(pcp_size: int, n_local: int, device) -> torch.Tensor:
@@ -159,6 +173,85 @@ def build_cp_contiguous_reorder_idx(
     return torch.cat(parts, dim=0)
 
 
+def _build_layout_route(
+    cp_ctx: "CPContext",
+    total_tokens: int,
+    source_layout: str,
+    target_layout: str,
+):
+    """Build the one-way all-to-all route between two CP layouts."""
+    if {source_layout, target_layout} == {"interleaved", "contiguous"}:
+        from chitu.cp_linear_attention import build_layout_route
+
+        return build_layout_route(
+            cp_ctx.pcp_size,
+            int(total_tokens),
+            to_contiguous=target_layout == "contiguous",
+        )
+    raise NotImplementedError(
+        f"Unsupported CP layout transform {source_layout!r} -> {target_layout!r}"
+    )
+
+
+def _get_layout_routes(
+    cp_ctx: "CPContext",
+    total_tokens: int,
+    source_layout: str,
+    target_layout: str,
+):
+    """Cached forward and reverse routes for one layout transform."""
+    key = (cp_ctx.pcp_size, int(total_tokens), source_layout, target_layout)
+    cached = getattr(cp_ctx, "_layout_route_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    fwd = _build_layout_route(cp_ctx, total_tokens, source_layout, target_layout)
+    bwd = _build_layout_route(cp_ctx, total_tokens, target_layout, source_layout)
+    routes = (
+        (fwd[2], fwd[3], fwd[4], fwd[5]),
+        (bwd[2], bwd[3], bwd[4], bwd[5]),
+    )
+    cp_ctx._layout_route_cache = (key, routes)
+    return routes
+
+
+def to_layout(
+    x: torch.Tensor,
+    cp_ctx: "CPContext",
+    total_tokens: int,
+    target_layout: str,
+):
+    """Move a local residual chunk to ``target_layout``.
+
+    Returns ``(x_target, restore_route)``. If the context already uses the
+    target layout, this is a no-op and ``restore_route`` is ``None``. The
+    route is consumed by :func:`from_layout`.
+    """
+    source_layout = getattr(cp_ctx, "layout", "interleaved")
+    if source_layout == target_layout:
+        return x, None
+
+    from chitu.cp_linear_attention import all_to_all_reshape
+
+    fwd_route, bwd_route = _get_layout_routes(
+        cp_ctx, total_tokens, source_layout, target_layout
+    )
+    group = cp_ctx.cp_group.gpu_group if cp_ctx.cp_group is not None else None
+    x_target = all_to_all_reshape(x, cp_ctx.cp_rank, *fwd_route, group=group)
+    return x_target, bwd_route
+
+
+def from_layout(x: torch.Tensor, restore_route, cp_ctx: "CPContext") -> torch.Tensor:
+    """Restore a transformed tensor to the context's residual layout."""
+    if restore_route is None:
+        return x
+
+    from chitu.cp_linear_attention import all_to_all_reshape
+
+    group = cp_ctx.cp_group.gpu_group if cp_ctx.cp_group is not None else None
+    return all_to_all_reshape(x, cp_ctx.cp_rank, *restore_route, group=group)
+
+
 def pad_rows_to_count(
     tensors: Sequence[torch.Tensor], target_rows: int
 ) -> list[torch.Tensor]:
@@ -224,6 +317,7 @@ class CPContext:
 
         # Per-step cached query view (set by prepare_local_lengths, read by layers)
         self._seq_len_delta_view: Optional[BatchedSeqLenDeltaView] = None
+        self._interleaved_ctx: Optional["CPContextInterleaved"] = None
 
     def set_step_active(self, active: bool) -> None:
         self._step_active = bool(active)
@@ -266,6 +360,24 @@ class CPContext:
         if self.step_active:
             return self._seq_len_delta_view
         return None
+
+    def as_interleaved(self) -> "CPContextInterleaved":
+        """Return a cached interleaved view over the same CP group and token step."""
+        if self.layout == "interleaved":
+            return self
+        ctx = self._interleaved_ctx
+        if ctx is None:
+            ctx = CPContextInterleaved(self.pcp_size, self.cp_group)
+            self._interleaved_ctx = ctx
+        ctx._step_active = self.step_active
+        ctx._orig_num_tokens = self._orig_num_tokens
+        ctx._n_local = ctx.compute_pp_num_tokens(self._orig_num_tokens)
+        ctx._expected_n_local = (
+            ceil_div(self._orig_num_tokens, self.pcp_size)
+            if self.step_active
+            else self._orig_num_tokens
+        )
+        return ctx
 
     def _allgather_global_payload(self, local_tensor: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -388,6 +500,7 @@ class CPContext:
     def clear_step_cache(self):
         """Clear per-step cached values."""
         self._seq_len_delta_view = None
+        self._interleaved_ctx = None
 
     @property
     def n_local(self) -> int:

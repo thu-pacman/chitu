@@ -1576,6 +1576,9 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
             masked_m,
             expected_m_per_group,
         )
+        # Free gate buffers before allocating the output. DeepEP buffers can
+        # be much larger than the valid token count.
+        del q_x, act_scale
         if self.swiglu_limit is None and _lightop_fuse_silu_mul_quant_ep_available():
             q_intermediate, intermediate_scale = lightop.fuse_silu_mul_quant_ep(
                 gate_up_out,
@@ -1602,6 +1605,8 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
                     scale_dtype=torch.float32,
                 )
             )
+            del intermediate
+        del gate_up_out
         # Hygon DeepGEMM W8A8 requires fp32 scale tensors.
         down_scale = self.down_proj_weight_scale
         down_out = torch.empty((E, M, self.dim), dtype=torch.bfloat16, device=device)

@@ -5,16 +5,24 @@
 from typing import Optional
 import torch
 
+from chitu.device_type import is_hygon
 from chitu.native_layout import NpuFractalZnTensor
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.utils import make_op_dispatcher
-from chitu.import_utils import try_import_platform_dep, try_import_and_setup_torch_npu
+from chitu.import_utils import (
+    try_import_platform_dep,
+    try_import_opt_dep,
+    try_import_and_setup_torch_npu,
+)
 from chitu.lazy import eval_lazy, single_dispatch_lazy_tensor
 
 triton, has_triton = try_import_platform_dep("triton")
 lmslim, has_lmslim = try_import_platform_dep("lmslim")
 lightop, has_lightop = try_import_platform_dep("lightop")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+hygon_w8a8, has_hygon_w8a8 = try_import_opt_dep(
+    "hygon_w8a8_kernel.dense", "hygon_w8a8_kernel"
+)
 
 # Although imported lmslim and lightop, some version of them does not contain the following
 # sub-package. So treat the following with `try_import_platform_dep`, too.
@@ -44,6 +52,8 @@ def w8a8_gemm_per_token_per_channel(
 @w8a8_gemm_per_token_per_channel.register_auto
 def _auto_w8a8_gemm_per_token_per_channel():
     if has_lmslim_quant_ops and hasattr(lmslim_quant_ops, "hipblaslt_w8a8_gemm"):
+        if has_hygon_w8a8 and is_hygon():
+            return "hygon_w8a8_gemm"
         return "hipblaslt_w8a8_gemm"
     if has_lightop and hasattr(lightop, "gemm_w8a8_smooth"):
         return "lightop_gemm_w8a8_smooth"
@@ -88,6 +98,19 @@ def w8a8_gemm_per_token_per_channel_hipblaslt_w8a8_gemm(
             f"hipblaslt_w8a8_gemm failed: {a.shape=} {b.shape=} {a_s.shape=} {b_s.shape=}"
         )
     return out
+
+
+@w8a8_gemm_per_token_per_channel.register(
+    "hygon_w8a8_gemm",
+    available=has_triton
+    and has_lmslim_quant_ops
+    and hasattr(lmslim_quant_ops, "hipblaslt_w8a8_gemm"),
+)
+@single_dispatch_lazy_tensor
+def w8a8_gemm_per_token_per_channel_hygon(a, a_s, b, b_s):
+    if has_hygon_w8a8 and hygon_w8a8.can_use_small_m_gemm(a, a_s, b, b_s):
+        return hygon_w8a8.small_m_gemm(a, a_s, b, b_s)
+    return w8a8_gemm_per_token_per_channel_hipblaslt_w8a8_gemm(a, a_s, b, b_s)
 
 
 @w8a8_gemm_per_token_per_channel.register(
