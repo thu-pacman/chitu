@@ -40,7 +40,8 @@ from chitu.ops import (
     moe_gate,
     add_shared_experts,
 )
-from chitu.cp_utils import get_cp_context
+from chitu.cp_utils import get_cp_context, to_layout
+from chitu.cp_linear_attention import build_contiguous_cp_plan, merge_prefix_states
 from chitu.distributed.comm_group import CommGroup
 from chitu.distributed.parallel_state import (
     get_tp_group,
@@ -109,6 +110,164 @@ def _make_shared_experts_stream() -> torch.cuda.Stream:
     if _SHARED_EXPERTS_STREAM is None:
         _SHARED_EXPERTS_STREAM = torch.cuda.Stream()
     return _SHARED_EXPERTS_STREAM
+
+
+def prepare_linear_attention_cp_chunk(x, seq_len_delta, cp_ctx, cache_accessor, kernel):
+    """Prepare the common KDA/linear-attention CP prefill state.
+
+    Returns ``(plan, x_local, restore_route, local_cu, conv_state,
+    recurrent_state, conv_state_local, seq_lens, cu)`` or ``None`` when
+    contiguous CP is not applicable. Projections and operator selection stay in
+    the model layer.
+    """
+    group = cp_ctx.cp_group.gpu_group if cp_ctx.cp_group is not None else None
+    if group is None:
+        return None
+
+    seq_lens = list(seq_len_delta.delta_lens_list)
+    total = int(seq_len_delta.delta_total_len)
+    if len(seq_lens) == 0 or total == 0 or total < cp_ctx.pcp_size:
+        return None
+    if cache_accessor.get_ckpt_write_pages() is not None:
+        return None
+
+    kernel = int(kernel)
+    if total // cp_ctx.pcp_size < kernel - 1:
+        return None
+
+    cu = [0]
+    for n in seq_lens:
+        cu.append(cu[-1] + n)
+    plan = build_contiguous_cp_plan(cu, cp_ctx.cp_rank, cp_ctx.pcp_size)
+
+    x_local, restore_route = to_layout(x, cp_ctx, total, "contiguous")
+    if x_local.shape[0] != plan.part_len:
+        raise RuntimeError(
+            f"rank {cp_ctx.cp_rank}/{cp_ctx.pcp_size} holds {x_local.shape[0]} "
+            f"local rows, but the contiguous plan expects {plan.part_len}"
+        )
+
+    conv_state = read_from_singleton_paged_kv_cache(
+        cache_accessor.kv["conv_state"], cache_accessor.get_read_page_ids()
+    )
+    recurrent_state = read_from_singleton_paged_kv_cache(
+        cache_accessor.kv["recurrent_state"], cache_accessor.get_read_page_ids()
+    )
+    conv_state_local = conv_state[plan.global_seq_indices].clone()
+    local_cu = torch.tensor(plan.local_cu_seqlens, dtype=torch.int32, device=x.device)
+    return (
+        plan,
+        x_local,
+        restore_route,
+        local_cu,
+        conv_state,
+        recurrent_state,
+        conv_state_local,
+        seq_lens,
+        cu,
+    )
+
+
+def patch_conv_state_with_prev_tail(qkv, conv_state_local, plan, cp_ctx, kernel):
+    """Patch a rank's first local conv window from the previous rank's tail."""
+    if kernel <= 1:
+        return conv_state_local
+
+    world = cp_ctx.pcp_size
+    rank = cp_ctx.cp_rank
+    n_tail = int(kernel) - 1
+    if qkv.shape[0] >= n_tail:
+        tail = qkv[-n_tail:]
+    else:
+        tail = torch.cat(
+            [qkv.new_zeros(n_tail - qkv.shape[0], qkv.shape[1]), qkv], dim=0
+        )
+
+    gathered_tail = torch.empty(
+        world * n_tail, qkv.shape[1], dtype=qkv.dtype, device=qkv.device
+    )
+    cp_ctx.cp_group.all_gather_into_tensor(gathered_tail, tail.contiguous())
+    tails = gathered_tail.view(world, n_tail, qkv.shape[1])
+    valid = min(n_tail, plan.pre_conv_tokens)
+    if plan.continues_from_prev_rank and valid > 0:
+        window = conv_state_local[0]
+        window[:, -valid:] = tails[rank - 1][-valid:].transpose(0, 1)
+        conv_state_local[0] = window
+    return conv_state_local
+
+
+def all_gather_cp_last(value, cp_ctx):
+    """All-gather the last local sequence's affine map from every rank."""
+    flat = value[-1].reshape(-1).contiguous()
+    out = torch.empty(
+        cp_ctx.pcp_size * flat.numel(), dtype=torch.float32, device=flat.device
+    )
+    cp_ctx.cp_group.all_gather_into_tensor(out, flat)
+    return out.view(cp_ctx.pcp_size, *value[-1].shape)
+
+
+def merge_cp_initial_state(
+    recurrent_state, plan, m_all, ext_all, rank, *, state_v_first: bool = False
+):
+    """Merge the affine prefix maps that precede the first local sequence."""
+    initial_state = recurrent_state[plan.global_seq_indices].to(torch.float32)
+    if plan.continues_from_prev_rank and plan.chain_len[0] > 0:
+        first_slot = rank - plan.chain_len[0]
+        merge_kwargs = {"state_v_first": True} if state_v_first else {}
+        initial_state[0] = merge_prefix_states(
+            m_all[first_slot:rank],
+            ext_all[first_slot:rank],
+            initial_state[0],
+            **merge_kwargs,
+        )
+    return initial_state
+
+
+def reduce_linear_attention_cp_state(
+    conv_state,
+    new_conv_state_local,
+    recurrent_state,
+    last_state_local,
+    seq_lens,
+    cu,
+    plan,
+    cp_ctx,
+):
+    """Collect each request's final conv/recurrent state from its owner rank."""
+    bsz = len(seq_lens)
+    conv_full = conv_state.new_zeros((bsz,) + tuple(conv_state.shape[1:]))
+    rec_full = last_state_local.new_zeros((bsz,) + tuple(last_state_local.shape[1:]))
+    local_pos = {g_idx: i for i, g_idx in enumerate(plan.global_seq_indices)}
+    for seq_idx in range(bsz):
+        if seq_lens[seq_idx] <= 0:
+            continue
+        last_pos = cu[seq_idx + 1] - 1
+        if not (plan.interval_start <= last_pos < plan.interval_end):
+            continue
+        local_idx = local_pos[seq_idx]
+        conv_full[seq_idx] = new_conv_state_local[local_idx]
+        rec_full[seq_idx] = last_state_local[local_idx]
+
+    conv_full = cp_ctx.cp_group.all_reduce(conv_full)
+    rec_full = cp_ctx.cp_group.all_reduce(rec_full)
+    for seq_idx in range(bsz):
+        if seq_lens[seq_idx] <= 0:
+            conv_full[seq_idx] = conv_state[seq_idx]
+            rec_full[seq_idx] = recurrent_state[seq_idx]
+    return conv_full, rec_full
+
+
+def write_linear_attention_cp_state(cache_accessor, conv_full, rec_full):
+    """Write the reduced final conv/recurrent state back to the paged cache."""
+    state_page_ids = cache_accessor.get_write_page_ids()[:, 0]
+    conv_cache = cache_accessor.kv["conv_state"]
+    rec_cache = cache_accessor.kv["recurrent_state"]
+    update_singleton_paged_kv_cache(
+        conv_cache, state_page_ids, conv_full.to(conv_cache.dtype)
+    )
+    update_singleton_paged_kv_cache(
+        rec_cache, state_page_ids, rec_full.to(rec_cache.dtype)
+    )
 
 
 class LayerNorm(nn.Module):
