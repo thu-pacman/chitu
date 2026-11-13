@@ -2032,7 +2032,9 @@ class Executor:
         if not self.is_pp_last_stage:
             return
         tasks = TaskCollector.get_postprocess_tasks()
-        if tasks is None:
+        # A global empty step has no draft to generate. Local empty DP batches
+        # must still join the other ranks' draft collectives.
+        if tasks is None or tasks.is_empty_tasks():
             return
 
         # The draft below replays the MTP layer, and that replay runs the MoE, so the dispatcher has

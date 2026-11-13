@@ -1784,9 +1784,7 @@ class Transformer(nn.Module):
     def _init_mtp_draft_callable(self, bs: int, tokens: torch.Tensor):
         """Lazily build the CUDA-graph callable for the MTP draft decode."""
         infer_args = get_global_args().infer
-        decode_graph_pool_handle = (
-            torch.cuda.graph_pool_handle() if self.use_cuda_graph else None
-        )
+        decode_graph_pool_handle = self._mtp_graph_pool
         before_replay_callback = None
         if is_ascend() and not (
             infer_args.cache_type == "skew"
@@ -2172,11 +2170,14 @@ class Transformer(nn.Module):
             before_capture_callback=before_capture,
             before_replay_callback=lambda graph: rewind(),
             enable=self.use_cuda_graph,
-            graph_pool=(
-                torch.cuda.graph_pool_handle() if self.use_cuda_graph else None
-            ),
+            graph_pool=self._mtp_graph_pool,
             generators=[generator],
         )(do_decode_mtp_all)
+
+    @functools.cached_property
+    def _mtp_graph_pool(self):
+        # Empty and populated draft paths never run at the same time.
+        return torch.cuda.graph_pool_handle() if self.use_cuda_graph else None
 
     def _init_empty_mtp_draft_callable(self):
         """Lazily build the CUDA-graph callable for the EMPTY MTP draft.
@@ -2193,6 +2194,7 @@ class Transformer(nn.Module):
             kwargs_max_nelem={},
             before_replay_callback=None,
             enable=self.use_cuda_graph,
+            graph_pool=self._mtp_graph_pool,
         )
         def do_empty_decode_mtp():
             return self.empty_mtp_decode()
@@ -2306,7 +2308,7 @@ class Transformer(nn.Module):
         self.cp_context.set_step_active(False)
         # No moe_impl.prepare here: the executor's step body already ran
         # _prepare_moe_prefill for this step.
-        if self.specialize_embed_tokens_lm_head_parallel:
+        if self.specialize_embed_tokens_lm_head_parallel and self.pp_stage == 0:
             self.embed_tokens(
                 self.dummy_embed_tokens_input,
                 self.global_embed_num_tokens,
@@ -2317,7 +2319,10 @@ class Transformer(nn.Module):
                 if self.local_begin_layer_id + it < self.moe_impl.n_dense_layers:
                     continue
                 layer.mlp(self.dummy_input)
-        if self.specialize_embed_tokens_lm_head_parallel:
+        if (
+            self.specialize_embed_tokens_lm_head_parallel
+            and self.pp_stage == self.pp_end_stage
+        ):
             if not getattr(self.params, "tie_word_embeddings", False):
                 self.lm_head(
                     self.dummy_input,
@@ -2342,7 +2347,7 @@ class Transformer(nn.Module):
     def empty_decode(self):
         # No moe_impl.prepare here: the executor's step body already ran
         # _prepare_moe_decode for this step.
-        if self.specialize_embed_tokens_lm_head_parallel:
+        if self.specialize_embed_tokens_lm_head_parallel and self.pp_stage == 0:
             self.embed_tokens(
                 self.dummy_embed_tokens_input,
                 self.global_embed_num_tokens,
@@ -2353,7 +2358,10 @@ class Transformer(nn.Module):
             if self.local_begin_layer_id + it < self.moe_impl.n_dense_layers:
                 continue
             layer.mlp(self.dummy_input)
-        if self.specialize_embed_tokens_lm_head_parallel:
+        if (
+            self.specialize_embed_tokens_lm_head_parallel
+            and self.pp_stage == self.pp_end_stage
+        ):
             if not getattr(self.params, "tie_word_embeddings", False):
                 self.lm_head(
                     self.dummy_input,
@@ -2640,6 +2648,8 @@ class Transformer(nn.Module):
                     kwargs_max_nelem={},
                     before_replay_callback=None,
                     enable=self.use_cuda_graph,
+                    # Empty and populated decode paths never run together.
+                    graph_pool=decode_graph_pool_handle,
                 )
                 def do_empty_decode():
                     return self.empty_decode()
