@@ -103,14 +103,14 @@
 **/test/outputs/*
 **/dumps/*
 **/log/*
-!third_party/ascend-kernel/grouped_gemm/op_host/inc/log/*
+!third_party/ascend/ascend-kernel/grouped_gemm/op_host/inc/log/*
 
 # Vim
 **/.*.swp
 
 
 # Keep Hygon topology libraries in Docker build context
-!third_party/hygon_wheels/topo_lib/
-!third_party/hygon_wheels/topo_lib/**
-!third_party/hygon_wheels/topo_lib/lib/
-!third_party/hygon_wheels/topo_lib/lib/**
+!third_party/hygon/hygon_wheels/topo_lib/
+!third_party/hygon/hygon_wheels/topo_lib/**
+!third_party/hygon/hygon_wheels/topo_lib/lib/
+!third_party/hygon/hygon_wheels/topo_lib/lib/**

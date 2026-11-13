@@ -121,6 +121,16 @@ docker run -dit \
 git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 ```
 
+或者，为减小克隆体积，也可以不携带子模块克隆，然后只初始化当前平台所需的第三方依赖：
+
+```bash
+# 下载源码（不携带子模块，按需初始化可显著减小克隆体积）
+git clone https://github.com/thu-pacman/chitu && cd chitu && ./script/init_submodules.sh --platform nvidia
+# 可用平台：nvidia | ascend | hygon | muxi | cpu | all
+```
+
+子模块按平台放在 `third_party/<平台>/` 下，共享依赖放在 `third_party/common/`。如果还要安装 `cpu` 可选依赖，例如在 CUDA 环境使用 CPU+GPU 混合推理，可以运行 `./script/init_submodules.sh --platform nvidia,cpu`。
+
 #### 2. 安装普通构建时依赖
 
 ```bash

@@ -28,22 +28,22 @@ def get_bool_env(name: str, default: Optional[bool] = None):
 
 if get_bool_env("CHITU_HYGON_BUILD", False):
     deep_gemm = "deepgemm @ file://localhost" + os.path.join(
-        setup_dir, "third_party/deepgemm_hygon"
+        setup_dir, "third_party/hygon/deepgemm_hygon"
     )
 
     flash_mla = "flash_mla @ file://localhost" + os.path.join(
-        setup_dir, "third_party/flashmla_hygon"
+        setup_dir, "third_party/hygon/flashmla_hygon"
     )
 
     if get_bool_env("CHITU_HYGON_BUILD_FOR_SHCA", False):
         mooncake = "mooncake-transfer-engine-shca @ file://localhost" + os.path.join(
             setup_dir,
-            "third_party/hygon_wheels/mooncake_transfer_engine_shca-0.3.10.post1+das.opt1.dtk2604.2605131044.gd34f6f-cp310-cp310-manylinux_2_35_x86_64.whl",
+            "third_party/hygon/hygon_wheels/mooncake_transfer_engine_shca-0.3.10.post1+das.opt1.dtk2604.2605131044.gd34f6f-cp310-cp310-manylinux_2_35_x86_64.whl",
         )
 
         deep_ep = "deep_ep @ file://localhost" + os.path.join(
             setup_dir,
-            "third_party/hygon_wheels/deep_ep-1.1.0+das.opt1.dtk2604.shca-cp310-cp310-linux_x86_64.whl",
+            "third_party/hygon/hygon_wheels/deep_ep-1.1.0+das.opt1.dtk2604.shca-cp310-cp310-linux_x86_64.whl",
         )
     else:
         mooncake = "mooncake-transfer-engine==0.3.7.post2+das.opt1.dtk2604.torch290"
@@ -54,16 +54,16 @@ else:
     cuda_major = int((torch.version.cuda or "0").split(".")[0])
 
     flash_mla = "flash_mla @ file://localhost" + os.path.join(
-        setup_dir, "third_party/FlashMLA"
+        setup_dir, "third_party/nvidia/FlashMLA"
     )
 
     deep_gemm = "deep_gemm @ file://localhost" + os.path.join(
-        setup_dir, "third_party/DeepGEMM"
+        setup_dir, "third_party/nvidia/DeepGEMM"
     )
 
     # NOTE: Please make sure `requirements-build-deep_ep-cu12.txt` is installed at BUILD TIME
     deep_ep = "deep_ep @ file://localhost" + os.path.join(
-        setup_dir, "third_party/DeepEP"
+        setup_dir, "third_party/nvidia/DeepEP"
     )
 
     if cuda_major == 13:
@@ -123,39 +123,39 @@ extras_require = {
     # Our own kernels for various architectures
     "muxi_layout_kernels": [
         "muxi_layout_kernels @ file://localhost"
-        + os.path.join(setup_dir, "third_party/muxi_layout_kernels"),
+        + os.path.join(setup_dir, "third_party/muxi/muxi_layout_kernels"),
     ],
     "muxi_w8a8_kernels": [
         "tbsgemm @ file://localhost"
-        + os.path.join(setup_dir, "third_party/muxi_w8a8_kernels/w8a8"),
+        + os.path.join(setup_dir, "third_party/muxi/muxi_w8a8_kernels/w8a8"),
     ],
     "ascend_kernels": [
         "cinfer_ascendc @ file://localhost"
-        + os.path.join(setup_dir, "third_party/ascend-kernel"),
+        + os.path.join(setup_dir, "third_party/ascend/ascend-kernel"),
     ],
     "sugon_mixq4_kernels": [
         "sugon_mixq4_kernels @ file://localhost"
-        + os.path.join(setup_dir, "third_party/sugon_mixq4_kernels"),
+        + os.path.join(setup_dir, "third_party/hygon/sugon_mixq4_kernels"),
     ],
     "sugon_w4a8_kernels": [
         "sugon_w4a8_kernels @ file://localhost"
-        + os.path.join(setup_dir, "third_party/sugon_w4a8_kernels"),
+        + os.path.join(setup_dir, "third_party/hygon/sugon_w4a8_kernels"),
     ],
     "boltops": [
         "boltops[triton] @ file://localhost"
-        + os.path.join(setup_dir, "third_party/boltops-hygon"),
+        + os.path.join(setup_dir, "third_party/hygon/boltops-hygon"),
     ],
     ##########################################################################
     # Really third-party kernels
     "flash_attn": [
         "flash_attn @ file://localhost"
-        + os.path.join(setup_dir, "third_party/flash-attention"),
+        + os.path.join(setup_dir, "third_party/nvidia/flash-attention"),
         # Although `flash-attn` is available in PyPI, don't make it a required
         # dependency, because its installation runs forever on some platforms.
     ],
     "flash_attn_interface": [
         "flash_attn_3 @ file://localhost"
-        + os.path.join(setup_dir, "third_party/flash-attention/hopper"),
+        + os.path.join(setup_dir, "third_party/nvidia/flash-attention/hopper"),
     ],
     # TODO: Upgrade to latest flashInfer version and resolve environment compatibility issues
     "flashinfer": [
@@ -180,15 +180,16 @@ extras_require = {
     "deep_ep": [deep_ep],
     "hard_fp4_kernels": [
         "hard_fp4_kernels @ file://localhost"
-        + os.path.join(setup_dir, "third_party/hard_fp4_kernels"),
+        + os.path.join(setup_dir, "third_party/nvidia/hard_fp4_kernels"),
     ],
     "scipy": ["scipy"],
     "fast_hadamard_transform": [
         "fast-hadamard-transform @ file://localhost"
-        + os.path.join(setup_dir, "third_party/fast-hadamard-transform")
+        + os.path.join(setup_dir, "third_party/nvidia/fast-hadamard-transform")
     ],
     "hpc_ops": [
-        "hpc-ops @ file://localhost" + os.path.join(setup_dir, "third_party/hpc-ops"),
+        "hpc-ops @ file://localhost"
+        + os.path.join(setup_dir, "third_party/nvidia/hpc-ops"),
     ],
     "numa": ["numa"],
     "mooncake": [mooncake],

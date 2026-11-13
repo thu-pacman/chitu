@@ -205,7 +205,7 @@ RUN if [ -n "${pypi_mirror}" ]; then \
 # here, because its setup.py imports torch_npu.
 FROM dependency_installer AS kernel_builder
 WORKDIR /workspace/chitu
-COPY ./third_party/ascend-kernel ./third_party/ascend-kernel
+COPY ./third_party/ascend/ascend-kernel ./third_party/ascend/ascend-kernel
 COPY ./csrc/cpuinfer ./csrc/cpuinfer
 COPY --from=dependency_resolver /tmp/requirements-local.txt /tmp/requirements-local.txt
 RUN --mount=type=bind,from=ascend_driver,target=/usr/local/Ascend/driver/lib64 \

@@ -101,14 +101,14 @@ class CustomBuildExtension(BuildExtension):
             super().build_extension(ext)
 
 
-llama_cpp_files = glob.glob("../../third_party/llamafile/*.cpp")
+llama_cpp_files = glob.glob("../../third_party/cpu/llamafile/*.cpp")
 setup(
     name="cpuinfer",
     version="0.0.0",
     install_requires=["cpufeature"],
     cmdclass={"build_ext": CustomBuildExtension},
     ext_modules=[
-        CMakeExtension("llama.cpp", "../../third_party/llama.cpp"),
+        CMakeExtension("llama.cpp", "../../third_party/cpu/llama.cpp"),
         CUDAExtension(
             name="cpuinfer",
             sources=[
@@ -125,11 +125,11 @@ setup(
             + llama_cpp_files,
             libraries=["ggml_static"],
             include_dirs=[
-                os.path.join(setup_dir, "../../third_party/"),
+                os.path.join(setup_dir, "../../third_party/cpu"),
                 os.path.join(setup_dir),
             ],
             library_dirs=[
-                os.path.join(setup_dir, "../../third_party/llama.cpp/build"),
+                os.path.join(setup_dir, "../../third_party/cpu/llama.cpp/build"),
             ],
             extra_compile_args=["-O3", "-march=native", "-DUSE_CUDA"],
         ),

@@ -85,12 +85,12 @@ ENV CCACHE_MAXSIZE=20G
 # Don't hash the current working directory so the random temp dir name does not
 # bust the cache.
 ENV CCACHE_NOHASHDIR=true
-RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wheels if [ "${build_for_shca}" = "true" ]; then \
+RUN --mount=source=./third_party/hygon/hygon_wheels,destination=./third_party/hygon/hygon_wheels if [ "${build_for_shca}" = "true" ]; then \
     apt-get update -y; \
     apt remove -y rdmacm-utils ibacm perftest ibverbs-utils ucx libibverbs-dev libibmad-dev libibumad-dev librdmacm1 infiniband-diags opensm rdma-core libibmad5 libibumad3 ibverbs-providers libibverbs1 || true; \
     apt install -y libmosquitto1 && \
-    dpkg -i ./third_party/hygon_wheels/shca-tools_2.500.4.B074-Ubuntu22.04_amd64.deb && \
-    cp -r ./third_party/hygon_wheels/topo_lib /opt/topo_lib && \
+    dpkg -i ./third_party/hygon/hygon_wheels/shca-tools_2.500.4.B074-Ubuntu22.04_amd64.deb && \
+    cp -r ./third_party/hygon/hygon_wheels/topo_lib /opt/topo_lib && \
     ln -s /opt/topo_lib/lib/librccl-net-shca.so.0.0.0 /opt/topo_lib/lib/librccl-net-shca.so && \
     ln -s /opt/topo_lib/lib/librccl-net-shca.so.0.0.0 /opt/topo_lib/lib/librccl-net-shca.so.0; \
 else \
@@ -113,16 +113,16 @@ RUN --mount=type=cache,target=/var/cache/chitu \
     /var/cache/chitu/dtk_llvm.run
 
 COPY ./script/pip-multi-indices.sh ./script/pip-multi-indices.sh
-# NOTE: ./third_party/hygon_wheels/triton-3.5.1+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl is different from
+# NOTE: ./third_party/hygon/hygon_wheels/triton-3.5.1+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl is different from
 #       `triton==3.5.1+das.opt1.dtk2604.torch290` from https://pypi.sourcefind.cn/release/dtk/, although they have the same name.
-RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wheels \
+RUN --mount=source=./third_party/hygon/hygon_wheels,destination=./third_party/hygon/hygon_wheels \
     --mount=type=cache,target=/root/.cache/pip \
   ./script/pip-multi-indices.sh install \
     -i "${pypi_mirror}" \
     -i https://pypi.sourcefind.cn/release/dtk/ \
     -i https://pypi.sourcefind.cn/nightly/dtk/ \
-    ./third_party/hygon_wheels/aiter-0.1.2+das.opt1.dtk2604.torch290.2605071840.g1f8f50-cp310-cp310-linux_x86_64.whl \
-    ./third_party/hygon_wheels/triton-3.5.1+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl \
+    ./third_party/hygon/hygon_wheels/aiter-0.1.2+das.opt1.dtk2604.torch290.2605071840.g1f8f50-cp310-cp310-linux_x86_64.whl \
+    ./third_party/hygon/hygon_wheels/triton-3.5.1+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl \
     "lightop==0.6.0+das.dtk2604.torch290.2605220936.g6bfaca" \
     "lmslim==0.3.1+das.opt4.dtk2604.torch290.2604281437.g61fdfe" \
     -c <(pip list --format freeze | grep -v -e "setuptools" -e "numpy" -e "triton" -e "aiter" -e "lightop" -e "lmslim")
@@ -288,14 +288,7 @@ RUN ./script/pip-multi-indices.sh install --no-build-isolation -r /tmp/requireme
 # PyPI wheels above does not.
 FROM dependency_installer AS kernel_builder
 WORKDIR /workspace/chitu
-COPY ./third_party/sugon_mixq4_kernels ./third_party/sugon_mixq4_kernels
-COPY ./third_party/sugon_w4a8_kernels ./third_party/sugon_w4a8_kernels
-COPY ./third_party/hygon_w4a16_kernel ./third_party/hygon_w4a16_kernel
-COPY ./third_party/hygon_w8a8_kernel ./third_party/hygon_w8a8_kernel
-COPY ./third_party/boltops-hygon ./third_party/boltops-hygon
-COPY ./third_party/flashmla_hygon ./third_party/flashmla_hygon
-COPY ./third_party/deepgemm_hygon ./third_party/deepgemm_hygon
-COPY ./third_party/hygon_wheels ./third_party/hygon_wheels
+COPY ./third_party/hygon ./third_party/hygon
 COPY ./csrc/cpuinfer ./csrc/cpuinfer
 COPY --from=dependency_resolver /tmp/requirements-local.txt /tmp/requirements-local.txt
 # Build wheels for the local kernels instead of installing them. The final

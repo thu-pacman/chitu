@@ -288,18 +288,9 @@ print(next((d.version for d in m.distributions() if (d.metadata.get('Name') or '
 FROM dependency_installer AS kernel_builder
 
 WORKDIR /workspace/chitu
-COPY ./third_party/DeepEP ./third_party/DeepEP
-COPY ./third_party/DeepGEMM ./third_party/DeepGEMM
-COPY ./third_party/FlashMLA ./third_party/FlashMLA
-COPY ./third_party/flash-attention ./third_party/flash-attention
-# hard_fp4_kernels includes headers from ../../cutlass.
-COPY ./third_party/cutlass ./third_party/cutlass
-COPY ./third_party/hard_fp4_kernels ./third_party/hard_fp4_kernels
-COPY ./third_party/fast-hadamard-transform ./third_party/fast-hadamard-transform
-COPY ./third_party/hpc-ops ./third_party/hpc-ops
-# cpuinfer vendors llama.cpp and llamafile from these two directories.
-COPY ./third_party/llama.cpp ./third_party/llama.cpp
-COPY ./third_party/llamafile ./third_party/llamafile
+COPY ./third_party/nvidia ./third_party/nvidia
+# cpuinfer uses llama.cpp and llamafile from the CPU directory.
+COPY ./third_party/cpu ./third_party/cpu
 COPY ./csrc/cpuinfer ./csrc/cpuinfer
 COPY --from=dependency_resolver /tmp/requirements-local.txt /tmp/requirements-local.txt
 

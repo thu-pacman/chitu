@@ -109,7 +109,7 @@ def get_extensions():
         )
 
     if enable_nvfp4:
-        cutlass_path = os.path.join(this_dir, "../third_party/cutlass")
+        cutlass_path = os.path.join(this_dir, "../third_party/nvidia/cutlass")
         cxx_extra_args += ["-DENABLE_NVFP4"]
         nvcc_extra_args += ["-DENABLE_NVFP4"]
         extra_include_dirs += [
@@ -205,7 +205,7 @@ def get_extensions():
                 ("CHITU_MUXI_BUILD", os.environ.get("CHITU_MUXI_BUILD", "0")),
             ],
             include_dirs=[
-                os.path.join(this_dir, "../third_party/spdlog/include"),
+                os.path.join(this_dir, "../third_party/common/spdlog/include"),
                 os.path.join(this_dir, "cuda/common"),
                 os.path.join(this_dir, "cuda/allreduce"),
             ]

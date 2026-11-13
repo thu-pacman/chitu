@@ -1,36 +1,40 @@
+# ==========================================================================
+# Third-party submodules.
+#
+# Submodule paths use third_party/<platform>/<name>. Shared dependencies
+# live under third_party/common. Use script/init_submodules.sh to initialize
+# the submodules for a platform.
+# ==========================================================================
 [submodule "third_party/spdlog"]
-    path = third_party/spdlog
+    path = third_party/common/spdlog
     url = https://github.com/gabime/spdlog.git
 [submodule "third_party/cutlass"]
-    path = third_party/cutlass
+    path = third_party/nvidia/cutlass
     url = https://github.com/NVIDIA/cutlass.git
 [submodule "third_party/FlashMLA"]
-    path = third_party/FlashMLA
+    path = third_party/nvidia/FlashMLA
     url = https://github.com/deepseek-ai/FlashMLA.git
 [submodule "third_party/flash-attention"]
-    path = third_party/flash-attention
+    path = third_party/nvidia/flash-attention
     url = https://github.com/Dao-AILab/flash-attention.git
 [submodule "third_party/DeepGEMM"]
-    path = third_party/DeepGEMM
+    path = third_party/nvidia/DeepGEMM
     url = https://github.com/QingCheng-AI/DeepGEMM.git
 [submodule "third_party/llama.cpp"]
-    path = third_party/llama.cpp
+    path = third_party/cpu/llama.cpp
     url = https://github.com/ggml-org/llama.cpp.git
-[submodule "third_party/pybind11"]
-    path = third_party/pybind11
-    url = https://github.com/pybind/pybind11.git
 [submodule "third_party/muxi_layout_kernels"]
-    path = third_party/muxi_layout_kernels
+    path = third_party/muxi/muxi_layout_kernels
     url = https://github.com/QingCheng-AI/muxi_native_layout_kernels.git
 [submodule "third_party/ascend-kernel"]
-    path = third_party/ascend-kernel
+    path = third_party/ascend/ascend-kernel
     url = https://github.com/QingCheng-AI/ascend-kernel.git
 [submodule "third_party/DeepEP"]
-    path = third_party/DeepEP
+    path = third_party/nvidia/DeepEP
     url = https://github.com/QingCheng-AI/DeepEP.git
 [submodule "third_party/fast-hadamard-transform"]
-    path = third_party/fast-hadamard-transform
+    path = third_party/nvidia/fast-hadamard-transform
     url = https://github.com/Dao-AILab/fast-hadamard-transform.git
 [submodule "third_party/hpc-ops"]
-    path = third_party/hpc-ops
+    path = third_party/nvidia/hpc-ops
     url = https://github.com/Tencent/hpc-ops.git
