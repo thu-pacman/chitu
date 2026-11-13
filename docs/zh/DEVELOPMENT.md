@@ -1034,6 +1034,19 @@ torchrun --nproc_per_node 8 --no-python ./test/dist_pytest/run_pytest_with_prett
 
 运行时：
 
+Mooncake RDMA KV 传输优先使用 `NCCL_IB_HCA`；该变量未设置或为空时使用
+`NVSHMEM_HCA_LIST`。NCCL 默认按设备名前缀匹配，`=` 表示精确匹配，`^` 表示排除；
+NVSHMEM 按完整设备名匹配，也支持 `^` 排除。例如，
+`NCCL_IB_HCA='^=mlx5_3,mlx5_4'` 排除这两张网卡。自动补齐环境变量会保留显式选择。
+
+显式筛选读取工作进程可见的 `/sys/class/infiniband`，仅选择 `MC_IB_PORT` 对应端口
+处于 Active 状态的设备，不按链路速率再次筛选。`MC_IB_PORT` 默认为 `1`，有效范围为
+`1`–`255`；可选的 `:port` 限定必须与该端口一致。NCCL 可选的 rail/plane 字段不影响
+Mooncake 的设备选择。格式错误或没有活跃设备匹配时会报错，不会退回到无限制的自动检测。
+显式筛选不依赖 `ibstat`。两个选择变量均未设置时，沿用选择最高速率活跃设备的自动检测。
+TCP、昇腾 HCCL 和 mock 模式仍使用可选的自动检测。SSH、Docker、Apptainer 启动器会
+传递两个 HCA 变量及 `MC_IB_PORT`。
+
 | 名称                            | 可选值                       | 描述                                                   |
 | ------------------------------- | ---------------------------- | ------------------------------------------------------ |
 | `CHITU_LOGGING_LEVEL`           | `<level>` 或 `<module1>:<level1>;<module2>:<level2>;...`，各 level 可为 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`，各 module（如设置）可为源码树中任意模块路径，如 `chitu.ops`。 | 日志级别。 |
