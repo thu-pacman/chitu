@@ -275,6 +275,18 @@ def resolve_default_args(args):
             )
             args.infer.prefill_chunk_size = None
 
+    # Every DP scheduler needs a positive share of the global token budget.
+    # Otherwise warmup divides by zero and zero-budget ranks cannot prefill.
+    if (
+        args.infer.prefill_chunk_size is not None
+        and args.infer.prefill_chunk_size < args.infer.dp_size
+    ):
+        raise ValueError(
+            f"infer.prefill_chunk_size ({args.infer.prefill_chunk_size}) must be "
+            f"at least infer.dp_size ({args.infer.dp_size}) so each DP rank "
+            "can prefill at least one token. Set it to null to disable prefill chunking."
+        )
+
     if args.infer.bind_process_to_cpu == "auto":
         if _has_cpu_layer(args):
             args.infer.bind_process_to_cpu = "one_numa_per_rank"
