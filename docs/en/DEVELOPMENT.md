@@ -121,6 +121,19 @@ docker run -dit \
 git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 ```
 
+Or, to keep the clone smaller, clone without submodules and then initialize
+only the third-party submodules required by your platform:
+
+```bash
+# Clone without submodules; initialize only what your platform needs.
+git clone https://github.com/thu-pacman/chitu && cd chitu && ./script/init_submodules.sh --platform nvidia
+# Available platforms: nvidia | ascend | hygon | muxi | cpu | all
+```
+
+Submodules live under `third_party/<platform>/`, with shared dependencies under
+`third_party/common/`. To also install the optional `cpu` dependency for a CUDA
+build, run `./script/init_submodules.sh --platform nvidia,cpu`.
+
 #### 2. Install ordinary build-time dependencies
 
 ```bash

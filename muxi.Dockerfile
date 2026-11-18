@@ -249,9 +249,7 @@ RUN ./script/pip-multi-indices.sh install --no-build-isolation -r /tmp/requireme
 # them does not reinstall the PyPI dependencies from the stage above.
 FROM dependency_installer AS kernel_builder
 WORKDIR /workspace/chitu
-COPY ./third_party/muxi_layout_kernels ./third_party/muxi_layout_kernels
-COPY ./third_party/muxi_w8a8_kernels ./third_party/muxi_w8a8_kernels
-COPY ./third_party/metax_soft_fp4_kernels ./third_party/metax_soft_fp4_kernels
+COPY ./third_party/muxi ./third_party/muxi
 COPY ./csrc/cpuinfer ./csrc/cpuinfer
 COPY --from=dependency_resolver /tmp/requirements-local.txt /tmp/requirements-local.txt
 # Build wheels for the local kernels instead of installing them, so the final

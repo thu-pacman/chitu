@@ -193,7 +193,7 @@ def _(
         assert has_deep_gemm, "BF16 masked path requires deep_gemm backend"
 
         # For bf16, DeepGEMM requires reduction dimensions % 64 == 0. Search `DG_HOST_ASSERT(k % 64 == 0)`
-        # in `third_party/DeepGEMM/csrc/jit_kernels/impls/sm90_bf16_gemm.hpp` for details.
+        # in `third_party/nvidia/DeepGEMM/csrc/jit_kernels/impls/sm90_bf16_gemm.hpp` for details.
         assert K % 64 == 0
         assert N % 64 == 0
 
