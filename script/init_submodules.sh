@@ -79,8 +79,14 @@ case ",${PLATFORM}," in
         ;;
 esac
 
+# `git submodule` path arguments are pathspecs, so passing a platform
+# directory under third_party selects every submodule inside it.
+#
+# Unknown platform names are rejected here because `git submodule update`
+# exits 1 without printing anything when a pathspec matches no submodule, so
+# a typo would otherwise fail silently.
 IFS=',' read -r -a PLATFORMS <<< "${PLATFORM}"
-SELECTED_GROUPS=",common,"
+DIRS=(third_party/common)
 for platform in "${PLATFORMS[@]}"; do
     case "${platform}" in
         cuda) platform=nvidia ;;
@@ -91,34 +97,11 @@ for platform in "${PLATFORMS[@]}"; do
             exit 1
             ;;
     esac
-    SELECTED_GROUPS="${SELECTED_GROUPS}${platform},"
+    DIRS+=("third_party/${platform}")
 done
 
-SUBMODULE_PATHS=$(git config -f .gitmodules --get-regexp '^submodule\..*\.path$')
-echo "Initializing submodules for platforms [${PLATFORM}]:"
-set --
-SKIPPED=""
-while read -r _ path; do
-    relative_path=${path#third_party/}
-    group=${relative_path%%/*}
-    case "${SELECTED_GROUPS}" in
-        *",${group},"*)
-            echo "  + ${path}"
-            set -- "$@" "${path}"
-            ;;
-        *)
-            SKIPPED="${SKIPPED} ${relative_path}"
-            ;;
-    esac
-done <<< "${SUBMODULE_PATHS}"
-echo "Skipping (not needed):${SKIPPED}"
-
-if [[ $# -eq 0 ]]; then
-    echo "No submodules to initialize."
-    exit 0
-fi
-
-git submodule update --init --recursive -- "$@"
+echo "Initializing submodules for platforms [${PLATFORM}]: ${DIRS[*]}"
+git submodule update --init --recursive -- "${DIRS[@]}"
 
 echo "Done. Submodule status:"
-git submodule status -- "$@"
+git submodule status -- "${DIRS[@]}"
