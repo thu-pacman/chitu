@@ -125,3 +125,26 @@ def sqrt(x):
     x = abs(x)
     ... # compute arithmetic square root
 ```
+
+## Defensive programming should not sacrifice functionality
+
+Don't early-reject cases just because you have not tested them. Only reject cases that we have no code to support.
+
+Bad example (sacrificing supported but just untested cases):
+
+```
+def plus(a, b):
+    if a < 0 or b < 0:
+        raise NotImplementedErorr()  # Not yet tested on negative values
+    return a + b
+```
+
+Good example (only handle errors when there is really a problem):
+
+```
+def plus(a, b):
+    try:
+        return a + b
+    except Exception as e:
+        raise RuntimeError(f"Operator `+` is not supported on {a} and {b}") from e
+```
