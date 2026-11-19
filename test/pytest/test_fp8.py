@@ -8,12 +8,12 @@ from chitu.ops import (
     silu_and_mul_and_blockfp8_act_quant,
     blockfp8_gemm,
     blockfp8_weight_dequant,
-    soft_fp8_blockfp8_weight_dequant,
     soft_fp8_blockfp8_gemm,
     blockfp8_index_score_dense_dsv32,
     blockfp8_index_score_ragged_q_dense_k_dsv32,
     blockfp8_index_score_ragged_q_paged_k_dsv32,
 )
+from chitu.ops.quant.blockfp8.convert import blockfp8_weight_dequant_impl_for
 from chitu.device_type import has_native_fp8
 from chitu.lazy import eval_lazy
 from chitu.batched_seq_len import BatchedSeqLenDelta
@@ -314,21 +314,24 @@ def test_dequanted_gemm_is_close_to_fp8_gemm(
     assert_close(std_y, y, atol=0.15, rtol=0.15)
 
 
+@pytest.mark.parametrize("impl", ["soft_triton", "soft_torch"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_soft_fp8_dequant_is_close_to_dequant(dtype: torch.dtype, record_benchmark):
+def test_soft_fp8_dequant_is_close_to_dequant(
+    dtype: torch.dtype, impl: str, record_benchmark
+):
     torch.set_default_dtype(dtype)
     dim = 256
     block_size = 128
     b, b_s = init_b_and_b_s(dim, block_size)
 
     soft_dequant_b = record_benchmark.run(
-        lambda: blockfp8_weight_dequant(b, b_s, impl="soft_triton"),
+        lambda: blockfp8_weight_dequant(b, b_s, impl=impl),
         dim=dim,
-        impl="soft_fp8_dequant",
+        impl=impl,
     )
     dequant_b = blockfp8_weight_dequant(b, b_s, impl="triton")
 
@@ -357,7 +360,7 @@ def test_blockfp8_weight_dequant_auto_selects_impl_by_raise_lower_bit_float_to()
         soft_dequant_b = blockfp8_weight_dequant(b, b_s)
     assert_close(
         soft_dequant_b,
-        soft_fp8_blockfp8_weight_dequant(b, b_s),
+        blockfp8_weight_dequant(b, b_s, impl="soft_triton"),
         rtol=0,
         atol=0,
     )
@@ -392,7 +395,9 @@ def test_soft_fp8_gemm_is_close_to_dequanted_gemm(
     a = torch.randn(bs, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    dequant_b = soft_fp8_blockfp8_weight_dequant(b, b_s)
+    dequant_b = blockfp8_weight_dequant(
+        b, b_s, impl=blockfp8_weight_dequant_impl_for(soft_fp8=True)
+    )
     std_y = torch.nn.functional.linear(a, dequant_b)
 
     y = record_benchmark.run(

@@ -5,7 +5,6 @@
 from chitu.ops.quant.blockfp8.convert import (
     blockfp8_weight_quant,
     blockfp8_weight_dequant,
-    soft_fp8_blockfp8_weight_dequant,
     blockfp8_act_quant,
     silu_and_mul_and_blockfp8_act_quant,
     fp8_e4m3fn_quant_per_tensor,

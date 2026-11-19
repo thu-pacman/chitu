@@ -10,7 +10,7 @@ from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
 
 from chitu.ops.quant.blockfp8.convert import (
     blockfp8_weight_dequant,
-    soft_fp8_blockfp8_weight_dequant,
+    blockfp8_weight_dequant_impl_for,
 )
 from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import try_import_platform_dep
@@ -58,10 +58,12 @@ def _einsum_shc_hdc_shd_torch(
     assert group_B.dim() == 3
     assert group_A.shape[1] == group_B.shape[0]
     assert group_A.shape[2] == group_B.shape[2]
-    weight_dequant_fn = (
-        soft_fp8_blockfp8_weight_dequant if soft_fp8 else blockfp8_weight_dequant
+    group_B = blockfp8_weight_dequant(
+        group_B,
+        group_b_s,
+        scale_block_shape=scale_block_shape,
+        impl=blockfp8_weight_dequant_impl_for(soft_fp8),
     )
-    group_B = weight_dequant_fn(group_B, group_b_s, scale_block_shape=scale_block_shape)
     return torch.einsum("shc,hdc->shd", group_A, group_B)
 
 
