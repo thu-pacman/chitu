@@ -148,3 +148,43 @@ def plus(a, b):
     except Exception as e:
         raise RuntimeError(f"Operator `+` is not supported on {a} and {b}") from e
 ```
+
+## Implement conditions and branches with causation
+
+Choose a branch when a condition logically cause it, not when a logically unrelated condition happens to be true.
+
+Bad example (shared experts is unrelated to score function, but the pairing happens to be true when we develop):
+
+```
+if has_shared_experts
+    moe_gate_shared_sigmoid(...)
+else:
+    moe_gate_no_shared_softmax(...)
+```
+
+Good example (check shared experts and score functions separatedly, and raise when unimplemented):
+
+```
+if has_shared_experts and score_func == "sigmoid":
+    moe_gate_shared_sigmoid(...)
+elif not has_shared_experts and score_func == "softmax":
+    moe_gate_no_shared_softmax(...)
+else:
+    raise NotImplementedErorr(...)
+```
+
+Bad example (reject a random unsupported type)
+
+```
+if isinstance(obj, str):
+    raise ValueError("obj should not be a str")
+obj["x"] = 1
+```
+
+Good example (because we expect a dict, we check if it is a dict):
+
+```
+if not isinstance(obj, dict):
+    raise ValueError("obj should be a dict")
+obj["x"] = 1
+```
