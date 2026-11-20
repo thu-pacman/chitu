@@ -73,6 +73,23 @@ After checking the rules above, if you still think the config is needed, please 
 2. Otherwise, if you are editing a standalone test or installation script, a command line argument is preferred.
 3. Environment variables are last resort, for special cases like options handled before Hydra initialization. If you really need to add an environment variable, please also update the environment variable sections in related documents.
 
+## Always leave a TODO comment for temporary workarounds
+
+Future developers often imitate the current code. If the code you write is only a temporary workaround but you think it's not a good design, you won't want future developers to follow its pattern, so leave a comment.
+
+Good example:
+
+```
+def func(x: int):
+    if x is None:
+        # TODO: `x` should not be `None` by design, but an important legacy user still passes
+        # `None`, so we need to check it here. This does NOT mean you should check `None` in
+        # all other functions. Typically you should trust the type hint.
+
+        ...  # Fallback logic
+    ...  # Compute on x
+```
+
 ## Fold redundant code
 
 Bad example (redundant variable passing):
