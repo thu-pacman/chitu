@@ -112,6 +112,17 @@ def blockfp8_weight_dequant(
     raise NotImplementedError
 
 
+def blockfp8_weight_dequant_impl_for(soft_fp8: bool) -> str:
+    """Resolve the ``blockfp8_weight_dequant`` impl name given `soft_fp8` or not."""
+    if soft_fp8:
+        if is_enflame():
+            return "soft_torch"
+        if has_triton:
+            return "soft_triton"
+        return "soft_torch"
+    return "triton"
+
+
 @blockfp8_weight_dequant.register_auto
 def _auto_blockfp8_weight_dequant():
     try:
@@ -120,11 +131,7 @@ def _auto_blockfp8_weight_dequant():
         )
     except Exception:
         soft_fp8 = False
-    if soft_fp8:
-        if is_enflame():
-            return "soft_torch"
-        return "soft_triton"
-    return "triton"
+    return blockfp8_weight_dequant_impl_for(soft_fp8)
 
 
 blockfp8_weight_dequant.register_candidate("triton")
@@ -138,48 +145,13 @@ if has_triton:
     )
 
 
-@make_op_dispatcher
-def soft_fp8_blockfp8_weight_dequant(
-    x: torch.Tensor,
-    s: torch.Tensor,
-    *,
-    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
-    impl: str = "auto",
-) -> torch.Tensor:
-    """
-    Dequantizes the given weight tensor using the provided scale tensor.
-
-    Args:
-        x (torch.Tensor): The quantized weight tensor of shape (M, N).
-        s (torch.Tensor): The scale tensor.
-        scale_block_shape (list, optional): Scale block shape ``[out_blk, in_blk]``.
-            Defaults to ``[128, 128]``.
-
-    Returns:
-        torch.Tensor: The dequantized weight tensor of the same shape as `x`.
-
-    Raises:
-        AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
-    """
-    raise NotImplementedError
-
-
-@soft_fp8_blockfp8_weight_dequant.register_auto
-def _auto_soft_fp8_blockfp8_weight_dequant():
-    if is_enflame():
-        return "torch"
-    return "triton"
-
-
-@soft_fp8_blockfp8_weight_dequant.register("torch")
+@blockfp8_weight_dequant.register("soft_torch")
 def soft_fp8_blockfp8_weight_dequant_torch(
     x: torch.Tensor,
     s: torch.Tensor,
-    block_size: int = 128,
-    *,
     scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ) -> torch.Tensor:
-    """Software FP8-E4M3FN weight dequantization for GCU bring-up.
+    """Software FP8-E4M3FN weight dequantization in pure torch.
 
     With ``raise_lower_bit_float_to=bfloat16`` Chitu deliberately stores FP8
     weights as their raw uint8 payload.  Recreate the finite E4M3 values using
@@ -197,6 +169,11 @@ def soft_fp8_blockfp8_weight_dequant_torch(
         )
     if x.element_size() != 1:
         raise TypeError(f"BlockFP8 weight must use one-byte storage, got {x.dtype}")
+    if s.dtype == torch.uint8:
+        raise NotImplementedError(
+            "The torch soft FP8 dequant supports FP32 scales only; UE8M0 (uint8) "
+            "scales are only supported by the triton impl"
+        )
 
     raw = x.view(torch.uint8)
     signed = torch.where(raw >= 128, raw.to(torch.int32) - 256, raw.to(torch.int32))
@@ -222,27 +199,6 @@ def soft_fp8_blockfp8_weight_dequant_torch(
     )
     expanded_scale = expanded_scale[..., :rows, :cols]
     return (fp8_as_fp32 * expanded_scale).to(torch.get_default_dtype())
-
-
-def _blockfp8_weight_dequant_soft_torch(
-    x: torch.Tensor,
-    s: torch.Tensor,
-    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
-) -> torch.Tensor:
-    return soft_fp8_blockfp8_weight_dequant_torch(
-        x, s, scale_block_shape=scale_block_shape
-    )
-
-
-blockfp8_weight_dequant.register_candidate("soft_torch")
-blockfp8_weight_dequant.register("soft_torch")(_blockfp8_weight_dequant_soft_torch)
-
-
-soft_fp8_blockfp8_weight_dequant.register_candidate("triton")
-if has_triton:
-    soft_fp8_blockfp8_weight_dequant.register("triton")(
-        soft_fp8_blockfp8_weight_dequant_triton
-    )
 
 
 def pack_ue8m0_scale_to_deepgemm_layout(s: torch.Tensor) -> torch.Tensor:

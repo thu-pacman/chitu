@@ -73,6 +73,23 @@ After checking the rules above, if you still think the config is needed, please 
 2. Otherwise, if you are editing a standalone test or installation script, a command line argument is preferred.
 3. Environment variables are last resort, for special cases like options handled before Hydra initialization. If you really need to add an environment variable, please also update the environment variable sections in related documents.
 
+## Always leave a TODO comment for temporary workarounds
+
+Future developers often imitate the current code. If the code you write is only a temporary workaround but you think it's not a good design, you won't want future developers to follow its pattern, so leave a comment.
+
+Good example:
+
+```
+def func(x: int):
+    if x is None:
+        # TODO: `x` should not be `None` by design, but an important legacy user still passes
+        # `None`, so we need to check it here. This does NOT mean you should check `None` in
+        # all other functions. Typically you should trust the type hint.
+
+        ...  # Fallback logic
+    ...  # Compute on x
+```
+
 ## Fold redundant code
 
 Bad example (redundant variable passing):
@@ -124,4 +141,67 @@ Bad example (output incorrect result in unsupported cases):
 def sqrt(x):
     x = abs(x)
     ... # compute arithmetic square root
+```
+
+## Defensive programming should not sacrifice functionality
+
+Don't early-reject cases just because you have not tested them. Only reject cases that we have no code to support.
+
+Bad example (sacrificing supported but just untested cases):
+
+```
+def plus(a, b):
+    if a < 0 or b < 0:
+        raise NotImplementedErorr()  # Not yet tested on negative values
+    return a + b
+```
+
+Good example (only handle errors when there is really a problem):
+
+```
+def plus(a, b):
+    try:
+        return a + b
+    except Exception as e:
+        raise RuntimeError(f"Operator `+` is not supported on {a} and {b}") from e
+```
+
+## Implement conditions and branches with causation
+
+Choose a branch when a condition logically cause it, not when a logically unrelated condition happens to be true.
+
+Bad example (shared experts is unrelated to score function, but the pairing happens to be true when we develop):
+
+```
+if has_shared_experts
+    moe_gate_shared_sigmoid(...)
+else:
+    moe_gate_no_shared_softmax(...)
+```
+
+Good example (check shared experts and score functions separatedly, and raise when unimplemented):
+
+```
+if has_shared_experts and score_func == "sigmoid":
+    moe_gate_shared_sigmoid(...)
+elif not has_shared_experts and score_func == "softmax":
+    moe_gate_no_shared_softmax(...)
+else:
+    raise NotImplementedErorr(...)
+```
+
+Bad example (reject a random unsupported type)
+
+```
+if isinstance(obj, str):
+    raise ValueError("obj should not be a str")
+obj["x"] = 1
+```
+
+Good example (because we expect a dict, we check if it is a dict):
+
+```
+if not isinstance(obj, dict):
+    raise ValueError("obj should be a dict")
+obj["x"] = 1
 ```

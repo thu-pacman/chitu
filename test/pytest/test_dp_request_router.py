@@ -21,10 +21,20 @@ class MonkReq:
     prompt_tokens: list[int] = field(default_factory=list)
 
 
-def _build_router(algorithm: str = "prefix_cache_aware") -> RequestRouter:
+def _build_router(
+    algorithm: str = "prefix_cache_aware",
+    *,
+    routing_by_req_len: bool = False,
+    max_seq_lens: list[int] | None = None,
+) -> RequestRouter:
+    if max_seq_lens is None:
+        max_seq_lens = [8192]
     set_global_args(
         OmegaConf.create(
-            {"infer": {"max_seq_len": 8192, "enable_prefix_caching": True}}
+            {
+                "infer": {"max_seq_len": 8192, "enable_prefix_caching": True},
+                "multi_inst": {"n_insts": len(max_seq_lens)},
+            }
         ),
         need_ensure=False,
         need_preprocess=False,
@@ -40,11 +50,34 @@ def _build_router(algorithm: str = "prefix_cache_aware") -> RequestRouter:
         router_evict_buffer_size=64,
         router_local_reservation_timeout_s=600.0,
         launch_timeout=3600.0,
-        routing_by_req_len=False,
+        routing_by_req_len=routing_by_req_len,
         decode_routing_by_req_len=False,
     )
-    router = RequestRouter(cfg)
+    # ``_parse_scheduler_configs`` reads per-instance ``infer.max_seq_len`` from
+    # the full resolved config. Building that config here would require many
+    # unrelated fields, so drive the per-instance length directly.
+    with patch.object(
+        RequestRouter,
+        "_scheduler_max_seq_len",
+        lambda self, inst_id: max_seq_lens[inst_id],
+    ):
+        router = RequestRouter(cfg)
     return router
+
+
+def _mark_schedulers_alive(router: RequestRouter, count: int) -> None:
+    for local_instance_id in range(count):
+        router.policy.update_stats(
+            SchedulerStats(
+                local_instance_id=local_instance_id,
+                running_requests=0,
+                waiting_requests=0,
+                pending_tokens=0,
+                throughput_tokens_per_sec=0.0,
+                last_update_time=0.0,
+                is_alive=True,
+            )
+        )
 
 
 def test_hit_aware_select_scheduler_prefers_instance_with_more_prefix_hits():
@@ -151,6 +184,152 @@ def test_unified_dp_keeps_running_load_until_request_finishes():
     router.policy.remove_request(req.request_id)
 
     assert router.policy.get_router_load(0) == (0, 0)
+
+
+def test_unified_length_buckets_follow_instance_limits():
+    router = _build_router(routing_by_req_len=True, max_seq_lens=[32, 8, 16])
+    _mark_schedulers_alive(router, 3)
+    assert router.prefill_and_decode_schedulers == {
+        0: {"global_instance_id": 0, "max_seq_len": 32},
+        1: {"global_instance_id": 1, "max_seq_len": 8},
+        2: {"global_instance_id": 2, "max_seq_len": 16},
+    }
+
+    def candidates(req_seq_len: int) -> list[int]:
+        return router._length_routing_candidates(
+            policy=router.policy,
+            schedulers=router.prefill_and_decode_schedulers,
+            req_seq_len=req_seq_len,
+        )
+
+    # Smallest compatible bucket wins; a request longer than every instance is
+    # not admitted at all.
+    assert candidates(8) == [1]
+    assert candidates(9) == [2]
+    assert candidates(17) == [0]
+    assert candidates(33) == []
+
+
+def test_unified_length_bucket_spills_over_when_full():
+    router = _build_router(routing_by_req_len=True, max_seq_lens=[8, 16])
+    _mark_schedulers_alive(router, 2)
+    policy = router.policy
+    policy.max_inflight_per_scheduler = 1
+    policy.remember_request(MonkReq("busy"), local_instance_id=0)
+
+    assert router._length_routing_candidates(
+        policy=policy,
+        schedulers=router.prefill_and_decode_schedulers,
+        req_seq_len=8,
+    ) == [1]
+
+
+def test_unified_length_bucket_reaps_stale_reservation():
+    router = _build_router(routing_by_req_len=True, max_seq_lens=[8])
+    _mark_schedulers_alive(router, 1)
+    policy = router.policy
+    policy.max_inflight_per_scheduler = 1
+    policy.remember_request(MonkReq("stale"), local_instance_id=0)
+    policy.router_reservations["stale"].reserved_at = (
+        time.monotonic() - policy.router_reservation_timeout_s - 1
+    )
+
+    # The only compatible bucket looks full until the expired reservation is
+    # reaped; without the reap this path returns no candidates and the request
+    # is requeued forever.
+    assert router._length_routing_candidates(
+        policy=policy,
+        schedulers=router.prefill_and_decode_schedulers,
+        req_seq_len=8,
+    ) == [0]
+    assert "stale" not in policy.router_reservations
+
+
+def test_unified_router_dispatches_by_prompt_plus_max_new_tokens():
+    router = _build_router(routing_by_req_len=True, max_seq_lens=[16, 8])
+    _mark_schedulers_alive(router, 2)
+    sent: list[tuple[int, str]] = []
+
+    async def send_request(local_instance_id: int, request: UserRequest):
+        sent.append((local_instance_id, request.request_id))
+
+    router._send_request = send_request
+
+    # Both prompts fit the 8-token bucket, only the output budgets differ, so
+    # the second request must use the 16-token bucket.
+    short = UserRequest.create_mock(input_len=7, request_id="len-8", max_new_tokens=1)
+    long = UserRequest.create_mock(input_len=7, request_id="len-16", max_new_tokens=9)
+
+    async def run():
+        router._shutdown = False
+        task = asyncio.create_task(router._request_processor_task())
+        try:
+            await router.submit_request(short)
+            await router.submit_request(long)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and len(sent) < 2:
+                await asyncio.sleep(0.001)
+        finally:
+            router._shutdown = True
+            await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(run())
+
+    assert sorted(sent) == [(0, "len-16"), (1, "len-8")]
+
+
+@pytest.mark.parametrize(
+    "max_new_tokens,rejected",
+    [
+        # prompt 7 + 1 == the only instance's limit: admitted.
+        (1, False),
+        # prompt 7 + 2 exceeds it: no bucket can ever accept the request.
+        (2, True),
+    ],
+)
+def test_unified_router_rejects_only_unroutable_lengths(max_new_tokens, rejected):
+    router = _build_router(routing_by_req_len=True, max_seq_lens=[8])
+    _mark_schedulers_alive(router, 1)
+    sent: list[tuple[int, str]] = []
+    finished: list[tuple[str, FinishReason]] = []
+
+    async def send_request(local_instance_id: int, request: UserRequest):
+        sent.append((local_instance_id, request.request_id))
+
+    def finish_request_before_recv_stop(
+        request: UserRequest, finish_reason: FinishReason, error=None
+    ):
+        finished.append((request.request_id, finish_reason))
+        request.stop_stream(finish_reason, error=error)
+
+    router._send_request = send_request
+    router.finish_request_before_recv_stop = finish_request_before_recv_stop
+
+    request = UserRequest.create_mock(
+        input_len=7, request_id="len-boundary", max_new_tokens=max_new_tokens
+    )
+
+    async def run():
+        router._shutdown = False
+        task = asyncio.create_task(router._request_processor_task())
+        try:
+            await router.submit_request(request)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not sent and not finished:
+                await asyncio.sleep(0.001)
+        finally:
+            router._shutdown = True
+            await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(run())
+
+    assert not router.pending_requests
+    if rejected:
+        assert finished == [("len-boundary", FinishReason.LENGTH)]
+        assert sent == []
+    else:
+        assert finished == []
+        assert sent == [(0, "len-boundary")]
 
 
 def test_local_evict_moves_hash_to_buffer():

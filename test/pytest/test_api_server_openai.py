@@ -99,7 +99,11 @@ def create_client(
         ),
         debug=SimpleNamespace(save_trace_dir=None),
         models=SimpleNamespace(name="test-model"),
-        serve=SimpleNamespace(api_keys=[], validate_api_key=False),
+        serve=SimpleNamespace(
+            api_keys=[],
+            validate_api_key=False,
+            default_max_new_tokens=1024,
+        ),
         multi_inst=SimpleNamespace(n_insts=n_insts),
     )
     monkeypatch.setattr(api_server.Backend, "formatter", formatter or DummyFormatter())

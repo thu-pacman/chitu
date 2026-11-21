@@ -21,7 +21,7 @@ from chitu.ops.quant import (
     linear,
     blockfp8_gemm,
     soft_fp8_blockfp8_gemm,
-    soft_fp8_blockfp8_weight_dequant,
+    blockfp8_weight_dequant,
     blockfp8_act_quant,
     blockfp8_einsum_shc_hdc_shd,
     soft_fp8_blockfp8_gemm_marlin,
@@ -136,7 +136,10 @@ def linear_blockfp8(
             logger.warning(
                 f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
             )
-            weight_dequanted = soft_fp8_blockfp8_weight_dequant(
+            # Soft dequant is guaranteed here: this branch only runs with
+            # `raise_lower_bit_float_to=bfloat16`, so `impl="auto"` resolves to
+            # a soft implementation.
+            weight_dequanted = blockfp8_weight_dequant(
                 weight,
                 weight_scale,
                 scale_block_shape=scale_block_shape,
@@ -1048,13 +1051,16 @@ class Blockfp8MoeExpertsMerged(NativeLayoutMixin, QuantizedMoeExpertsMerged):
                 logger.warning(
                     f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
                 )
-                gate_up_proj_weight = soft_fp8_blockfp8_weight_dequant(
+                # Soft dequant is guaranteed here: this branch only runs when
+                # hard FP8 compute is unavailable, so `impl="auto"` resolves to
+                # a soft implementation.
+                gate_up_proj_weight = blockfp8_weight_dequant(
                     self.gate_up_proj_weight,
                     self.gate_up_proj_scale,
                     scale_block_shape=self.scale_block_shape,
                 )
                 gate_up_proj_scale = None
-                down_proj_weight = soft_fp8_blockfp8_weight_dequant(
+                down_proj_weight = blockfp8_weight_dequant(
                     self.down_proj_weight,
                     self.down_proj_scale,
                     scale_block_shape=self.scale_block_shape,

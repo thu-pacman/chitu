@@ -328,6 +328,20 @@ HTTP service port. Set this according to your network.
 
 *Default: `21002`.*
 
+### Argument `serve.default_max_new_tokens`
+
+Default number of tokens to generate when a request omits the output length
+(`max_completion_tokens`, `max_tokens`, `max_tokens_to_sample`, or
+`max_output_tokens`). This value only limits generated tokens; it does not include
+input tokens. The value is still capped by `infer.max_seq_len - prompt_len`.
+
+A small value routes unknown-length requests to short-sequence instances and may
+truncate long outputs. A large value reduces truncation but sends those requests to
+long-sequence instances. Clients that need a specific length should set it
+explicitly.
+
+*Default: `1024`.*
+
 ### Argument `serve.api_keys`
 
 If the request has a api_key field found in this dict, the request will be prioritized
@@ -1088,6 +1102,34 @@ has this many seconds to notify the Router / terminate in-flight requests
 before a hard exit. Default 10s.
 
 *Default: `10.0`.*
+
+#### Argument `multi_inst.router.max_inflight_per_instance`
+
+Maximum Router in-flight requests admitted per instance. Length routing
+tries a larger compatible bucket when the current bucket reaches this
+limit. If all compatible buckets are full, PD rejects the request and
+unified routing waits. Without length routing this is a soft limit:
+if every alive instance is full, all alive instances remain candidates.
+
+*Default: `24`.*
+
+#### Argument `multi_inst.router.routing_by_req_len`
+
+Group instances by infer.max_seq_len and choose the smallest compatible
+bucket with admission capacity, then apply routing_algorithm within it.
+PD Prefill uses input length; unified routing uses input + maximum output
+length. Supports prefix_cache_aware and load-balancing policies.
+
+*Default: `False`.*
+
+#### Argument `multi_inst.router.decode_routing_by_req_len`
+
+Apply length buckets to PD Decode using input + maximum output length.
+Set routing_algorithm_for_decode=power_of_two_choices for load balancing
+within the selected bucket. Larger buckets are tried only when smaller
+compatible buckets have no alive instance below max_inflight_per_instance.
+
+*Default: `False`.*
 
 ## `metrics`
 

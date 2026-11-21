@@ -679,7 +679,7 @@ async def build_user_request(
     max_new_tokens = (
         req.max_completion_tokens
         if req.max_completion_tokens is not None
-        else args.infer.max_seq_len
+        else args.serve.default_max_new_tokens
     )
     enable_thinking = req.extra_body.get(
         "enable_thinking",
@@ -1056,7 +1056,9 @@ async def build_completion_user_request(
         arrival_ts = time.monotonic()
     args = get_global_args()
     max_new_tokens = (
-        req.max_tokens if req.max_tokens is not None else args.infer.max_seq_len
+        req.max_tokens
+        if req.max_tokens is not None
+        else args.serve.default_max_new_tokens
     )
     ttft_timeout_s = req.extra_body.get("ttft_timeout_s", req.ttft_timeout_s)
     params_done_ts = time.monotonic()

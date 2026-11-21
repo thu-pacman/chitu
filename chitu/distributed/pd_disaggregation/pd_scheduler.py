@@ -28,6 +28,7 @@ from chitu.task import (
     abort_task,
 )
 from chitu.global_vars import get_global_args
+from chitu.utils import cap_max_new_tokens_for_instance
 from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
 from chitu.distributed.pd_disaggregation.kv_transfer import (
     KVManagerDecode,
@@ -641,15 +642,19 @@ class PDInstanceRequestManager:
         # Decode should only generate up to max_seq_len - prompt_len tokens.
         max_seq_len = get_global_args().infer.max_seq_len
         generated = len(task.req.generated_tokens)
-        allowed_new = max(0, max_seq_len - task.prefix_tokens_len)
-        allowed_new = min(allowed_new, task.req.max_new_tokens - generated)
-        if task.req.max_new_tokens > allowed_new:
+        capped_max_new_tokens = cap_max_new_tokens_for_instance(
+            task.req.max_new_tokens,
+            task.prefix_tokens_len,
+            generated,
+            max_seq_len,
+        )
+        if task.req.max_new_tokens > capped_max_new_tokens:
             logger.warning(
                 f"[PD_DECODE] clamp max_new_tokens: req_id={task.task_id} "
-                f"prompt_len={task.prompt_len} {generated=} {max_seq_len=}"
-                f"max_new_tokens={task.req.max_new_tokens} -> {allowed_new}"
+                f"prompt_len={task.prompt_len} {generated=} {max_seq_len=} "
+                f"max_new_tokens={task.req.max_new_tokens} -> {capped_max_new_tokens}"
             )
-            task.req.max_new_tokens = int(allowed_new)
+            task.req.max_new_tokens = capped_max_new_tokens
         # For PD services, keep request handling non-blocking and thread-safe:
         # the caller wraps + enqueues OUTSIDE the request-build boundary (see below).
         return task

@@ -85,6 +85,7 @@ def client_and_params(monkeypatch):
         lambda: SimpleNamespace(
             infer=SimpleNamespace(max_seq_len=4096),
             debug=SimpleNamespace(save_trace_dir=None),
+            serve=SimpleNamespace(default_max_new_tokens=1024),
         ),
         raising=False,
     )

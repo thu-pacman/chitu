@@ -26,6 +26,12 @@ class ServeConfigRules(Callback):
         if not (1024 <= port <= 65535):
             self._exit_with_error(f"Port must be between 1024 and 65535, got {port}")
 
+        default_max_new_tokens = config.serve.default_max_new_tokens
+        if default_max_new_tokens < 1:
+            self._exit_with_error(
+                f"default_max_new_tokens must be positive, got {default_max_new_tokens}"
+            )
+
         num_blocks = config.infer.num_blocks
         if num_blocks < 0 and num_blocks != -1:
             self._exit_with_error(

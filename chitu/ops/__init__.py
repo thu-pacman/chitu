@@ -60,7 +60,6 @@ from chitu.ops.quant import (
     soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm,
     blockfp8_weight_quant,
     blockfp8_weight_dequant,
-    soft_fp8_blockfp8_weight_dequant,
     blockfp8_act_quant,
     silu_and_mul_and_blockfp8_act_quant,
     unpack_every_uint8_to_two_fp4_e2m1_in_uint8,

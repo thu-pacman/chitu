@@ -5,8 +5,8 @@ from chitu.device_type import has_native_fp8
 from chitu.ops import (
     blockfp8_act_quant,
     blockfp8_gemm,
+    blockfp8_weight_dequant,
     soft_fp8_blockfp8_gemm,
-    soft_fp8_blockfp8_weight_dequant,
 )
 from chitu.testing import assert_close
 from chitu.utils import try_import_platform_dep
@@ -57,14 +57,15 @@ def test_mxfp8_soft_dequant_is_close_to_ref(
     weight, scale = init_mxfp8_weight(out_features, in_features)
 
     output = record_benchmark.run(
-        lambda: soft_fp8_blockfp8_weight_dequant(
+        lambda: blockfp8_weight_dequant(
             weight,
             scale,
             scale_block_shape=SCALE_BLOCK_SHAPE,
+            impl="soft_triton",
         ),
         out_features=out_features,
         in_features=in_features,
-        impl="soft_fp8_dequant",
+        impl="soft_triton",
     )
     output_ref = dequant_mxfp8_weight(weight, scale)
 

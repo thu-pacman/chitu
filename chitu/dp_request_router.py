@@ -198,14 +198,22 @@ class RoutePolicy:
         # always return 0. This fuction should be overrided/prohibited
         return self.scheduler_stats[local_instance_id].running_requests
 
-    def eligible_schedulers(self) -> list[int]:
-        """Soft-admission: prefer under-cap alive schedulers; fallback to all alive.
+    def eligible_schedulers(
+        self,
+        candidate_ids: Optional[list[int]] = None,
+        *,
+        allow_overflow: bool = True,
+    ) -> list[int]:
+        """Prefer under-cap alive candidates, optionally allowing overflow.
 
-        This avoids empty candidate sets causing Router-side pushbacks when the cluster is busy.
+        Length buckets disable overflow so a full bucket can spill into a
+        larger compatible bucket instead of admitting more requests locally.
         """
         alive: list[int] = []
         under_cap: list[int] = []
-        for s_id, stats in self.scheduler_stats.items():
+        candidates = self.scheduler_stats if candidate_ids is None else candidate_ids
+        for s_id in candidates:
+            stats = self.scheduler_stats[s_id]
             if stats.is_alive:
                 alive.append(s_id)
                 if (
@@ -213,7 +221,7 @@ class RoutePolicy:
                     < self.max_inflight_per_scheduler
                 ):
                     under_cap.append(s_id)
-        return under_cap if under_cap else alive
+        return under_cap if under_cap or not allow_overflow else alive
 
     def remember_request(
         self,
@@ -233,13 +241,27 @@ class RoutePolicy:
         """local_instance_id currently serving ``request_id``, if known."""
         return None
 
+    def reap_stale_reservations(self) -> None:
+        """Drop load reservations whose owner is assumed to be gone.
+
+        Policies that reserve capacity must override this. Callers invoke it
+        before admission decisions that can reject a request without going
+        through ``select_scheduler``, so a leaked reservation cannot block a
+        scheduler forever.
+        """
+        pass
+
 
 class LoadBalancer(RoutePolicy):
     """Load balancing algorithms for request routing."""
 
     def __init__(self, config: ServeRouterConfig):
         super().__init__(config)
-        self.round_robin_counter = 0
+        # One cursor per candidate set. A single shared cursor is modulo-indexed
+        # by the current candidate count, so it keeps landing on the same index
+        # whenever the candidate set size alternates — which it does once the
+        # candidates are length buckets.
+        self.round_robin_counters: dict[tuple[int, ...], int] = {}
         self.last_selected_scheduler_id: Optional[int] = None
         self.w_pending_tokens = float(PENDING_TOKENS_WEIGHT)
         # Prefill-token equivalents charged for one request that is past its first
@@ -292,6 +314,9 @@ class LoadBalancer(RoutePolicy):
         local_instance_id = reservation.local_instance_id
         self.router_pending_tokens[local_instance_id] -= reservation.pending_tokens
         reservation.pending_tokens = 0
+
+    def reap_stale_reservations(self) -> None:
+        self._reap_stale_router_reservations()
 
     def _reap_stale_router_reservations(self) -> None:
         """Clean haning requests that never finish"""
@@ -352,8 +377,9 @@ class LoadBalancer(RoutePolicy):
         return reservation.local_instance_id
 
     def _round_robin(self, eligible_ids: list[int]) -> int:
-        idx = self.round_robin_counter % len(eligible_ids)
-        self.round_robin_counter += 1
+        candidates = tuple(eligible_ids)
+        idx = self.round_robin_counters.get(candidates, 0) % len(candidates)
+        self.round_robin_counters[candidates] = idx + 1
         return eligible_ids[idx]
 
     def _least_loaded(self, eligible_ids: list[int]) -> int:
@@ -483,9 +509,6 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         self.evict_buffer_size = max(
             1, int(getattr(config, "router_evict_buffer_size", 64))
         )
-
-        # If requests are routed by request length
-        self.routing_by_req_len = False
 
     def clear_prefix_cache(self):
         self.cached_blocks.clear()
@@ -631,13 +654,6 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             )
             return best_scheduler
 
-        if self.routing_by_req_len:
-            logger.debug(
-                f"[PREFIX_ROUTER] req[{request.request_id}] weak match_rate={match_rate:.2f} "
-                f"-> seed on min-max_seq_len sid={eligible_ids[0]}"
-            )
-            return eligible_ids[0]
-
         logger.debug(
             f"[PREFIX_ROUTER] req[{request.request_id}] weak match_rate={match_rate:.2f} "
             f"-> seed on min-load sid={min_load_sid}"
@@ -751,10 +767,7 @@ class RequestRouter:
                 "infer.enable_prefix_caching=true"
             )
             self.policy = PrefixCacheAwarePolicy(config)
-            self.policy.routing_by_req_len = self.routing_by_req_len
         else:
-            if self.routing_by_req_len:
-                raise ValueError("LoadBalancer do not supports routing_by_req_len")
             self.policy = LoadBalancer(config)
         self.context = zmq.asyncio.Context()
         # 轮询游标
@@ -841,6 +854,33 @@ class RequestRouter:
         self.finish_request_before_recv_stop(
             request, finish_reason=FinishReason.ERROR, error="TTFT timeout"
         )
+        return True
+
+    def _reject_overlong_request(self, request: UserRequest) -> bool:
+        """Reject a request that can never fit any length bucket.
+
+        Length-bucket admission uses ``prompt_len + max_new_tokens``. If that
+        total exceeds every instance's ``max_seq_len`` no bucket will ever
+        accept the request, so requeueing it would wait forever.
+        """
+        if not self.routing_by_req_len or not self.prefill_and_decode_schedulers:
+            return False
+        req_len = request.prompt_len + request.max_new_tokens
+        if any(
+            info["max_seq_len"] >= req_len
+            for info in self.prefill_and_decode_schedulers.values()
+        ):
+            return False
+        logger.warning(
+            "[LENGTH_EXCEED][router] req_id=%s stage=unified req_len=%s max_seq_len=%s",
+            request.request_id,
+            req_len,
+            max(
+                info["max_seq_len"]
+                for info in self.prefill_and_decode_schedulers.values()
+            ),
+        )
+        self.finish_request_before_recv_stop(request, finish_reason=FinishReason.LENGTH)
         return True
 
     @property
@@ -1196,20 +1236,33 @@ class RequestRouter:
     def _length_routing_candidates(
         self,
         *,
-        policy: PrefixCacheAwarePolicy,
+        policy: RoutePolicy,
         schedulers: dict[int, dict],
         req_seq_len: int,
     ) -> list[int]:
-        eligible_alive = set(policy.eligible_schedulers())
-        return sorted(
-            (
-                sid
-                for sid, info in schedulers.items()
-                if sid in eligible_alive
-                and info.get("max_seq_len", 10240) >= req_seq_len
-            ),
-            key=lambda sid: schedulers[sid].get("max_seq_len", 10240),
-        )
+        """Select the smallest compatible length bucket with admission capacity.
+
+        Admission is scoped to each bucket. Full buckets may spill into larger
+        ones, but no bucket bypasses its in-flight limit when all are full.
+        """
+        # This is a hard admission path: when every compatible bucket is full we
+        # return no candidates, and the caller never reaches
+        # ``select_scheduler``, which is where stale reservations are normally
+        # reaped. Without an explicit reap here a single leaked reservation can
+        # keep the only compatible bucket full forever.
+        policy.reap_stale_reservations()
+        buckets: dict[int, list[int]] = {}
+        for sid, info in schedulers.items():
+            max_seq_len = info["max_seq_len"]
+            if max_seq_len >= req_seq_len:
+                buckets.setdefault(max_seq_len, []).append(sid)
+        for max_seq_len in sorted(buckets):
+            eligible_ids = policy.eligible_schedulers(
+                buckets[max_seq_len], allow_overflow=False
+            )
+            if eligible_ids:
+                return eligible_ids
+        return []
 
     async def _request_processor_task(self):
         """Process pending requests and route them to schedulers."""
@@ -1231,6 +1284,9 @@ class RequestRouter:
                         # not be dispatched to an instance anymore.
                         continue
                     if self._reject_ttft_timeout(request):
+                        self.total_requests += 1
+                        continue
+                    if self._reject_overlong_request(request):
                         self.total_requests += 1
                         continue
 
