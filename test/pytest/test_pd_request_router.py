@@ -9,6 +9,8 @@ selection helpers — no ZMQ or ``_pd_stats_collector_task`` integration.
 """
 
 import asyncio
+import time
+
 import pytest
 from omegaconf import OmegaConf
 from dataclasses import dataclass, field
@@ -482,11 +484,17 @@ def test_pd_router_prefix_prefill_decode_uses_decode_policy():
 
 
 def _length_test_router(
-    prefill_limits, decode_limits, *, length_routing=True, decode_length_routing=True
+    prefill_limits,
+    decode_limits,
+    *,
+    length_routing=True,
+    decode_length_routing=True,
+    routing_algorithm="prefix_cache_aware",
+    decode_algorithm="prefix_cache_aware",
 ):
     cfg = _pd_router_config(
-        routing_algorithm="prefix_cache_aware",
-        routing_algorithm_for_decode="prefix_cache_aware",
+        routing_algorithm=routing_algorithm,
+        routing_algorithm_for_decode=decode_algorithm,
     )
     cfg.routing_by_req_len = length_routing
     cfg.decode_routing_by_req_len = decode_length_routing
@@ -509,6 +517,167 @@ def _length_test_router(
 
     router = LengthTestPDRequestRouter(cfg, PDDisaggregationConfig())
     return router
+
+
+@pytest.mark.parametrize("total_len,expected_sid", [(8, 0), (9, 1), (16, 1), (17, 2)])
+def test_pd_length_buckets_precede_load(total_len, expected_sid):
+    router = _length_test_router(
+        [32], [8, 16, 32], decode_algorithm="power_of_two_choices"
+    )
+    # A less-loaded larger bucket must not steal a request from a smaller one.
+    router.decode_policy.remember_request(MockReq("busy"), 0, pending_tokens=0)
+    request = MockReq("boundary", [1] * (total_len - 1), 1)
+
+    asyncio.run(router.add_request(request))
+
+    assert (
+        router.pending_pd_requests[request.request_id].decode_scheduler_id
+        == expected_sid
+    )
+
+
+def test_pd_length_bucket_prefix_cache_miss_uses_least_loaded_replica():
+    router = _length_test_router([32], [8, 8])
+    router.decode_policy.remember_request(MockReq("busy"), 0, pending_tokens=0)
+    request = MockReq("no-affinity", [1] * 7, 1)
+
+    asyncio.run(router.add_request(request))
+
+    assert router.pending_pd_requests[request.request_id].decode_scheduler_id == 1
+
+
+def test_pd_length_bucket_round_robin_cycles_within_bucket():
+    router = _length_test_router([32], [8, 8], decode_algorithm="round_robin")
+
+    picked = []
+    for i in range(4):
+        request = MockReq(f"rr-{i}", [1] * 7, 1)
+        asyncio.run(router.add_request(request))
+        picked.append(
+            router.pending_pd_requests[request.request_id].decode_scheduler_id
+        )
+
+    assert picked == [0, 1, 0, 1]
+
+
+def test_pd_length_bucket_round_robin_leaves_no_replica_idle():
+    router = _length_test_router([32], [8, 16, 16], decode_algorithm="round_robin")
+
+    picked = []
+    for i in range(4):
+        # 7 + 1 tokens fit the 8k bucket only; 15 + 1 need one of the 16k replicas.
+        requests = [
+            MockReq(f"short-{i}", [1] * 7, 1),
+            MockReq(f"long-{i}", [1] * 15, 1),
+        ]
+        for request in requests:
+            asyncio.run(router.add_request(request))
+            picked.append(
+                router.pending_pd_requests[request.request_id].decode_scheduler_id
+            )
+
+    assert picked == [0, 1, 0, 2, 0, 1, 0, 2]
+
+
+def test_pd_length_bucket_balances_same_capacity_replicas():
+    router = _length_test_router(
+        [32], [8, 8, 16], decode_algorithm="power_of_two_choices"
+    )
+    router.decode_policy.remember_request(MockReq("busy"), 0, pending_tokens=0)
+    request = MockReq("balanced", [1] * 7, 1)
+
+    asyncio.run(router.add_request(request))
+
+    assert router.pending_pd_requests[request.request_id].decode_scheduler_id == 1
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+@pytest.mark.parametrize("rejected_prompt_len", [7, 9])
+def test_pd_length_bucket_admission_and_spillover(role, rejected_prompt_len):
+    router = _length_test_router(
+        [8, 16],
+        [8, 16],
+        routing_algorithm="power_of_two_choices",
+        decode_algorithm="power_of_two_choices",
+    )
+    policy = router.prefill_policy if role == "prefill" else router.decode_policy
+    for i in range(policy.max_inflight_per_scheduler):
+        policy.remember_request(MockReq(f"busy-{i}"), 0, pending_tokens=0)
+
+    request = MockReq("spill", [1] * 7, 1)
+    asyncio.run(router.add_request(request))
+    pair = router.pending_pd_requests[request.request_id]
+    assert (pair.prefill_scheduler_id, pair.decode_scheduler_id) == (
+        (1, 0) if role == "prefill" else (0, 1)
+    )
+
+    # A full compatible bucket cannot fall back to an incompatible short one.
+    for i in range(policy.max_inflight_per_scheduler):
+        policy.remember_request(MockReq(f"long-busy-{i}"), 1, pending_tokens=0)
+    rejected = MockReq("full", [1] * rejected_prompt_len, 1)
+    asyncio.run(router.add_request(rejected))
+    assert rejected.error == "No available prefill/decode workers"
+    assert rejected.request_id not in router.pending_pd_requests
+    assert rejected.request_id not in router.prefill_policy.router_reservations
+    assert rejected.request_id not in router.decode_policy.router_reservations
+
+
+def test_pd_length_bucket_keeps_cache_affinity_within_bucket():
+    router = _length_test_router([32], [8, 16])
+    policy = router.decode_policy
+    policy.instances_num_total_blocks[1] = 16
+    policy.instances_block_size[1] = 1
+    request = MockReq("cached", [1] * 7, 1)
+    policy.remember_request(MockReq("warm-cache", [1] * 7), 1, pending_tokens=0)
+    assert policy.num_hit_blocks(1, policy.build_req_block_hashes(request, 1)) == 7
+
+    asyncio.run(router.add_request(request))
+
+    assert router.pending_pd_requests[request.request_id].decode_scheduler_id == 0
+
+
+def test_pd_length_bucket_skips_dead_short_replica():
+    router = _length_test_router([32], [8, 16], decode_algorithm="power_of_two_choices")
+    router.decode_policy.scheduler_stats[0].is_alive = False
+    request = MockReq("live", [1] * 7, 1)
+
+    asyncio.run(router.add_request(request))
+
+    assert router.pending_pd_requests[request.request_id].decode_scheduler_id == 1
+
+
+def test_pd_length_bucket_reaps_stale_reservation():
+    router = _length_test_router([32], [8], decode_algorithm="power_of_two_choices")
+    policy = router.decode_policy
+    policy.max_inflight_per_scheduler = 1
+    policy.remember_request(MockReq("stale"), 0, pending_tokens=0)
+    policy.router_reservations["stale"].reserved_at = (
+        time.monotonic() - policy.router_reservation_timeout_s - 1
+    )
+    request = MockReq("fresh", [1] * 7, 1)
+
+    asyncio.run(router.add_request(request))
+
+    assert router.pending_pd_requests[request.request_id].decode_scheduler_id == 0
+    assert "stale" not in policy.router_reservations
+    assert not request.finished
+
+
+def test_pd_without_length_routing_keeps_soft_overflow():
+    router = _length_test_router(
+        [8],
+        [8],
+        length_routing=False,
+        decode_length_routing=False,
+        decode_algorithm="power_of_two_choices",
+    )
+    for i in range(router.decode_policy.max_inflight_per_scheduler):
+        router.decode_policy.remember_request(MockReq(f"busy-{i}"), 0, pending_tokens=0)
+    request = MockReq("overflow", [1], 1)
+
+    asyncio.run(router.add_request(request))
+
+    assert router.pending_pd_requests[request.request_id].decode_scheduler_id == 0
 
 
 async def _run_pd_router_iteration(router):

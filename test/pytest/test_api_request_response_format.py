@@ -576,6 +576,7 @@ def create_chat_client(monkeypatch, captured):
         serve=SimpleNamespace(
             api_keys=[],
             validate_api_key=False,
+            default_max_new_tokens=1024,
             # the example body asks for GLM-5.3-FP8-kv; expose it as an alias
             # so the real resolve_model_name logic stays in play
             model_alias="GLM-5.3-FP8-kv",
@@ -801,6 +802,7 @@ def create_responses_client(monkeypatch, captured):
             infer=SimpleNamespace(max_seq_len=4096),
             debug=SimpleNamespace(save_trace_dir=None),
             models=SimpleNamespace(name="Qwen3-32B"),
+            serve=SimpleNamespace(default_max_new_tokens=1024),
         ),
     )
     monkeypatch.setattr(

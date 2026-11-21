@@ -203,6 +203,24 @@ def max_alloc_seq_len(max_seq_len: int) -> int:
     return max_seq_len - 1 + 3 * draft_len
 
 
+def cap_max_new_tokens_for_instance(
+    max_new_tokens: int,
+    prefix_len: int,
+    generated_len: int,
+    max_seq_len: int,
+) -> int:
+    """Cap the output budget to the sequence capacity left in this instance.
+
+    `max_new_tokens` counts tokens already generated, and `prefix_len` already
+    includes them. A request may have been capped against the global
+    `infer.max_seq_len` before an instance was chosen, so redo it with the
+    instance's own `max_seq_len`.
+    """
+    remaining_capacity = max(0, max_seq_len - prefix_len)
+    remaining_budget = max(0, max_new_tokens - generated_len)
+    return min(remaining_capacity, remaining_budget)
+
+
 def is_power_of_two(n: int) -> bool:
     return (n != 0) and (n & (n - 1)) == 0
 

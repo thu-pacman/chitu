@@ -1521,7 +1521,7 @@ async def handle_responses_request(
         max_new_tokens=(
             request.max_output_tokens
             if request.max_output_tokens is not None
-            else args.infer.max_seq_len
+            else args.serve.default_max_new_tokens
         ),
         temperature=request.resolved_temperature,
         top_p=request.resolved_top_p,

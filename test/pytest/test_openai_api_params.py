@@ -501,13 +501,14 @@ class TestBuildUserRequestReasoningEffort:
         import chitu.serve.openai_api as openai_api
         import chitu.serve.common as serve_common
 
-        # build_user_request reads args.infer.max_seq_len / debug.save_trace_dir
+        # build_user_request reads serve.default_max_new_tokens / debug.save_trace_dir
         monkeypatch.setattr(
             openai_api,
             "get_global_args",
             lambda: SimpleNamespace(
                 infer=SimpleNamespace(max_seq_len=4096),
                 debug=SimpleNamespace(save_trace_dir=None),
+                serve=SimpleNamespace(default_max_new_tokens=1024),
             ),
         )
         # build_chat_template_kwargs reads models.name
@@ -564,3 +565,58 @@ class TestBuildUserRequestReasoningEffort:
             extra_body={"reasoning_effort": "low"},
         )
         assert kwargs["reasoning_effort"] == "low"
+
+
+class TestBuildUserRequestMaxNewTokens:
+    """An omitted output length falls back to ``serve.default_max_new_tokens``,
+    not to the model's maximum sequence length."""
+
+    @staticmethod
+    def _captured_max_new_tokens(monkeypatch, **chat_request_fields):
+        from types import SimpleNamespace
+
+        import chitu.serve.openai_api as openai_api
+        import chitu.serve.common as serve_common
+
+        monkeypatch.setattr(
+            openai_api,
+            "get_global_args",
+            lambda: SimpleNamespace(
+                infer=SimpleNamespace(max_seq_len=4096),
+                debug=SimpleNamespace(save_trace_dir=None),
+                serve=SimpleNamespace(default_max_new_tokens=1024),
+            ),
+        )
+        monkeypatch.setattr(
+            serve_common,
+            "get_global_args",
+            lambda: SimpleNamespace(models=SimpleNamespace(name="GLM-5.2")),
+        )
+        captured = {}
+
+        def _capture(params, **kwargs):
+            captured["params"] = params
+            return params
+
+        monkeypatch.setattr(
+            openai_api.UserRequest, "from_request_params", staticmethod(_capture)
+        )
+        monkeypatch.setattr(
+            openai_api.UserRequest,
+            "encode_request_params",
+            staticmethod(lambda params: ([1, 2, 3], None, None)),
+        )
+
+        req = openai_api.ChatRequest(
+            messages=[{"role": "user", "content": "hi"}], **chat_request_fields
+        )
+        asyncio.run(openai_api.build_user_request(req))
+        return captured["params"].max_new_tokens
+
+    def test_omitted_uses_serve_default(self, monkeypatch):
+        assert self._captured_max_new_tokens(monkeypatch) == 1024
+
+    def test_explicit_value_is_preserved(self, monkeypatch):
+        assert (
+            self._captured_max_new_tokens(monkeypatch, max_completion_tokens=64) == 64
+        )

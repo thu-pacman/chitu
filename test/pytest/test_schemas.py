@@ -37,7 +37,7 @@ class TestServeConfigRules:
                     "n_heads": 64,
                     "n_kv_heads": 8,
                 },
-                "serve": {"port": 21002},
+                "serve": {"port": 21002, "default_max_new_tokens": 1024},
                 "infer": {
                     "num_blocks": 2,
                     "attn_type": "flash_attn",

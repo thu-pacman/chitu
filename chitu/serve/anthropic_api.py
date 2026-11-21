@@ -881,7 +881,9 @@ async def handle_messages_request(
         return anthropic_error(400, "invalid_request_error", str(e))
 
     max_new_tokens = (
-        request.max_tokens if request.max_tokens is not None else args.infer.max_seq_len
+        request.max_tokens
+        if request.max_tokens is not None
+        else args.serve.default_max_new_tokens
     )
     temperature = request.temperature if request.temperature is not None else 0.8
     top_p = request.top_p if request.top_p is not None else 0.9
@@ -1022,7 +1024,7 @@ async def handle_completion_request(
             max_new_tokens=(
                 request.max_tokens_to_sample
                 if request.max_tokens_to_sample is not None
-                else args.infer.max_seq_len
+                else args.serve.default_max_new_tokens
             ),
             top_p=request.top_p if request.top_p is not None else 0.9,
             top_k=request.top_k if request.top_k is not None else 50,

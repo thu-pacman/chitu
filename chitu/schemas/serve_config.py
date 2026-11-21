@@ -44,6 +44,7 @@ class ApiKey:
 class ServeAddrConfig:
     host: str = MISSING
     port: int = MISSING
+    default_max_new_tokens: int = MISSING
     api_keys: list[ApiKey] = field(default_factory=list)
     validate_api_key: bool = MISSING
     # Optional extra API model name; does not change the loaded model.

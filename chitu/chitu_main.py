@@ -47,6 +47,7 @@ from chitu.task import (
     abort_task,
 )
 from chitu.utils import (
+    cap_max_new_tokens_for_instance,
     gen_req_id,
     max_alloc_seq_len,
     try_import_and_setup_torch_npu,
@@ -2215,6 +2216,23 @@ async def process_scheduler_request(rank: int, request_data: dict):
             stop_with_eos = False
 
         task = Task(task_id=request_id, req=user_request, stop_with_eos=stop_with_eos)
+
+        # Router capping only knows the global `infer.max_seq_len`, but this
+        # instance may be smaller. Re-cap against this instance's own limit.
+        max_seq_len = get_global_args().infer.max_seq_len
+        capped_max_new_tokens = cap_max_new_tokens_for_instance(
+            task.req.max_new_tokens,
+            task.prefix_tokens_len,
+            len(task.req.generated_tokens),
+            max_seq_len,
+        )
+        if capped_max_new_tokens < task.req.max_new_tokens:
+            logger.warning(
+                f"clamp max_new_tokens: req_id={request_id} "
+                f"prompt_len={task.prompt_len} max_seq_len={max_seq_len} "
+                f"max_new_tokens={task.req.max_new_tokens} -> {capped_max_new_tokens}"
+            )
+            task.req.max_new_tokens = capped_max_new_tokens
 
         try:
             instance_id = get_global_args().multi_inst.inst_id

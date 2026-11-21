@@ -149,10 +149,7 @@ class PDRequestRouter(RequestRouter):
         routing_algorithm = getattr(self.config, "routing_algorithm", "")
         if routing_algorithm == "prefix_cache_aware":
             self.prefill_policy = PrefixCacheAwarePolicy(self.config)
-            self.prefill_policy.routing_by_req_len = self.routing_by_req_len
         elif routing_algorithm in ("round_robin", "power_of_two_choices"):
-            if self.routing_by_req_len:
-                raise ValueError("LoadBalancer do not supports routing_by_req_len")
             self.prefill_policy = LoadBalancer(self.config)
             self.prefill_policy.algorithm = routing_algorithm
         else:
@@ -171,10 +168,7 @@ class PDRequestRouter(RequestRouter):
                 "requires infer.enable_prefix_caching=true"
             )
             self.decode_policy = PrefixCacheAwarePolicy(self.config)
-            self.decode_policy.routing_by_req_len = self.decode_routing_by_req_len
         elif decode_algorithm in ("round_robin", "power_of_two_choices"):
-            if self.decode_routing_by_req_len:
-                raise ValueError("LoadBalancer do not supports routing_by_req_len")
             self.decode_policy = LoadBalancer(self.config)
             self.decode_policy.algorithm = decode_algorithm
         else:

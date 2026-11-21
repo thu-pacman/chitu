@@ -84,6 +84,7 @@ def create_client(monkeypatch):
             multi_inst=SimpleNamespace(n_insts=1),
             infer=SimpleNamespace(max_seq_len=4096),
             debug=SimpleNamespace(save_trace_dir=None),
+            serve=SimpleNamespace(default_max_new_tokens=1024),
         ),
     )
     monkeypatch.setattr(
