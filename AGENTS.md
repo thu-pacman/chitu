@@ -9,7 +9,24 @@ This is the Chitu repo. Chitu is an LLM inference engine. See `README.md` for de
 
 # Coding style rules
 
-When developing this repo, follow the rules below. Before commiting, check your diff against the rules again.
+When developing this repo, follow the rules below. Before committing, check your diff against the rules again.
+
+## Commit and merge request messages are for all developers working on this repo
+
+Readers of commit and merge request messages do not have the chat context between you and your user.
+
+Example: Your user proposed an algorithm, but you found it impossible. After discussion with your user, your user agree to adjust to a new algorithm, and you finally implemented it.
+
+Good merge request message for this example (provide context for readers):
+
+> We have investigated the following algorithms:
+> - Algorithm A: ...
+> - Algorithm B: ...
+> We finally decided to implement Algorithm B because ...
+
+Bad merge request message for this example (readers will confused on what is a "new" algorithm):
+
+> Why the new algorithm: ...
 
 ## Comments are for future developers
 

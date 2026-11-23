@@ -224,7 +224,6 @@ def soft_fp8_blockfp8_gemm_npu(
     *,
     scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ) -> torch.Tensor:
-    expert_tokens = None
     if get_global_args().models.name in ["Qwen3-32B-FP8"]:
         # To adapt the operator, treat the dense model as a 1 expert.
         # scale need torch.float32
@@ -235,6 +234,11 @@ def soft_fp8_blockfp8_gemm_npu(
         # Due to 1 expert, the list of expert_tokens here should be all the lines of the input x.
         expert_tokens = torch.ones([1], device=x.device, dtype=torch.int64)
         expert_tokens.fill_(x.shape[0])
+    else:
+        raise NotImplementedError(
+            f"The NPU soft-FP8 GEMM supports only the Qwen3-32B-FP8 dense-model "
+            f"grouped layout, not model {get_global_args().models.name!r}."
+        )
     scale_off = torch.zeros_like(scale, dtype=torch.float32, device=x.device)
     output = torch.empty(
         [x.shape[0], weight.shape[-1]], dtype=torch.bfloat16, device=x.device

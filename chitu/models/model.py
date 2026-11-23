@@ -88,6 +88,7 @@ from chitu.quantization import (
     get_quant_kwargs_from_checkpoint_prefix,
     get_backend_from_checkpoint_prefix,
 )
+from chitu.quantization.on_load import convert_state_dict_quantization_on_load
 from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.hybrid_device import CPUParameter
 from chitu.native_layout.base import TensorWithNativeLayout
@@ -1293,6 +1294,12 @@ class Transformer(nn.Module):
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                     state_dict, self.pp_stage, self.pp_size
                 )
+            # Quantization-on-load runs after EP/PP chunking (so each rank converts
+            # only its local tensors) and before TP chunking (so scales are computed
+            # on full-TP weights, like a natively quantized checkpoint).
+            state_dict = convert_state_dict_quantization_on_load(
+                state_dict, self.params.quant_config.rules
+            )
             if self.tp_size > 1:
                 # QKV and gate/up layers might already be merged in the checkpoint, but they should be split
                 # for TP. After we process for TP, we merge them back.
@@ -1753,10 +1760,13 @@ class Transformer(nn.Module):
         if self.do_decode_callable_mtp is None:
             self._init_mtp_draft_callable(bs, tokens)
         if isinstance(self.cache_dict["main"], DenseKVCache):
-            key_mtp = (
-                bs,
-                self.cache_dict["main"].get_start_and_end_idx()[0],
-            ) + ("mtp",)
+            cache = self.cache_dict["main"]
+            start_slot = (
+                cache.req2slot[tasks.output_task_ids[0]]
+                if tasks.task_type == TaskType.Prefill
+                else cache.get_start_and_end_idx()[0]
+            )
+            key_mtp = (bs, start_slot, "mtp")
         elif isinstance(self.cache_dict["main"], PagedKVCache):
             key_mtp = (bs, get_global_args().infer.num_blocks) + ("mtp",)
         else:

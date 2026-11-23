@@ -2000,10 +2000,10 @@ class Executor:
             cast(torch.Tensor, payload), cast(Optional[PackedTasks], self.ctx.tasks)
         )
 
-    def _prepare_accept_indices(self, tasks, is_draft_prepare=False) -> list[int]:
+    def _prepare_accept_indices(self, tasks, is_draft_prepare=False) -> None:
         indices = None
         if self.is_dp_rank or self.is_sample_rank:
-            indices = [task.mtp_accept_index for task in tasks.tasks]
+            indices = [task.mtp_accept_index for task in tasks.output_tasks]
         if is_draft_prepare:
             # Only the last stage runs the draft path (postprocess_generate_draft);
             # no upstream stage sends accept indices during it, so never recv here.
@@ -2019,7 +2019,7 @@ class Executor:
             # skip last stage cache update if not in draft path
             return
         for cache in Backend.cache_dict.values():
-            cache.update_mtp_cache_accept(tasks, indices)
+            cache.update_mtp_cache_accept(tasks.output_task_ids, indices)
 
     def postprocess_generate_draft(self) -> None:
         """Run the MTP draft model for the tasks sampled in a previous step."""
@@ -2036,6 +2036,8 @@ class Executor:
         # must still join the other ranks' draft collectives.
         if tasks is None or tasks.is_empty_tasks():
             return
+        draft_task_ids = tasks.output_task_ids
+        num_draft_tasks = len(draft_task_ids)
 
         # The draft below replays the MTP layer, and that replay runs the MoE, so the dispatcher has
         # to be prepared for the rows this draft will use. It sits above the empty/non-empty split
@@ -2044,16 +2046,19 @@ class Executor:
         # previous real step's sizing and the next real step would dispatch with stale state.
         with step_timer("draft.moe_prepare"):
             if Backend.model.moe_impl is not None:
-                Backend.model.moe_impl.prepare(
-                    TaskType.Decode, len(tasks.output_task_ids)
-                )
+                Backend.model.moe_impl.prepare(TaskType.Decode, num_draft_tasks)
 
-        if len(tasks.output_task_ids) == 0:
+        if num_draft_tasks == 0:
             Backend.model.draft(
                 tasks, torch.empty(0, dtype=torch.int64, device=self.device)
             )
             return
 
+        if num_draft_tasks != tasks.num_tasks:
+            # Sampling already uses only the completed prefill rows. Rebind the
+            # cache metadata to those same rows before reading their hidden states.
+            for cache in Backend.cache_dict.values():
+                cache.prepare_cache_draft(draft_task_ids)
         self._prepare_accept_indices(tasks, is_draft_prepare=True)
 
         # Anchor tokens (last accepted token per task) for the next draft.
@@ -2068,7 +2073,7 @@ class Executor:
             else:
                 last_tokens = [
                     (task.next_tokens[0] if task.next_tokens else 0)
-                    for task in tasks.tasks
+                    for task in tasks.output_tasks
                 ]
         for dispatcher in self.tensor_broadcast_dispatchers:
             last_tokens = dispatcher.broadcast_data(last_tokens)

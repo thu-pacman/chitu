@@ -60,6 +60,7 @@ from chitu.ops import (
     hadamard_transform,
     topk_page_table_decode_cuda,
     a8_per_token_act_quant,
+    mla_kv_pack,
 )
 from chitu.dsa_indexer_backend import DSAIndexer
 from chitu.quantization import (
@@ -988,37 +989,23 @@ class AttentionDeepSeekV3(Attention):
         )
 
     def _expand_latent_kv_to_full_kv(
-        self,
-        kv_lora: torch.Tensor,
-        k_pe: torch.Tensor,
-        n_tokens: int,
-        *,
-        normalize: bool,
+        self, latent: torch.Tensor, n_tokens: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        k_pe = self._as_plain_tensor(k_pe)
-        if normalize:
-            # In-place normalize kv_lora; since kv_lora is a view into the latent
-            # KV tensor, this also updates the compressed tensor stored by
-            # absorb-kv-only.
-            self.kv_a_layernorm(kv_lora, compute_dtype=kv_lora.dtype, out=kv_lora)
-
-        kv_full = self.kv_b_proj(kv_lora.contiguous())
-        kv_full = kv_full.view(
+        """K [n, heads, nope + rope] and V [n, heads, v] from the normalized latent
+        [kv_lora | k_pe] of n tokens (any row stride)."""
+        latent = latent.reshape(n_tokens, self.kv_lora_rank + self.qk_rope_head_dim)
+        kv_lora, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_full = self.kv_b_proj(kv_lora.contiguous()).view(
             n_tokens, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
         )
-        k_nope, v = torch.split(
-            kv_full, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        return mla_kv_pack(
+            kv_full,
+            k_pe,
+            self.n_local_heads,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
         )
-        k = torch.cat(
-            [
-                k_nope,
-                k_pe.view(n_tokens, 1, self.qk_rope_head_dim).expand(
-                    -1, self.n_local_heads, -1
-                ),
-            ],
-            dim=-1,
-        )
-        return k, v.contiguous()
 
     def _forward_reconstruct_prefill(
         self,
@@ -1037,19 +1024,16 @@ class AttentionDeepSeekV3(Attention):
         seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
         attn_input = x
 
-        # Build full Q/K/V and normalized latent KV for absorb-kv-only prefill.
         n_tokens = x.size(0)
-        q, kv, _, _, kv_lora, k_pe, _, _, _ = self._project_mla_q_latent_kv(
+        q, kv, _, _, kv_lora, _, _, _, _ = self._project_mla_q_latent_kv(
             x, freqs_cis, n_tokens
         )
         q = self._as_plain_tensor(q)
         kv_compressed = self._as_plain_tensor(kv)
-        k_chunk, v_chunk = self._expand_latent_kv_to_full_kv(
-            kv_lora, k_pe, n_tokens, normalize=True
-        )
-
-        k_chunk = k_chunk.contiguous()
-        v_chunk = v_chunk.contiguous()
+        # kv_lora is a view into kv_compressed. Normalizing in place also
+        # normalizes the latent appended to the KV cache below, so this must
+        # run before the append.
+        self.kv_a_layernorm(kv_lora, compute_dtype=kv_lora.dtype, out=kv_lora)
 
         kv_cache_accessor = self.cache.get_accessor(self.layer_id, is_mtp)
         if "kv_lora_k_pe" in kv_cache_accessor.kv:
@@ -1089,8 +1073,7 @@ class AttentionDeepSeekV3(Attention):
             )
 
         if seq_len_delta.is_first_prefill_chunk:
-            k_attn = k_chunk
-            v_attn = v_chunk
+            latent_full, total_len = kv_compressed, n_tokens
         else:
             new_pos = seq_len_delta.new.position_ids_tensor_device
             new_seq = seq_len_delta.new.seq_ids_tensor_device
@@ -1101,8 +1084,9 @@ class AttentionDeepSeekV3(Attention):
                     new_pos,
                     new_seq,
                 )
-                kv_lora_full = latent_full[..., : self.kv_lora_rank]
-                k_pe_full = latent_full[..., self.kv_lora_rank :]
+                total_len = latent_full.shape[0]
+                if latent_full.dtype == torch.float8_e5m2:
+                    latent_full = latent_full.to(torch.bfloat16)
             else:
                 kv_lora_full = read_from_paged_kv_cache(
                     kv_cache_accessor.kv["kv_lora"],
@@ -1116,20 +1100,17 @@ class AttentionDeepSeekV3(Attention):
                     new_pos,
                     new_seq,
                 )
-
-            total_len = kv_lora_full.shape[0]
-            if kv_lora_full.dtype == torch.float8_e5m2:
-                kv_lora_full = kv_lora_full.to(torch.bfloat16)
-            if k_pe_full.dtype == torch.float8_e5m2:
-                k_pe_full = k_pe_full.to(torch.bfloat16)
-            kv_lora_full = kv_lora_full.view(total_len, self.kv_lora_rank).contiguous()
-            k_attn, v_attn = self._expand_latent_kv_to_full_kv(
-                kv_lora_full,
-                k_pe_full,
-                total_len,
-                normalize=False,
-            )
-
+                total_len = kv_lora_full.shape[0]
+                latent_full = torch.cat(
+                    [
+                        (
+                            t.to(torch.bfloat16) if t.dtype == torch.float8_e5m2 else t
+                        ).view(total_len, -1)
+                        for t in (kv_lora_full, k_pe_full)
+                    ],
+                    dim=-1,
+                )
+        k_attn, v_attn = self._expand_latent_kv_to_full_kv(latent_full, total_len)
         x = self.attn_backend.prefill_ragged_qkvo(
             q,
             k_attn,
@@ -1264,8 +1245,10 @@ class AttentionDeepSeekV3(Attention):
                 assert not cp_active
 
                 q = self._as_plain_tensor(q)
+                # KV layernorm
+                self.kv_a_layernorm(kv_lora, compute_dtype=kv_lora.dtype, out=kv_lora)
                 k, v = self._expand_latent_kv_to_full_kv(
-                    kv_lora, k_pe, n_tokens, normalize=True
+                    self._as_plain_tensor(kv), n_tokens
                 )
 
                 if has_indexer_weights:
@@ -2554,17 +2537,12 @@ class TransformerDeepSeekV3(Transformer):
                         new_q_b_proj_scale_2.view(1, 1)
                     )
                 elif quant in ["blockfp8", "q4km"]:
-                    # FIXME: Support soft fp8 in blockfp8_weight_quant
+                    # `blockfp8_weight_quant` dispatches to its soft-FP8
+                    # implementation on platforms that store FP8 payloads as raw
+                    # uint8, so the quantized tensors are storable everywhere.
                     new_q_b_proj, new_q_b_proj_scale = blockfp8_weight_quant(
                         new_q_b_proj, scale_block_shape=[block_size, block_size]
                     )
-                    if (
-                        parse_dtype(
-                            get_global_args().infer.raise_lower_bit_float_to
-                        ).itemsize
-                        > 1
-                    ):
-                        new_q_b_proj = new_q_b_proj.view(dtype=torch.uint8)
                     checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
                     checkpoint[prefix + "q_b_proj.scale"] = new_q_b_proj_scale
                 else:
@@ -2629,17 +2607,12 @@ class TransformerDeepSeekV3(Transformer):
                 if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     checkpoint[prefix + "o_proj.weight"] = new_o_proj
                 elif quant in ["blockfp8", "q4km"]:
-                    # FIXME: Support soft fp8 in blockfp8_weight_quant
+                    # `blockfp8_weight_quant` dispatches to its soft-FP8
+                    # implementation on platforms that store FP8 payloads as raw
+                    # uint8, so the quantized tensors are storable everywhere.
                     new_o_proj, new_o_proj_scale = blockfp8_weight_quant(
                         new_o_proj, scale_block_shape=[block_size, block_size]
                     )
-                    if (
-                        parse_dtype(
-                            get_global_args().infer.raise_lower_bit_float_to
-                        ).itemsize
-                        > 1
-                    ):
-                        new_o_proj = new_o_proj.view(dtype=torch.uint8)
                     checkpoint[prefix + "o_proj.weight"] = new_o_proj
                     checkpoint[prefix + "o_proj.scale"] = new_o_proj_scale
                 elif quant in ["blockfp4"]:
@@ -2678,6 +2651,16 @@ class TransformerDeepSeekV3(Transformer):
 
         return checkpoint
 
+    def can_use_mla_prologue_int8(self, layer_id: int) -> bool:
+        """Whether the layer's attention uses MLA prologue int8.
+
+        DeepSeek-V3 family models are homogeneous MLA stacks: every layer's
+        ``self_attn`` is an ``AttentionDeepSeekV3``.
+        """
+        attn = getattr(self.layers[layer_id], "self_attn")
+        assert isinstance(attn, AttentionDeepSeekV3)
+        return attn.mla_prologue_int8_partial or attn.mla_prologue_int8_full
+
     @override
     def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
         def enable_callback(checkpoint_prefix: str | CheckpointPrefix):
@@ -2688,14 +2671,7 @@ class TransformerDeepSeekV3(Transformer):
             )
             return QuantizationRegistry.allowed_merge_qkv(
                 checkpoint_prefix,
-                (
-                    (
-                        self.layers[layer_id].self_attn.mla_prologue_int8_partial
-                        or self.layers[layer_id].self_attn.mla_prologue_int8_full
-                    )
-                    if layer_id > -1
-                    else False
-                ),
+                (self.can_use_mla_prologue_int8(layer_id) if layer_id > -1 else False),
             )
 
         if not hasattr(self.params, "index_topk"):

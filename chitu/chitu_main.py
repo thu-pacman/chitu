@@ -1175,7 +1175,9 @@ def _warmup_backend_direct(
             curr_bs = local_max_bs - i * bs_descend
             curr_req_ids = req_ids[:curr_bs]
 
-            cur_tasks = PackedTasksBase(curr_bs, task_ids=curr_req_ids)
+            cur_tasks = PackedTasksBase(
+                curr_bs, task_ids=curr_req_ids, has_outputs=[True] * curr_bs
+            )
             cur_tasks.task_type = TaskType.Decode
             cur_tasks.num_tokens = curr_bs
             cur_tasks.new_cache_ids_list = []

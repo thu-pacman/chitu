@@ -31,6 +31,7 @@ from chitu.ops.quant.blockfp8.matmul import blockfp8_gemm_wants_packed_ue8m0_sca
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
 from chitu.utils import parse_dtype
 from chitu.blockfp8_shape import (
+    DEFAULT_ROUND_SCALE_TO_POW2,
     DEFAULT_SCALE_BLOCK_SHAPE,
     blockfp8_scale_dtype,
     blockfp8_scale_shape,
@@ -216,7 +217,7 @@ class Blockfp8Linear(QuantizedLinearBase):
         ############################################
         # Parameters specific to this quantization
         bias_dtype=None,
-        round_scale_to_pow2: bool = False,
+        round_scale_to_pow2: bool = DEFAULT_ROUND_SCALE_TO_POW2,
         scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     ):
         """
@@ -357,133 +358,6 @@ class Blockfp8LinearDeepGemm(NativeLayoutMixin, Blockfp8Linear):
             round_scale_to_pow2=self.round_scale_to_pow2,
             scale_block_shape=self.scale_block_shape,
             # TODO: Call deep_gemm implementation only. No dispatching
-        )
-
-
-@QuantizationRegistry.register_linear("blockfp8_from_bf16")
-class Blockfp8LinearQuantizedFromBf16(QuantizedLinearBase):
-    """Block-FP8 linear whose checkpoint weight is BF16 and quantized at load.
-
-    Select ``type: blockfp8_from_bf16`` in a quantization rule for the target
-    linear layer. Already quantized checkpoint weights use ``type: blockfp8``.
-
-    The regular loader consumes the BF16 checkpoint parameter; a load hook
-    then converts it to block-FP8 and releases the BF16 storage. Platforms
-    configured to raise FP8 to BF16 keep the BF16 weight.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        has_bias: bool = False,
-        *,
-        bias_dtype=None,
-        round_scale_to_pow2: bool = True,
-        scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
-    ):
-        super().__init__(in_features, out_features, has_bias)
-
-        if list(scale_block_shape) != list(DEFAULT_SCALE_BLOCK_SHAPE):
-            raise ValueError("blockfp8_from_bf16 requires 128x128 block-FP8 scales")
-        self.round_scale_to_pow2 = round_scale_to_pow2
-        self.scale_block_shape = list(scale_block_shape)
-
-        self.register_parameter(
-            "weight",
-            torch.nn.Parameter(
-                torch.empty(
-                    (out_features, in_features), dtype=torch.get_default_dtype()
-                ),
-                requires_grad=False,
-            ),
-        )
-        if has_bias:
-            self.register_parameter(
-                "bias",
-                torch.nn.Parameter(
-                    torch.empty(out_features, dtype=bias_dtype), requires_grad=False
-                ),
-            )
-        else:
-            self.register_parameter("bias", None)
-
-        # Runtime (non-checkpoint) tensors. Registered as non-persistent buffers
-        # so `module.to(device)` moves them and `state_dict()` ignores them.
-        self.register_buffer("_fp8_weight", None, persistent=False)
-        self.register_buffer("_fp8_scale", None, persistent=False)
-        self.register_buffer("_deepgemm_scale", None, persistent=False)
-
-        self.register_load_state_dict_post_hook(self._quantize_loaded_bf16_weight)
-
-    @staticmethod
-    def _quantize_loaded_bf16_weight(module, incompatible_keys):
-        """Quantize right after the checkpoint tensor lands, to free the BF16 copy.
-
-        The backend loads uninitialized placeholder parameters before the real
-        checkpoint (`Backend._create_empty_module`, `debug.skip_model_load`), and
-        both fire this hook; those placeholders are on CPU or "meta" while the
-        real load with ``gpu_preprocess=True`` copies into the CUDA parameter.
-        Anything else (CPU checkpoints, `assign=True` loads) is quantized lazily
-        on the first forward instead, after the model reaches the device.
-        """
-        if not _blockfp8_hard_fp8_compute_available():
-            return
-        if module.weight.numel() == 0:
-            return  # Already quantized by an earlier `load_state_dict` pass.
-        if not module.weight.is_cuda:
-            return  # Placeholder, or a CPU checkpoint not yet moved to the device.
-        module.quantize_weight_now()
-
-    @torch.no_grad()
-    def quantize_weight_now(self) -> None:
-        """Replace the BF16 checkpoint weight with block-FP8 weight + scales."""
-        from chitu.ops.quant.blockfp8.convert import blockfp8_weight_quant
-
-        weight, scale = blockfp8_weight_quant(
-            self.weight.data,
-            scale_block_shape=self.scale_block_shape,
-            round_scale_to_pow2=True,
-        )
-        self._fp8_weight = weight
-        self._fp8_scale = scale
-        self._deepgemm_scale = None
-        if blockfp8_gemm_wants_packed_ue8m0_scale(
-            round_scale_to_pow2=self.round_scale_to_pow2,
-            scale_block_shape=self.scale_block_shape,
-        ):
-            self._deepgemm_scale = DeepGemmScale.convert_from(
-                scale,
-                mn=self.out_features,
-                k=self.in_features,
-                disable_ue8m0_cast=False,
-            ).layout_tensor
-        # Release the checkpoint storage after the runtime weight is ready.
-        self.weight.data = self.weight.data.new_empty((0, self.in_features))
-
-    @torch.no_grad()
-    def forward(self, x) -> torch.Tensor:
-        if not _blockfp8_hard_fp8_compute_available():
-            return linear(x, self.weight, self.bias)
-        if self._fp8_weight is None:
-            # The load hook did not run (CPU checkpoint moved to the device
-            # afterwards, weights assigned directly in tests, ...). Quantize now;
-            # never inside a CUDA graph, whose private pool would own the result.
-            assert (
-                not torch.cuda.is_current_stream_capturing()
-            ), "lm_head FP8 quantization must happen before CUDA-graph capture"
-            self.quantize_weight_now()
-        return linear_blockfp8(
-            x,
-            self._fp8_weight,
-            (
-                self._deepgemm_scale
-                if self._deepgemm_scale is not None
-                else self._fp8_scale
-            ),
-            self.bias,
-            round_scale_to_pow2=self.round_scale_to_pow2,
-            scale_block_shape=self.scale_block_shape,
         )
 
 
@@ -771,7 +645,7 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
         checkpoint_prefix: str | CheckpointPrefix,
         ############################################
         # Parameters specific to this quantization
-        round_scale_to_pow2: bool = False,
+        round_scale_to_pow2: bool = DEFAULT_ROUND_SCALE_TO_POW2,
         scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     ):
         super().__init__(
@@ -915,7 +789,7 @@ class Blockfp8MoeExpertsMerged(NativeLayoutMixin, QuantizedMoeExpertsMerged):
         checkpoint_prefix: str | CheckpointPrefix,
         ############################################
         # Parameters specific to this quantization
-        round_scale_to_pow2: bool = False,
+        round_scale_to_pow2: bool = DEFAULT_ROUND_SCALE_TO_POW2,
         scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     ):
         super().__init__(
@@ -1275,7 +1149,7 @@ class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
         ############################################
         # Parameters specific to this quantization
         scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
-        round_scale_to_pow2: bool = False,
+        round_scale_to_pow2: bool = DEFAULT_ROUND_SCALE_TO_POW2,
     ):
         super().__init__(n_heads, in_features_per_head, out_features_per_head)
 

@@ -612,44 +612,6 @@ def test_blockfp8_packed_scales(shape):
         assert packed.stride() == expected_scale.stride()
 
 
-def test_blockfp8_linear_quantized_on_load():
-    from chitu.device_type import is_nvidia
-    from chitu.quantization.registry import QuantizationRegistry
-
-    if not is_nvidia() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("This test requires SM100")
-    pytest.importorskip("deep_gemm")
-    set_global_args(
-        OmegaConf.create(
-            {
-                "infer": {
-                    "raise_lower_bit_float_to": "float8_e4m3fn",
-                    "op_impl": "auto",
-                },
-                "models": {
-                    "quant_config": {
-                        "rules": [{"regex": "lm_head", "type": "blockfp8_from_bf16"}]
-                    },
-                    "backend_config": {"rules": []},
-                },
-            }
-        ),
-        need_ensure=False,
-        need_preprocess=False,
-    )
-    torch.set_default_dtype(torch.bfloat16)
-    cls = QuantizationRegistry.get_quantized_linear_class_from_global_args(
-        checkpoint_prefix="lm_head"
-    )
-    layer = cls(512, 256, False).cuda()
-    weight = torch.randn(256, 512, device="cuda") * 0.02
-    layer.load_state_dict({"weight": weight})
-    x = torch.randn(3, 512, device="cuda")
-    expected = torch.nn.functional.linear(x, weight).float()
-    assert layer.weight.numel() == 0
-    assert (layer(x).float() - expected).norm() / expected.norm() < 0.05
-
-
 @pytest.mark.parametrize("round_scale_to_pow2", [False, True])
 def test_blockfp8_weight_quant_rounding(round_scale_to_pow2):
     from chitu.ops.quant import blockfp8_weight_quant
@@ -672,3 +634,67 @@ def test_blockfp8_weight_quant_rounding(round_scale_to_pow2):
     )
     torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
     assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+
+
+@pytest.mark.parametrize("round_scale_to_pow2", [False, True])
+def test_soft_fp8_weight_quant_matches_torch_impl(round_scale_to_pow2):
+    # The soft-FP8 quantization is a drop-in replacement for the float8-dtype
+    # implementation: the payload bytes must match bit for bit. The crafted block
+    # pins the scale (amax = 1.0) so its values hit exact rounding ties, subnormals
+    # and negative zero after the division; the other blocks add broad value
+    # coverage, including a zero block. Runs on CPU, so platforms without FP8
+    # hardware execute it too.
+    from chitu.ops.quant import blockfp8_weight_quant
+
+    torch.manual_seed(0)
+    crafted = torch.zeros(128, 128)
+    crafted[0, 0] = 1.0  # Block amax -> scale 1.0 with round_scale_to_pow2=False
+    crafted[0, 1] = 0.78125  # 1.5625 * 2^-1: mantissa rounding tie -> nearest even
+    crafted[0, 2] = -0.78125
+    crafted[0, 3] = 0.0087890625  # 4.5 * 2^-9: subnormal tie -> nearest even
+    crafted[0, 4] = 0.01  # 5.12 * 2^-9: subnormal
+    crafted[0, 5] = -0.0  # Negative zero
+    w = torch.zeros(512, 128)
+    w[:128] = crafted
+    w[128:256] = torch.randn(128, 128) * 0.05
+    w[256:384] = torch.randn(128, 128) * 1e-6
+    # w[384:512] stays zero: a zero block uses scale 1.
+
+    torch_q, torch_scale = blockfp8_weight_quant(
+        w, round_scale_to_pow2=round_scale_to_pow2, impl="torch"
+    )
+    soft_q, soft_scale = blockfp8_weight_quant(
+        w, round_scale_to_pow2=round_scale_to_pow2, impl="soft_torch"
+    )
+
+    assert soft_q.dtype == torch.uint8
+    assert torch.equal(soft_q, torch_q.view(torch.uint8))
+    assert torch.equal(soft_scale, torch_scale)
+
+
+def test_blockfp8_weight_quant_auto_selects_impl_by_raise_lower_bit_float_to():
+    # `raise_lower_bit_float_to` larger than one byte declares that the platform
+    # cannot run FP8 compute, so the payload is produced as raw uint8 bytes (soft
+    # FP8) - mirroring `blockfp8_weight_dequant`'s auto selection. Runs on CPU, so
+    # platforms without FP8 hardware execute it too.
+    from chitu.ops.quant import blockfp8_weight_quant
+
+    w = torch.randn(128, 256, dtype=torch.bfloat16) * 0.02
+
+    set_global_args(
+        OmegaConf.create({"infer": {"raise_lower_bit_float_to": "bfloat16"}}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    with AssertOpCalled("blockfp8_weight_quant", "soft_torch"):
+        soft_q, _ = blockfp8_weight_quant(w)
+    assert soft_q.dtype == torch.uint8
+
+    set_global_args(
+        OmegaConf.create({"infer": {"raise_lower_bit_float_to": "float8_e4m3fn"}}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    with AssertOpCalled("blockfp8_weight_quant", "torch"):
+        torch_q, _ = blockfp8_weight_quant(w)
+    assert torch_q.dtype == torch.float8_e4m3fn
