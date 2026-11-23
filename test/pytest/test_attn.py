@@ -4114,6 +4114,7 @@ def test_reconstruct_prefill_matches_full_kv_attention(chunk_lens):
                 },
                 "dtype": "float32",
                 "use_float32_rotary": False,
+                "skip_preprocess": False,
             }
         ),
         need_ensure=False,
@@ -4187,6 +4188,15 @@ def test_reconstruct_prefill_matches_full_kv_attention(chunk_lens):
                 param.fill_(1.0)
             else:
                 torch.nn.init.normal_(param, mean=0.0, std=0.02)
+        # The checkpoint's kv_b_proj weight, loaded like a checkpoint so it goes
+        # through its native layout.
+        kv_b_proj_weight = (
+            torch.randn(
+                n_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank, device=device
+            )
+            * 0.02
+        )
+        attn.kv_b_proj.load_state_dict({"weight": kv_b_proj_weight})
 
     all_x = torch.randn(max_seq_len, dim, device=device)
     all_freqs = BatchedFreqsCis(
@@ -4220,8 +4230,14 @@ def test_reconstruct_prefill_matches_full_kv_attention(chunk_lens):
             x, freqs_cis, n_tokens
         )
         q = attn._as_plain_tensor(q)
-        k, v = attn._expand_latent_kv_to_full_kv(
-            kv_lora, k_pe, n_tokens, normalize=True
+        attn.kv_a_layernorm(kv_lora, compute_dtype=kv_lora.dtype, out=kv_lora)
+        k_nope, v = (
+            (kv_lora.reshape(n_tokens, -1) @ kv_b_proj_weight.t())
+            .view(n_tokens, n_heads, qk_nope_head_dim + v_head_dim)
+            .split([qk_nope_head_dim, v_head_dim], dim=-1)
+        )
+        k = torch.cat(
+            [k_nope, k_pe.reshape(n_tokens, 1, -1).expand(-1, n_heads, -1)], dim=-1
         )
         ref = attn_backend.prefill_ragged_qo_paged_kv(
             q,
@@ -4239,6 +4255,55 @@ def test_reconstruct_prefill_matches_full_kv_attention(chunk_lens):
         assert_close(out, ref, atol=1e-4, rtol=1e-4)
         prev_len = new_len
     torch.set_default_dtype(prev_default_dtype)
+
+
+def test_mla_kv_pack_matches_cat():
+    """Every mla_kv_pack implementation builds the same K and V as torch.cat,
+    for token counts below and above BLOCK_N, power-of-2 and non-power-of-2
+    head dims, and a strided k_pe input."""
+    if not torch.cuda.is_available():
+        pytest.skip("mla_kv_pack requires CUDA")
+    from chitu.ops import mla_kv_pack
+
+    torch.manual_seed(0)
+    impls = ["torch", "auto"]
+    if has_triton:
+        impls.append("triton")
+
+    def _check(nope, rope, v_dim, n_heads, kv_full, k_pe, impl):
+        k, v = mla_kv_pack(kv_full, k_pe, n_heads, nope, rope, v_dim, impl=impl)
+        ref_k = torch.cat(
+            [
+                kv_full[..., :nope],
+                k_pe.view(kv_full.shape[0], 1, rope).expand(-1, n_heads, -1),
+            ],
+            dim=-1,
+        )
+        assert k.shape == ref_k.shape
+        assert k.is_contiguous()
+        assert torch.equal(k, ref_k)
+        assert torch.equal(v, kv_full[..., nope:])
+
+    # 128/64/128 is DeepSeek/Kimi-K3; 192/64/256 is GLM-4.7-Flash.
+    for nope, rope, v_dim in [(128, 64, 128), (192, 64, 256)]:
+        n_heads = 3
+        for n_tokens in [1, 5, 128, 130, 1000]:
+            kv_full = torch.randn(
+                n_tokens, n_heads, nope + v_dim, dtype=torch.bfloat16, device="cuda"
+            )
+            k_pe = torch.randn(n_tokens, rope, dtype=torch.bfloat16, device="cuda")
+            for impl in impls:
+                _check(nope, rope, v_dim, n_heads, kv_full, k_pe, impl)
+
+    # k_pe as a view into a wider buffer (row stride > rope).
+    nope, rope, v_dim, n_heads, n_tokens = 128, 64, 128, 3, 130
+    kv_full = torch.randn(
+        n_tokens, n_heads, nope + v_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    k_pe_wide = torch.randn(n_tokens, rope * 2, dtype=torch.bfloat16, device="cuda")
+    k_pe = k_pe_wide[:, :rope]
+    for impl in impls:
+        _check(nope, rope, v_dim, n_heads, kv_full, k_pe, impl)
 
 
 # ===========================================================================

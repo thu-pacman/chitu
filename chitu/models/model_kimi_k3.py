@@ -1609,6 +1609,13 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
         )
 
     @override
+    def can_use_mla_prologue_int8(self, layer_id: int) -> bool:
+        # Hybrid stack: linear-attention layers have no MLA prologue.
+        if not isinstance(self.layers[layer_id].self_attn, AttentionDeepSeekV3):
+            return False
+        return super().can_use_mla_prologue_int8(layer_id)
+
+    @override
     def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
         # Merge the (TP-sharded) KDA projections into in_proj_qkvgbf_a:
         # per-rank layout = [q|k|v (sharded), g (sharded), f_a (full), b (sharded)],
