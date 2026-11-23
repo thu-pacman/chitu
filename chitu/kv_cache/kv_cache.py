@@ -593,12 +593,15 @@ class KVCacheBase:
             self.tid_to_cached_len[tid] += self.mtp_size
 
     def update_mtp_cache_accept(
-        self, tasks: "PackedTasksBase", mtp_accept_indices: list[int]
+        self, task_ids: Sequence[str], mtp_accept_indices: list[int]
     ):
-        for tid, accept_index in zip(tasks.task_ids, mtp_accept_indices):
+        for tid, accept_index in zip(task_ids, mtp_accept_indices):
             if accept_index >= 0:
                 assert tid in self.tid_to_cached_len
                 self.tid_to_cached_len[tid] += -self.mtp_size + accept_index + 1
+
+    def prepare_cache_draft(self, task_ids: list[str]) -> None:
+        self.curr_tids = task_ids
 
     def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):
         """
@@ -616,9 +619,12 @@ class KVCacheBase:
         if state_of(self).prepare_mtp_cache_decode(tasks, draft_offset):
             return
 
+        old_lens = [
+            self.tid_to_cached_len[tid] + draft_offset - 1
+            for tid in tasks.output_task_ids
+        ]
         self.mtp_seq_len_delta.copy_from_list(
-            [self.tid_to_cached_len[tid] + draft_offset - 1 for tid in tasks.task_ids],
-            [self.tid_to_cached_len[tid] + draft_offset for tid in tasks.task_ids],
+            old_lens, [length + 1 for length in old_lens]
         )
         self.mtp_seq_len_delta.is_decode_stage = True
         self.update_page_offs()
@@ -1099,6 +1105,11 @@ class PagedKVCache(KVCacheBase):
             self._update_block_table_from_scheduler(tasks, incremental=True)
 
     @override
+    def prepare_cache_draft(self, task_ids: list[str]) -> None:
+        super().prepare_cache_draft(task_ids)
+        self._upd_gpu_block_table(task_ids)
+
+    @override
     def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):
         """Prepare the MTP draft position, with additional guards on the draft's
         K/V writes compared to the base class.
@@ -1117,7 +1128,7 @@ class PagedKVCache(KVCacheBase):
             # `draft_offset == 1` means the first draft step. We only check on
             # the first step, but for every steps. This is to be compatible
             # with `infer.mtp_draft_single_graph`.
-            for tid in tasks.task_ids:
+            for tid in tasks.output_task_ids:
                 allocated_tokens = (
                     len(self.block_table.get(tid, ())) * self.block_size * self.dcp_size
                 )
@@ -1601,24 +1612,24 @@ class SingletonPagedKVCache(PagedKVCache):
 
     @override
     def update_mtp_cache_accept(
-        self, tasks: "PackedTasksBase", mtp_accept_indices: list[int]
-    ):
-        KVCacheBase.update_mtp_cache_accept(self, tasks, mtp_accept_indices)
+        self, task_ids: Sequence[str], mtp_accept_indices: list[int]
+    ) -> None:
+        KVCacheBase.update_mtp_cache_accept(self, task_ids, mtp_accept_indices)
         # 记下本 step 每个请求的接受长度对应的 in-place block 下标，供 _upd_read_page_ids
         # 用。只能在这里取：部分 rank 上 task.mtp_accept_index 是 -1，真正的值由
         # executor dispatch/broadcast 得到
-        for tid, accept_index in zip(tasks.task_ids, mtp_accept_indices):
+        for tid, accept_index in zip(task_ids, mtp_accept_indices):
             assert -1 <= accept_index < self.mtp_size, (
                 f"tid:{tid}, invalid mtp accept index {accept_index}, "
                 f"expect in [-1, {self.mtp_size - 1}]"
             )
             self.tid_to_accept_index[tid] = accept_index
-        # 应用接受结果后，按 tasks 的顺序重算读取页号，供最后一个 PP stage 继续 draft。
+        # 应用接受结果后，按 task_ids 的顺序重算读取页号，供最后一个 PP stage 继续 draft。
         # PP 切换批次时 curr_tids 尚未刷新，可能指向已释放的上一批请求。
-        if tasks.task_ids:
+        if task_ids:
             self._upd_read_page_ids(
-                tasks.task_ids,
-                [self.tid_to_cached_len.get(tid, 0) for tid in tasks.task_ids],
+                task_ids,
+                [self.tid_to_cached_len.get(tid, 0) for tid in task_ids],
             )
 
     @override
@@ -1649,6 +1660,11 @@ class SingletonPagedKVCache(PagedKVCache):
     # 本类没有基类那种 token → 物理页 的页表（见 init_metadata_buffer），下面这几个接口一律
     # 直接报错，而不是让调用方拿到一个别的东西（比如 ckpt block）当页表/页 id 用：
     has_token_block_table = False
+
+    @override
+    def prepare_cache_draft(self, task_ids: list[str]) -> None:
+        KVCacheBase.prepare_cache_draft(self, task_ids)
+        self._update_write_page_ids(task_ids)
 
     @override
     def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):
@@ -1945,13 +1961,17 @@ class MMPagedKVCache(PagedKVCache):
         pass
 
     @override
+    def prepare_cache_draft(self, task_ids: list[str]) -> None:
+        pass
+
+    @override
     def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):
         self.update_page_offs()
 
     @override
     def update_mtp_cache_accept(
-        self, tasks: "PackedTasksBase", mtp_accept_indices: list[int]
-    ):
+        self, task_ids: Sequence[str], mtp_accept_indices: list[int]
+    ) -> None:
         pass
 
     def free_req_cache_blocks(self, tid: str):
@@ -2120,6 +2140,12 @@ class DenseKVCache(KVCacheBase):
         task_ids = tasks.task_ids
         start_pos = self.get_start_and_end_idx()[0]
         self._prepare_cache(task_ids, start_pos)
+
+    @override
+    def prepare_cache_draft(self, task_ids: list[str]) -> None:
+        super().prepare_cache_draft(task_ids)
+        # The skew scheduler only splits the last request in a prefill batch.
+        self._prepare_cache(task_ids, self.req2slot[task_ids[0]])
 
     def _prepare_cache(self, task_ids: list[str], start_pos: int):
         assert (

@@ -4,6 +4,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -22,8 +23,71 @@ from chitu.models.model_glm5_next import TransformerGLM5Next
 from chitu.models.model_kimi_k3 import TransformerKimiK3
 from chitu.models.model_llada2 import TransformerLLaDA2
 from chitu.moe.impl import MoEImplNoEP
-from chitu.task import PackedTasksBase, SerializedPackedTasksPayloadType, TaskCollector
+from chitu.task import (
+    PackedTasksBase,
+    PackedTasksResult,
+    SerializedPackedTasksPayloadType,
+    TaskCollector,
+)
 from chitu.task_type import TaskType
+
+
+def test_postprocess_generate_draft_selects_completed_prefill_requests(monkeypatch):
+    tasks = PackedTasksBase(
+        num_tasks=2,
+        task_ids=["B", "C"],
+        task_type=TaskType.Prefill,
+        payload_type=SerializedPackedTasksPayloadType.Prefill,
+        tokens=[[1, 2], [3]],
+        prefix_lens=[2, 3],
+        has_outputs=[True, False],
+    )
+    tasks.tasks = [
+        SimpleNamespace(task_id=task_id, mtp_accept_index=-1)
+        for task_id in tasks.task_ids
+    ]
+    tasks.output_tasks = tasks.tasks[:1]
+    tasks.generated_result = PackedTasksResult(tokens=torch.tensor([[42]]))
+    monkeypatch.setattr(TaskCollector, "get_postprocess_tasks", lambda: tasks)
+    monkeypatch.setattr(executor_module, "create_tensor", torch.tensor)
+
+    cache = Mock()
+    model = Mock()
+    model.draft.return_value = (torch.tensor([[43, 44]]), None)
+    monkeypatch.setattr(Backend, "model", model)
+    monkeypatch.setattr(Backend, "cache_dict", {"main": cache})
+
+    executor = object.__new__(Executor)
+    executor.model_type = ModelType.GLM_5_2
+    executor._pd_prefill_only = False
+    executor.mtp_size = 3
+    executor.is_pp_last_stage = True
+    executor.is_dp_rank = False
+    executor.is_sample_rank = True
+    executor.tensor_broadcast_dispatchers = []
+    executor.device = "cpu"
+    executor.sampler = Mock()
+
+    executor.postprocess_generate_draft()
+
+    model.moe_impl.prepare.assert_called_once_with(TaskType.Decode, 1)
+    assert cache.method_calls == [
+        call.prepare_cache_draft(["B"]),
+        call.update_mtp_cache_accept(["B"], [-1]),
+    ]
+    model.draft.assert_called_once()
+    source_tasks, anchors = model.draft.call_args.args
+    assert source_tasks is tasks
+    assert source_tasks.output_task_ids == ["B"]
+    torch.testing.assert_close(anchors, torch.tensor([42]))
+    executor.sampler.update_draft_results.assert_called_once()
+    result_tasks, next_tokens, draft_probs = (
+        executor.sampler.update_draft_results.call_args.args
+    )
+    assert result_tasks is tasks
+    assert tasks.task_ids == ["B", "C"]
+    assert draft_probs is None
+    torch.testing.assert_close(next_tokens, torch.tensor([[42, 43, 44]]))
 
 
 @pytest.mark.parametrize(

@@ -1760,10 +1760,13 @@ class Transformer(nn.Module):
         if self.do_decode_callable_mtp is None:
             self._init_mtp_draft_callable(bs, tokens)
         if isinstance(self.cache_dict["main"], DenseKVCache):
-            key_mtp = (
-                bs,
-                self.cache_dict["main"].get_start_and_end_idx()[0],
-            ) + ("mtp",)
+            cache = self.cache_dict["main"]
+            start_slot = (
+                cache.req2slot[tasks.output_task_ids[0]]
+                if tasks.task_type == TaskType.Prefill
+                else cache.get_start_and_end_idx()[0]
+            )
+            key_mtp = (bs, start_slot, "mtp")
         elif isinstance(self.cache_dict["main"], PagedKVCache):
             key_mtp = (bs, get_global_args().infer.num_blocks) + ("mtp",)
         else:

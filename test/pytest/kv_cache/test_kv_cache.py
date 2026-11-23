@@ -53,6 +53,35 @@ def setup_global_args():
 class TestPagedKVCache:
     """Tests for PagedKVCache class."""
 
+    def test_prepare_mtp_cache_decode_uses_only_prefill_output_rows(self):
+        get_global_args().infer.mtp_size = 3
+        cache = PagedKVCache(
+            GlobalLocalMap.from_range(0, 1),
+            num_hot_req=2,
+            max_seq_len=16,
+            num_blocks=3,
+            shape_per_token_dict={"k": (1,)},
+            block_size=4,
+            device="cpu",
+        )
+        tasks = PackedTasksBase(
+            num_tasks=2,
+            task_ids=["B", "C"],
+            task_type=TaskType.Prefill,
+            tokens=[[1] * 4, [2] * 4],
+            prefix_lens=[4, 8],
+            has_outputs=[True, False],
+            new_cache_ids_list=[{"main": [0, 1]}, {"main": [2]}],
+        )
+        cache.prepare_cache_prefill(tasks)
+        cache.prepare_cache_draft(tasks.output_task_ids)
+
+        for offset in (1, 2):
+            cache.prepare_mtp_cache_decode(tasks, offset)
+            assert cache.mtp_seq_len_delta.old.lens_list == [4 + offset - 1]
+            assert cache.mtp_seq_len_delta.new.lens_list == [4 + offset]
+            assert cache.page_ids_mtp.tolist() == [1]
+
     @pytest.fixture
     def kvcache(self):
         """Create a PagedKVCache instance for testing."""
@@ -432,10 +461,7 @@ class TestSingletonPagedKVCacheLifecycle:
                 )
             )
 
-        tasks = PackedTasksBase(
-            num_tasks=2, task_ids=["b", "a"], task_type=TaskType.Decode
-        )
-        cache.update_mtp_cache_accept(tasks, [0, 2])
+        cache.update_mtp_cache_accept(["b", "a"], [0, 2])
 
         assert cache.tid_to_cached_len["b"] == 64
         assert cache.tid_to_cached_len["a"] == 66

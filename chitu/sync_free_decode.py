@@ -104,11 +104,6 @@ class SyncFreeStep:
     batch: tuple[str, ...]
     """The `task_ids` `inputs` describe: the previous step's batch."""
 
-    tasks: PackedTasksBase
-    """The previous batch whose KV cache is updated using inputs[0].
-    This may differ from the current batch being verified under PP scheduling.
-    """
-
     inputs: tuple[torch.Tensor, torch.Tensor]
     """This step's `(accept indices, anchor row)`, one row per task."""
 
@@ -239,7 +234,6 @@ class SyncFreeDecodeMixin:
         if inputs is not None:
             step = SyncFreeStep(
                 batch=tuple(source.task_ids),
-                tasks=source,
                 inputs=inputs,
                 counts_readback=self._sync_free_queue_counts_readback(inputs[0]),
             )
@@ -326,9 +320,7 @@ class SyncFreeDecodeMixin:
     # ---- base phases using device inputs ----
 
     @override
-    def _prepare_accept_indices(
-        self, tasks, is_draft_prepare=False
-    ) -> Optional[list[int]]:
+    def _prepare_accept_indices(self, tasks, is_draft_prepare=False) -> None:
         """Hand the model its MTP accept indices, from the device when they are there.
 
         The base builds them out of `task.mtp_accept_index` -- a host int, turned into a
@@ -375,7 +367,7 @@ class SyncFreeDecodeMixin:
             # The counts came from the step's inputs, so the step is there too.
             step = self._sync_free_step()
             for cache in Backend.cache_dict.values():
-                cache.update_mtp_cache_accept(step.tasks, counts)
+                cache.update_mtp_cache_accept(step.batch, counts)
         super()._prepare_cache_decode()
         for cache in Backend.cache_dict.values():
             # Cache preparation is complete. Do not reuse this step's device
@@ -470,7 +462,7 @@ class SyncFreeDecodeMixin:
     def _sync_free_take_counts(self) -> Optional[list[int]]:
         """Wait for the previous batch's accept indices and return them as a host list.
 
-        The caller applies these indices to step.tasks. They need not describe the
+        The caller applies these indices to step.batch. They need not describe the
         current batch being verified: PP scheduling can select a different group.
         Return None if this step has no device inputs or no queued readback.
         """
