@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# This file serves a demo of how to do a quantization on engine startup. Currently
+# no model config inherits from this config.
+#
+# A quantized source (`from: <quant>`) can additionally claim its detail arguments
+# with `from_kwargs`, e.g. `from_kwargs: {round_scale_to_pow2: false}` for a blockfp8
+# source. An unquantized source has no detail arguments.
+
+type: blockfp8
+quant:
+- model: '.'
+  rules:
+    - regex : 'mlp\.gate\.'
+      type : null
+    - regex : 'layers\.'
+      from : null  # <- this field sets the source quant: quant in checkpoint file
+      # If needed, set `from_kwargs` for detailed source quant arguments
+      type : blockfp8  # <- this field sets the target quant: quant to run
+      kwargs:  # <- tgus field sets detaild target quant argument
+        round_scale_to_pow2: true

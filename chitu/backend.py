@@ -65,6 +65,7 @@ from chitu.quantization import (
     get_quant_kwargs_from_checkpoint_prefix,
     utils,
 )
+from chitu.quantization.on_load import validate_quant_on_load_rules
 from chitu.tokenizer import (
     ChatFormat,
     ChatFormatHF,
@@ -956,6 +957,15 @@ class Backend:
             model: The model to load parameters into
             args: Configuration with checkpoint settings
         """
+        if any(
+            "from" in rule or "from_kwargs" in rule
+            for rule in args.models.quant_config.rules
+        ):
+            # Fail on unsupported or contradictory conversion rules before reading any
+            # checkpoint tensor, so a misconfiguration surfaces within seconds of
+            # startup.
+            validate_quant_on_load_rules(args.models.quant_config.rules)
+
         if (
             args.models.type == ModelType.DEEPSEEK_V3
             and args.models.quant_config.type

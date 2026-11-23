@@ -8,6 +8,11 @@ from chitu.utils import ceil_div
 
 DEFAULT_SCALE_BLOCK_SHAPE: list[int] = [128, 128]
 
+# Default of the blockfp8 quantization kwarg `round_scale_to_pow2`, shared by the
+# blockfp8 module constructors and the quantization-on-load config resolution, so a
+# quant rule omitting the kwarg means the same thing in both places.
+DEFAULT_ROUND_SCALE_TO_POW2: bool = False
+
 
 def blockfp8_scale_shape(
     out_features: int,

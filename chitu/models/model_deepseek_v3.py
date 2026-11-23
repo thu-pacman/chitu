@@ -2554,17 +2554,12 @@ class TransformerDeepSeekV3(Transformer):
                         new_q_b_proj_scale_2.view(1, 1)
                     )
                 elif quant in ["blockfp8", "q4km"]:
-                    # FIXME: Support soft fp8 in blockfp8_weight_quant
+                    # `blockfp8_weight_quant` dispatches to its soft-FP8
+                    # implementation on platforms that store FP8 payloads as raw
+                    # uint8, so the quantized tensors are storable everywhere.
                     new_q_b_proj, new_q_b_proj_scale = blockfp8_weight_quant(
                         new_q_b_proj, scale_block_shape=[block_size, block_size]
                     )
-                    if (
-                        parse_dtype(
-                            get_global_args().infer.raise_lower_bit_float_to
-                        ).itemsize
-                        > 1
-                    ):
-                        new_q_b_proj = new_q_b_proj.view(dtype=torch.uint8)
                     checkpoint[prefix + "q_b_proj.weight"] = new_q_b_proj
                     checkpoint[prefix + "q_b_proj.scale"] = new_q_b_proj_scale
                 else:
@@ -2629,17 +2624,12 @@ class TransformerDeepSeekV3(Transformer):
                 if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
                     checkpoint[prefix + "o_proj.weight"] = new_o_proj
                 elif quant in ["blockfp8", "q4km"]:
-                    # FIXME: Support soft fp8 in blockfp8_weight_quant
+                    # `blockfp8_weight_quant` dispatches to its soft-FP8
+                    # implementation on platforms that store FP8 payloads as raw
+                    # uint8, so the quantized tensors are storable everywhere.
                     new_o_proj, new_o_proj_scale = blockfp8_weight_quant(
                         new_o_proj, scale_block_shape=[block_size, block_size]
                     )
-                    if (
-                        parse_dtype(
-                            get_global_args().infer.raise_lower_bit_float_to
-                        ).itemsize
-                        > 1
-                    ):
-                        new_o_proj = new_o_proj.view(dtype=torch.uint8)
                     checkpoint[prefix + "o_proj.weight"] = new_o_proj
                     checkpoint[prefix + "o_proj.scale"] = new_o_proj_scale
                 elif quant in ["blockfp4"]:

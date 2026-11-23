@@ -81,6 +81,7 @@ from chitu.quantization import (
     get_quant_from_checkpoint_prefix,
     get_quant_kwargs_from_checkpoint_prefix,
 )
+from chitu.quantization.on_load import convert_state_dict_quantization_on_load
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear, RowParallelLinear
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size, get_etp_size
 from chitu.distributed.partition import compute_expert_dist_in_ep
@@ -3508,6 +3509,15 @@ class TransformerDeepSeekV4(Transformer):
             state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                 state_dict, self.pp_stage, self.pp_size
             )
+        # This override builds the load pipeline itself instead of delegating to
+        # `super().preprocess_state_dict_parallel`, so it must invoke
+        # quantization-on-load itself, at the same position as the base pipeline:
+        # after EP/PP chunking (each rank converts only its local tensors) and
+        # before TP chunking (scales are computed on full-TP weights, like a
+        # natively quantized checkpoint).
+        state_dict = convert_state_dict_quantization_on_load(
+            state_dict, self.params.quant_config.rules
+        )
         if self.tp_size > 1:
             state_dict = self._chunk_checkpoint_for_tensor_parallel(
                 state_dict,

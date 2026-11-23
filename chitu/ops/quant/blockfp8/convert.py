@@ -28,37 +28,104 @@ if has_triton:
     )
 
 
+def _fp32_to_e4m3fn_bytes(x: torch.Tensor) -> torch.Tensor:
+    """Encode FP32 values into FP8 E4M3FN payload bytes (uint8) in pure torch.
+
+    Platforms without FP8 support cannot run ``x.to(torch.float8_e4m3fn)`` on the
+    device, so the soft-FP8 weight quantization computes the payload by bit
+    manipulation instead. The rounding is round-to-nearest-even, and the result
+    is bit-identical to ``x.to(torch.float8_e4m3fn).view(torch.uint8)`` on every
+    input: like torch's conversion, values no finite E4M3FN can represent
+    (non-finite inputs, magnitudes >= 480) map to the NaN encoding 0x7F/0xFF.
+    The weight quantization clamps into the finite range beforehand.
+    """
+    if x.dtype != torch.float32:
+        raise ValueError(f"Expected an FP32 tensor, got {x.dtype}")
+    bits = x.contiguous().view(torch.int32)
+    sign = bits < 0
+    magnitude_bits = bits & 0x7FFFFFFF
+    magnitude = magnitude_bits.view(torch.float32)
+
+    # Normals (|x| >= 2^-6, i.e. FP32 exponent field >= 121): a 4-bit exponent
+    # (bias 7) and a 3-bit mantissa rounded from the FP32 mantissa. Round to
+    # nearest even: increment the mantissa when the first dropped bit is 1 and
+    # either the dropped tail is nonzero or the kept mantissa is odd. The branch
+    # is selected on the exponent field, not a float comparison, so non-finite
+    # values (field 255) take this branch too and the clamp below maps them to
+    # the NaN encoding like torch's conversion.
+    normal = (magnitude_bits >> 23) >= 121
+    exponent = (magnitude_bits >> 23) - 120  # rebias FP32 (127) -> E4M3FN (7)
+    mantissa = (magnitude_bits >> 20) & 0x7
+    round_up = (((magnitude_bits >> 19) & 1) == 1) & (
+        ((magnitude_bits & 0x7FFFF) != 0) | ((mantissa & 1) == 1)
+    )
+    mantissa = mantissa + round_up.to(torch.int32)
+    carry = mantissa == 8
+    exponent = exponent + carry.to(torch.int32)
+    mantissa = torch.where(carry, torch.zeros_like(mantissa), mantissa)
+    normal_payload = (exponent << 3) | mantissa
+
+    # Subnormals (0 <= |x| < 2^-6): m/8 * 2^-6, i.e. steps of 2^-9. `torch.round`
+    # rounds half to even, like the FP32-addition trick in torch's conversion. A
+    # value rounding to 8 is the smallest normal, whose encoding is also 8.
+    subnormal_payload = torch.round(magnitude * 512.0).to(torch.int32).clamp_(max=8)
+
+    payload = torch.where(normal, normal_payload, subnormal_payload)
+    # Exponent overflow (and the garbage from non-finite inputs) makes the
+    # payload >= 0x80, which would collide with the negative-zero encoding once
+    # the sign bit is OR-ed in; clamp to the NaN encoding like torch's conversion.
+    payload = payload.clamp(max=0x7F)
+    return (payload | (sign.to(torch.int32) << 7)).to(torch.uint8)
+
+
 @torch.no_grad()
-def blockfp8_weight_quant(
+def _blockfp8_weight_quant(
     w: torch.Tensor,
-    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+    scale_block_shape: list,
     *,
-    round_scale_to_pow2: bool = False,
-    rows_per_chunk: int = 4096,
+    round_scale_to_pow2: bool,
+    rows_per_chunk: int,
+    soft_fp8: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a 2-D weight into FP8 using square scale blocks.
+    """Shared core of the `blockfp8_weight_quant` implementations.
 
-    By default, each block is normalized by its maximum absolute value.
-    With ``round_scale_to_pow2=True``, use ``amax / 448`` rounded up to a
-    power of two, filling E4M3's range with UE8M0-representable scales.
-    Zero blocks use scale 1. Rows are chunked to bound the FP32 temporary
-    memory when quantizing large checkpoint weights such as the LM head.
-
-    Returns FP8 weights and FP32 scales shaped ``[ceil(n/block), ceil(k/block)]``.
+    With ``soft_fp8=False`` the payload is stored as ``torch.float8_e4m3fn``;
+    with ``soft_fp8=True`` as the same payload bytes in raw uint8, for platforms
+    without float8 support (see `_fp32_to_e4m3fn_bytes`). Everything else is
+    identical between the two.
     """
     out_blk, in_blk = scale_block_shape
     if out_blk != in_blk:
         raise ValueError("blockfp8_weight_quant requires square scale blocks")
-    block = int(out_blk)
-    if w.dim() != 2:
-        raise ValueError(f"Expected a 2-D weight, got shape {tuple(w.shape)}")
+    if w.dim() < 2:
+        raise ValueError(f"Expected a >=2-D weight, got shape {tuple(w.shape)}")
     if w.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(f"Expected a high-precision weight, got {w.dtype}")
 
+    if w.dim() > 2:
+        leading_shape = w.shape[:-2]
+        weights = []
+        scales = []
+        for single in w.reshape(-1, *w.shape[-2:]):
+            single_weight, single_scale = _blockfp8_weight_quant(
+                single,
+                scale_block_shape,
+                round_scale_to_pow2=round_scale_to_pow2,
+                rows_per_chunk=rows_per_chunk,
+                soft_fp8=soft_fp8,
+            )
+            weights.append(single_weight)
+            scales.append(single_scale)
+        weight = torch.stack(weights).reshape(*leading_shape, *weights[0].shape)
+        scale = torch.stack(scales).reshape(*leading_shape, *scales[0].shape)
+        return weight, scale
+
+    block = int(out_blk)
     n, k = w.shape
     nb, kb = ceil_div(n, block), ceil_div(k, block)
     fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
-    weight = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=w.device)
+    payload_dtype = torch.uint8 if soft_fp8 else torch.float8_e4m3fn
+    weight = torch.empty((n, k), dtype=payload_dtype, device=w.device)
     scale = torch.empty((nb, kb), dtype=torch.float32, device=w.device)
 
     blocks_per_chunk = max(1, int(rows_per_chunk) // block)
@@ -78,13 +145,118 @@ def blockfp8_weight_quant(
             chunk_scale = torch.where(
                 raw > 0, torch.exp2(torch.ceil(torch.log2(raw))), torch.ones_like(raw)
             )
+            # `round_scale_to_pow2` promises exact powers of two: UE8M0 scale
+            # storage keeps only the exponent byte of the float, so a scale even
+            # one ulp off a power of two would decode as half the scale. `exp2`
+            # is correctly rounded on CPU and CUDA but not on every device
+            # (Ascend NPU's exp2(-12.0) is one ulp below 2**-12), so verify what
+            # the device produced instead of trusting `exp2`.
+            inexact = (chunk_scale.view(torch.int32) & 0x7FFFFF) != 0
+            if bool(inexact.any()):
+                raise NotImplementedError(
+                    f"round_scale_to_pow2 scales must be exact powers of two, but "
+                    f"this device's exp2 is not correctly rounded and produced "
+                    f"{chunk_scale[inexact][0].item():.9e}. Pow2-rounded blockfp8 "
+                    f"weight quantization is not supported on this device."
+                )
         quantized = (grid / chunk_scale[:, None, :, None]).clamp_(-fp8_max, fp8_max)
-        quantized = quantized.to(torch.float8_e4m3fn).view(
-            (blk1 - blk0) * block, kb * block
-        )
-        weight[r0:r1].copy_(quantized[: r1 - r0, :k])
+        if soft_fp8:
+            payload = _fp32_to_e4m3fn_bytes(quantized)
+        else:
+            payload = quantized.to(torch.float8_e4m3fn)
+        payload = payload.view((blk1 - blk0) * block, kb * block)
+        weight[r0:r1].copy_(payload[: r1 - r0, :k])
         scale[blk0:blk1].copy_(chunk_scale)
     return weight, scale
+
+
+@make_op_dispatcher
+def blockfp8_weight_quant(
+    w: torch.Tensor,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+    *,
+    round_scale_to_pow2: bool = False,
+    rows_per_chunk: int = 4096,
+    impl: str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a weight into FP8 using square scale blocks.
+
+    Scale blocks span the last two dimensions. All leading dimensions are batch
+    dimensions with their own scales, e.g. per-expert MoE weights
+    ``[experts, out, in]`` get scales ``[experts, ceil(out/block), ceil(in/block)]``.
+
+    By default, each block is normalized by its maximum absolute value.
+    With ``round_scale_to_pow2=True``, use ``amax / 448`` rounded up to a
+    power of two, filling E4M3's range with UE8M0-representable scales.
+    Zero blocks use scale 1. Raises ``NotImplementedError`` when the device's
+    ``exp2`` does not produce those exact powers of two (Ascend NPU's ``exp2``
+    is not correctly rounded).
+
+    Returns the FP8 weights and FP32 scales shaped
+    ``[*batch, ceil(n/block), ceil(k/block)]``. The payload storage follows the
+    selected implementation: ``torch`` returns ``torch.float8_e4m3fn`` tensors,
+    and ``soft_torch`` - selected automatically on platforms declared by
+    ``infer.raise_lower_bit_float_to`` to lack FP8 compute - returns the same
+    payload bytes as raw uint8, the storage those platforms run (see
+    `Blockfp8Linear`).
+    """
+    raise NotImplementedError
+
+
+@blockfp8_weight_quant.register_auto
+def _auto_blockfp8_weight_quant():
+    # `raise_lower_bit_float_to` wider than one byte declares that the platform
+    # cannot run FP8 compute and stores FP8 payloads as raw uint8 (soft FP8) -
+    # the same condition `blockfp8_weight_dequant`'s auto resolves by.
+    try:
+        soft_fp8 = (
+            parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1
+        )
+    except Exception:
+        soft_fp8 = False
+    return "soft_torch" if soft_fp8 else "torch"
+
+
+@blockfp8_weight_quant.register("torch")
+def blockfp8_weight_quant_torch(
+    w: torch.Tensor,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+    *,
+    round_scale_to_pow2: bool = False,
+    rows_per_chunk: int = 4096,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP8 payload via the platform's ``torch.float8_e4m3fn`` dtype."""
+    return _blockfp8_weight_quant(
+        w,
+        scale_block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
+        rows_per_chunk=rows_per_chunk,
+        soft_fp8=False,
+    )
+
+
+@blockfp8_weight_quant.register("soft_torch")
+def soft_fp8_blockfp8_weight_quant_torch(
+    w: torch.Tensor,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+    *,
+    round_scale_to_pow2: bool = False,
+    rows_per_chunk: int = 4096,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP8 payload as raw uint8 bytes, in pure torch.
+
+    Platforms without float8 support cannot create or compute on
+    ``torch.float8_e4m3fn`` device tensors, so the E4M3FN payload is encoded by
+    bit manipulation. The result is bit-identical to the ``torch``
+    implementation, making the two interchangeable.
+    """
+    return _blockfp8_weight_quant(
+        w,
+        scale_block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
+        rows_per_chunk=rows_per_chunk,
+        soft_fp8=True,
+    )
 
 
 @make_op_dispatcher

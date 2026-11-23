@@ -88,6 +88,7 @@ from chitu.quantization import (
     get_quant_kwargs_from_checkpoint_prefix,
     get_backend_from_checkpoint_prefix,
 )
+from chitu.quantization.on_load import convert_state_dict_quantization_on_load
 from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.hybrid_device import CPUParameter
 from chitu.native_layout.base import TensorWithNativeLayout
@@ -1293,6 +1294,12 @@ class Transformer(nn.Module):
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                     state_dict, self.pp_stage, self.pp_size
                 )
+            # Quantization-on-load runs after EP/PP chunking (so each rank converts
+            # only its local tensors) and before TP chunking (so scales are computed
+            # on full-TP weights, like a natively quantized checkpoint).
+            state_dict = convert_state_dict_quantization_on_load(
+                state_dict, self.params.quant_config.rules
+            )
             if self.tp_size > 1:
                 # QKV and gate/up layers might already be merged in the checkpoint, but they should be split
                 # for TP. After we process for TP, we merge them back.

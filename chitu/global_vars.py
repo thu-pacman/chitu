@@ -11,6 +11,7 @@ import os
 import time
 import functools
 import copy
+from collections.abc import Mapping
 from logging import getLogger
 from typing import Any, Optional
 
@@ -82,6 +83,19 @@ def set_quant_variables(global_args=None):
     model_name = models.get("name")
     assert isinstance(model_name, str)
     model_name = model_name.lower()
+
+    input_quant_config = models.get("quant_config", None)
+    if input_quant_config is not None and not isinstance(input_quant_config, Mapping):
+        # The known way to get here is `+models.quant_config=<group-name>` on the
+        # CLI, which assigns the plain group name instead of merging the group's
+        # config, so the message points at the two working forms.
+        raise ValueError(
+            f"`models.quant_config` must be a dict, got "
+            f"{type(input_quant_config).__name__} {input_quant_config!r}. Set a "
+            f"quant config via a `defaults` entry in a model config (e.g. "
+            f"`quant_config: blockfp8_from_unquantized`) or a dict-value CLI "
+            f"override."
+        )
 
     def _ensure_quant_config_struct():
         """Ensure models.quant_config exists and has a kv_cache rules list."""
