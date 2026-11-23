@@ -134,7 +134,12 @@ class Autotuner:
         cache_root = cache_dir or os.getenv(
             "CHITU_AUTOTUNE_CACHE_DIR", "~/.cache/chitu"
         )
-        self._cache_path = Path(cache_root).expanduser() / f"{self._name}.json"
+        # The tuned key includes the device string, so every rank tunes its own
+        # keys. A shared file would be overwritten by whichever rank flushes
+        # last and the other ranks would miss, so keep one file per rank.
+        rank = os.getenv("RANK", os.getenv("LOCAL_RANK"))
+        cache_name = self._name if rank is None else f"{self._name}.rank{rank}"
+        self._cache_path = Path(cache_root).expanduser() / f"{cache_name}.json"
         self._disk_cache: dict[str, Any] = {}
         self._load_disk_cache()
 
