@@ -7,9 +7,9 @@ import torch
 import torch.nn.functional as F
 
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+
+from chitu.optdep import chitu_backend
 
 
 @make_op_dispatcher
@@ -36,7 +36,7 @@ def _auto_moe_hash_gate(
     *,
     score_func: str,
 ):
-    if has_chitu_backend and x.is_cuda and score_func == "sqrtsoftplus" and topk == 6:
+    if chitu_backend and x.is_cuda and score_func == "sqrtsoftplus" and topk == 6:
         return "cuda"
     return "torch"
 
@@ -68,7 +68,7 @@ def moe_hash_gate_torch(
     return weights, indices
 
 
-@moe_hash_gate.register("cuda", available=has_chitu_backend)
+@moe_hash_gate.register("cuda", available=bool(chitu_backend))
 def moe_hash_gate_cuda(
     x: torch.Tensor,
     weight: torch.Tensor,

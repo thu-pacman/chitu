@@ -36,7 +36,7 @@ from chitu.blockfp8_shape import (
     blockfp8_scale_dtype,
     blockfp8_scale_shape,
 )
-from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
+
 from chitu.global_vars import get_global_args
 from chitu.cuda_graph import is_warming_up_or_cuda_graph_capture
 from chitu.native_layout import (
@@ -55,15 +55,13 @@ from chitu.moe.batched_routed_activation import (
     PerExpertDenseBatchedRoutedActivationMinimal,
 )
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-triton, has_triton = try_import_platform_dep("triton")
-deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+from chitu.optdep import chitu_backend, triton, deep_gemm
 
-has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
+has_marlin = bool(chitu_backend) and hasattr(chitu_backend, "gptq_marlin_gemm")
 
-if has_triton:
+if triton:
     from chitu.moe.experts import fused_experts_fp8
-if has_deep_gemm:
+if deep_gemm:
     from chitu.moe.experts import deepgemm_masked_fused_expert
     from chitu.moe.experts import deepgemm_contiguous_fused_expert
 
@@ -326,7 +324,7 @@ class Blockfp8LinearMarlinLayout(NativeLayoutMixin, Blockfp8Linear):
         "scale_block_shape", DEFAULT_SCALE_BLOCK_SHAPE
     )
     == DEFAULT_SCALE_BLOCK_SHAPE
-    and has_deep_gemm
+    and bool(deep_gemm)
     and torch.get_default_dtype() == torch.bfloat16
     and (
         torch.cuda.get_device_capability()[0] == 9
@@ -399,12 +397,12 @@ def fused_experts_no_sum_blockfp8_indexed(
 
 
 fused_experts_no_sum_blockfp8_indexed.register_candidate("triton")
-if has_triton:
+if triton:
     fused_experts_no_sum_blockfp8_indexed.register("triton")(fused_experts_fp8)
 
 
 fused_experts_no_sum_blockfp8_indexed.register_candidate("deepgemm")
-if has_deep_gemm:
+if deep_gemm:
     fused_experts_no_sum_blockfp8_indexed.register("deepgemm")(
         deepgemm_contiguous_fused_expert
     )
@@ -458,7 +456,7 @@ def _auto_fused_experts_sum_blockfp8_indexed(
     block_shape: Optional[list] = None,
 ) -> str:
     if _blockfp8_moe_requires_triton(soft_fp8=soft_fp8, block_shape=block_shape):
-        if has_triton:
+        if triton:
             return "triton"
         raise NotImplementedError(
             "No triton implementation for soft-fp8 / MXFP8 blockfp8 MoE"
@@ -466,22 +464,22 @@ def _auto_fused_experts_sum_blockfp8_indexed(
 
     if not is_warming_up_or_cuda_graph_capture():
         # Prefill (no CUDA graph warmup/capture phase) prefers deepgemm contiguous
-        if has_deep_gemm:
+        if deep_gemm:
             return "deepgemm"
-        elif has_triton:
+        elif triton:
             return "triton"
     else:
         # Decode (CUDA graph warmup/capture phase) prefers triton
-        if has_triton:
+        if triton:
             return "triton"
-        elif has_deep_gemm:
+        elif deep_gemm:
             return "deepgemm"
 
     raise NotImplementedError("No available implementation for indexed blockfp8 MoE")
 
 
-@fused_experts_sum_blockfp8_indexed.register("triton", available=has_triton)
-@fused_experts_sum_blockfp8_indexed.register("deepgemm", available=has_deep_gemm)
+@fused_experts_sum_blockfp8_indexed.register("triton", available=bool(triton))
+@fused_experts_sum_blockfp8_indexed.register("deepgemm", available=bool(deep_gemm))
 def _fused_experts_sum_blockfp8_indexed_any(
     hidden_states,
     w1,
@@ -550,13 +548,13 @@ def _auto_fused_experts_no_sum_blockfp8_per_expert_dense(
         raise NotImplementedError(
             "No triton implementation for per-expert-dense blockfp8 MoE"
         )
-    if has_deep_gemm:
+    if deep_gemm:
         return "deepgemm"
     raise NotImplementedError
 
 
 fused_experts_no_sum_blockfp8_per_expert_dense.register_candidate("deepgemm")
-if has_deep_gemm:
+if deep_gemm:
     fused_experts_no_sum_blockfp8_per_expert_dense.register("deepgemm")(
         deepgemm_masked_fused_expert
     )
@@ -590,7 +588,7 @@ def _auto_fused_experts_sum_blockfp8_per_expert_dense(
 
 
 @fused_experts_sum_blockfp8_per_expert_dense.register(
-    "deepgemm", available=has_deep_gemm
+    "deepgemm", available=bool(deep_gemm)
 )
 def _fused_experts_sum_blockfp8_per_expert_dense_deepgemm(
     hidden_states,
@@ -905,7 +903,7 @@ class Blockfp8MoeExpertsMerged(NativeLayoutMixin, QuantizedMoeExpertsMerged):
         return super().forward_no_sum(routed_x, impl=impl)
 
     def _resolve_runtime_weights(self):
-        if has_triton:
+        if triton:
             fused_soft_fp8 = False
             use_fp8_w8a8 = False
             if _blockfp8_hard_fp8_compute_available():

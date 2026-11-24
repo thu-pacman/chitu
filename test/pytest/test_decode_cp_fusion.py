@@ -9,7 +9,7 @@ import chitu.ops.decode_cp as ops
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_topk_ties(device):
     """All owners keep the same K tokens when the cutoff crosses equal scores."""
-    if device == "cuda" and (not torch.cuda.is_available() or not ops.has_triton):
+    if device == "cuda" and (not torch.cuda.is_available() or not ops.triton):
         pytest.skip("needs GPU Triton")
     size, rows, k = 8, 4, 2048
     ids = torch.randperm(size * k, generator=torch.Generator().manual_seed(42))
@@ -74,7 +74,7 @@ def test_topk_ties(device):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not ops.has_triton, reason="needs GPU Triton"
+    not torch.cuda.is_available() or not ops.triton, reason="needs GPU Triton"
 )
 def test_partial_wire_graph():
     rows = 3
@@ -99,7 +99,7 @@ def test_partial_wire_graph():
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("rows", [0, 3])
 def test_q_unpack(device, rows):
-    if device == "cuda" and (not torch.cuda.is_available() or not ops.has_triton):
+    if device == "cuda" and (not torch.cuda.is_available() or not ops.triton):
         pytest.skip("needs GPU Triton")
     c, t, h, d, dn = 8, rows, 8, 576, 512
     gathered = torch.randn(c, t, h, d * 2, device=device, dtype=torch.bfloat16)
@@ -175,7 +175,7 @@ def test_compact_indices(query_rows):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not ops.has_triton, reason="needs GPU Triton"
+    not torch.cuda.is_available() or not ops.triton, reason="needs GPU Triton"
 )
 def test_compact_graph():
     args = _indices_case("cuda")

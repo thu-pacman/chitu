@@ -12,11 +12,9 @@ from chitu.attn_backend.flash_mla_backend import FlashMLABackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor
 from chitu.ops.page_table import topk_ids_to_page_ids
-from chitu.utils import try_import_opt_dep
 
-flash_attn3, has_flash_attn3 = try_import_opt_dep(
-    "flash_attn_interface", "flash_attn_interface"
-)
+
+from chitu.optdep import flash_attn_interface as flash_attn3
 
 
 class HopperMixedBackend(FlashMLABackend):
@@ -31,7 +29,7 @@ class HopperMixedBackend(FlashMLABackend):
         assert (
             not self.use_fp8_cache
         ), "HopperMixedBackend is only valid with bf16 MLA KV cache"
-        assert has_flash_attn3, "HopperMixedBackend requires flash_attn_interface (FA3)"
+        assert flash_attn3, "HopperMixedBackend requires flash_attn_interface (FA3)"
         self._fa = flash_attn3
         self._use_fa3 = True
 

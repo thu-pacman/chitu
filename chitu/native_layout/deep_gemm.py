@@ -11,9 +11,9 @@ import plum
 import torch
 
 from chitu.native_layout.base import NativeLayoutTensor
-from chitu.import_utils import try_import_opt_dep
 
-deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+
+from chitu.optdep import deep_gemm
 
 
 @dataclass

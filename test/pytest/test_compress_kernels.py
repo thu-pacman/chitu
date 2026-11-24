@@ -5,9 +5,9 @@
 import pytest
 import torch
 
-from chitu.utils import try_import_platform_dep
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
+
 
 from chitu.ops.deepseek_compressor import (
     build_compress_metadata,
@@ -20,7 +20,7 @@ from chitu.ops.deepseek_compressor import (
 )
 
 _COMPRESS_IMPLS = ["torch"]
-if has_triton:
+if triton:
     _COMPRESS_IMPLS.append("triton")
 
 
@@ -436,7 +436,7 @@ def test_masked_write_kv_cache_all_invalid_is_noop(impl):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not has_triton,
+    not torch.cuda.is_available() or not triton,
     reason="auto-selection test requires CUDA and Triton",
 )
 def test_compress_ops_auto_select_triton_on_cuda():

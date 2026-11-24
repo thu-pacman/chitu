@@ -9,9 +9,10 @@ from chitu.ops import (
     soft_fp8_blockfp8_gemm,
 )
 from chitu.testing import assert_close
-from chitu.utils import try_import_platform_dep
 
-triton, has_triton = try_import_platform_dep("triton")
+
+from chitu.optdep import triton
+
 
 BLOCK_SIZE = 32
 SCALE_BLOCK_SHAPE = [1, 32]
@@ -45,7 +46,7 @@ def dequant_mxfp8_weight(weight, scale):
 
 @pytest.mark.parametrize("out_features,in_features", [(128, 256), (256, 256)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.skipif(not has_triton, reason="Triton is not available")
+@pytest.mark.skipif(not triton, reason="Triton is not available")
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
@@ -75,7 +76,7 @@ def test_mxfp8_soft_dequant_is_close_to_ref(
 @pytest.mark.parametrize("bs", [0, 1, 64])
 @pytest.mark.parametrize("out_features,in_features", [(128, 256), (256, 256)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.skipif(not has_triton, reason="Triton is not available")
+@pytest.mark.skipif(not triton, reason="Triton is not available")
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
@@ -107,7 +108,7 @@ def test_mxfp8_soft_gemm_is_close_to_dequantized_gemm(
 @pytest.mark.parametrize("bs", [0, 1, 64])
 @pytest.mark.parametrize("out_features,in_features", [(128, 256), (256, 256)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.skipif(not has_triton, reason="Triton is not available")
+@pytest.mark.skipif(not triton, reason="Triton is not available")
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",

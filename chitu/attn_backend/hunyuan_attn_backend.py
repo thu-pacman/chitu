@@ -12,9 +12,10 @@ from chitu.attn_backend.base import AttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.ops import append_to_paged_kv_cache
-from chitu.utils import try_import_opt_dep
 
-hunyuan_ops, has_hunyuan_ops = try_import_opt_dep("hpc", "hpc_ops")
+
+from chitu.optdep import hpc as hunyuan_ops
+
 logger = getLogger(__name__)
 
 

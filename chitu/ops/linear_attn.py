@@ -8,12 +8,14 @@ import torch.nn.functional as F
 from chitu.lazy import eval_lazy, make_lazy_op
 from chitu.ops.utils import check_checkpoint_args, make_op_dispatcher
 from chitu.device_type import is_enflame, is_hygon, is_muxi
-from chitu.utils import try_import_opt_dep, try_import_platform_dep
+
 
 if is_muxi():
     has_fla = False
 else:
-    fla, has_fla = try_import_opt_dep("fla", "fla")
+    from chitu.optdep import fla
+
+    has_fla = bool(fla)
 
 if has_fla:
     from fla.ops import chunk_gated_delta_rule as chunk_gated_delta_rule_fla
@@ -31,23 +33,26 @@ if has_fla:
 else:
     has_fla_kda = False
 
-boltops_kda, has_boltops_kda = try_import_platform_dep("boltops.fla.kda")
+from chitu.optdep import boltops_kda
+
+has_boltops_kda = bool(boltops_kda)
 has_boltops_kda = has_boltops_kda and is_hygon()
 
 # Older BoltOps packages may not expose the joint gate/beta producer. Keep
 # their existing recurrent path available rather than requiring an upgrade.
 boltops_kda_gate, has_boltops_kda_gate = (None, False)
 if has_boltops_kda:
-    boltops_kda_gate, has_boltops_kda_gate = try_import_platform_dep(
-        "boltops.fla.kda.triton.fused_recurrent"
-    )
+    from chitu.optdep import boltops_kda_gate
+
+    has_boltops_kda_gate = bool(boltops_kda_gate)
     has_boltops_kda_gate = has_boltops_kda_gate and all(
         hasattr(boltops_kda_gate, name)
         for name in ("_kda_gate_beta_fwd_kernel", "get_kda_gate_beta_config")
     )
 
-triton, has_triton = try_import_platform_dep("triton")
-if has_triton:
+from chitu.optdep import triton
+
+if triton:
     from chitu.ops.triton_ops.fused_recurrent import (
         fused_recurrent_gated_delta_rule_fwd_all_state_triton,
     )
@@ -1636,7 +1641,7 @@ def recurrent_gated_delta_rule_all_state(
 def _auto_recurrent_gated_delta_rule_all_state():
     if is_enflame():
         return "torch"
-    if has_triton:
+    if triton:
         return "triton"
     return "torch"
 

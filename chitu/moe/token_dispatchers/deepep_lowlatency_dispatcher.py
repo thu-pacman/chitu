@@ -12,7 +12,7 @@ import torch
 
 from chitu.distributed.comm_group import CommGroup
 from chitu.utils import parse_dtype
-from chitu.import_utils import try_import_opt_dep
+
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
@@ -32,7 +32,7 @@ from contextlib import nullcontext
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
 
-deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
+from chitu.optdep import deep_ep
 
 logger = getLogger(__name__)
 

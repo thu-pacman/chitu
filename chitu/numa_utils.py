@@ -11,9 +11,9 @@ from typing import Optional
 import torch
 
 from chitu.device_type import is_hygon, is_nvidia
-from chitu.utils import try_import_opt_dep
 
-numa, has_numa = try_import_opt_dep("numa", "cpu")
+
+from chitu.optdep import numa
 
 
 logger = getLogger(__name__)

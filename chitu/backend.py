@@ -78,7 +78,7 @@ from chitu.tokenizer import (
 )
 from chitu.tool_call import patch_chat_template
 from chitu.utils import max_alloc_seq_len, parse_dtype, should_pretty_log
-from chitu.import_utils import try_import_opt_dep
+
 from chitu.moe import init_moe_impl
 from chitu.boot.arg_utils import calculate_parallelism_sizes
 from chitu.global_vars import (
@@ -94,7 +94,7 @@ if TYPE_CHECKING:
     from chitu.executor import Executor
     from chitu.scheduler import Scheduler
 
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+from chitu.optdep import cpuinfer
 
 
 logger = getLogger(__name__)

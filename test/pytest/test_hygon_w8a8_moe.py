@@ -58,7 +58,6 @@ def test_hygon_deepgemm_moe_contiguous_forward_matches_reference(monkeypatch):
                 out[row_idx].copy_(a_fp[row_idx] @ (weight * scale).t())
 
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn, "hygon_deepgemm", _FakeDeepGemm()
     )
@@ -67,8 +66,7 @@ def test_hygon_deepgemm_moe_contiguous_forward_matches_reference(monkeypatch):
         "convert_from",
         classmethod(lambda cls, tensor: tensor),
     )
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_lightop", False)
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "lightop", SimpleNamespace())
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "lightop", None)
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "_DEEPGEMM_MOE_BLOCK_SIZE", 2)
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn,
@@ -301,11 +299,10 @@ def test_hygon_deepgemm_moe_forward_no_sum_pads_small_masked_layout(monkeypatch)
             )
 
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn, "hygon_deepgemm", _FakeDeepGemm()
     )
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_lightop", False)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "lightop", None)
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn,
         "a8_per_token_act_quant",
@@ -415,11 +412,10 @@ def test_hygon_deepgemm_moe_masked_forward_no_sum_matches_reference(monkeypatch)
             )
 
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn, "hygon_deepgemm", _FakeDeepGemm()
     )
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_lightop", False)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "lightop", None)
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn,
         "a8_per_token_act_quant",
@@ -548,7 +544,6 @@ def test_hygon_lightop_forward_no_sum_accepts_withscale_w8a8(monkeypatch):
             return True, a_fp @ w_fp
 
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_lightop", True)
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "lightop", _FakeLightop())
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn,
@@ -704,7 +699,6 @@ def test_hygon_deepgemm_contiguous_quantizes_intermediate_after_silu_mul(
             out.zero_()
 
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn, "hygon_deepgemm", _FakeDeepGemm()
     )
@@ -886,7 +880,7 @@ def test_hygon_aiter_moe_forward_matches_reference(monkeypatch):
             return ref.to(output_dtype)
 
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_aiter", True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "aiter", object())
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "aiter", _FakeAiter())
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn.AiterMoeCInt8Gemm1Weight,

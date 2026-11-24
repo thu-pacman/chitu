@@ -11,14 +11,14 @@ import torch
 import torch.distributed as dist
 
 from chitu.device_type import is_ascend, has_accelerator
-from chitu.utils import try_import_and_setup_torch_npu
+
 from chitu.distributed.comm_group import CommGroup
 from chitu.moe.load_balancer.base_dynamic_planner import (
     AdjustmentAction,
     MoveExpertAction,
 )
 
-_, has_torch_npu = try_import_and_setup_torch_npu()
+from chitu.optdep import torch_npu
 
 
 logger = getLogger(__name__)
@@ -153,7 +153,7 @@ class WeightMigrationExecutor:
         # Pin device (keep existing policy; no non_blocking transfer here)
         if self.device_id is not None and has_accelerator():
             torch.cuda.set_device(self.device_id)
-        if is_ascend() and has_torch_npu:
+        if is_ascend() and torch_npu:
             device = torch.device(
                 f"npu:{self.device_id}"
                 if has_accelerator() and self.device_id is not None

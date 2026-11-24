@@ -89,15 +89,10 @@ from chitu.distributed.parallel_state import (
     get_dp_size,
 )
 from chitu.distributed.partition import compute_expert_dist_in_ep
-from chitu.utils import (
-    ceil_div,
-    max_alloc_seq_len,
-    parse_dtype,
-    try_import_and_setup_torch_npu,
-)
+from chitu.utils import ceil_div, max_alloc_seq_len, parse_dtype
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+from chitu.optdep import torch_npu
 
 logger = getLogger(__name__)
 
@@ -213,14 +208,14 @@ class Indexer(torch.nn.Module):
                 freqs_cis,
                 rotary_end=self.rope_head_dim,
                 rotary_type=self.index_rope_layout,
-                impl="torch_npu" if has_torch_npu else "auto",
+                impl="torch_npu" if torch_npu else "auto",
             )
             k_rot, _, _, _ = apply_rotary_pos_emb_single_partial(
                 k,
                 freqs_cis_k,
                 rotary_end=self.rope_head_dim,
                 rotary_type=self.index_rope_layout,
-                impl="torch_npu" if has_torch_npu else "auto",
+                impl="torch_npu" if torch_npu else "auto",
             )
         else:
             # Non-CP mode: unified RoPE for Q and K
@@ -231,7 +226,7 @@ class Indexer(torch.nn.Module):
                 q_rotary_end=self.rope_head_dim,
                 k_rotary_end=self.rope_head_dim,
                 rotary_type=self.index_rope_layout,
-                impl="torch_npu" if has_torch_npu else "auto",
+                impl="torch_npu" if torch_npu else "auto",
             )
 
         if self.use_hadamard_transform:
@@ -632,7 +627,7 @@ class AttentionDeepSeekV3(Attention):
         # - chitu/quantization/registry.py
         # - chitu/ops/mla_prologue.py
         self.can_use_mla_prologue_torch_npu = (
-            has_torch_npu
+            bool(torch_npu)
             and not is_ascend_950()
             and (
                 quant is None

@@ -1,11 +1,10 @@
 import torch
 import pytest
 
-from chitu.utils import try_import_platform_dep, try_import_opt_dep
+
 from chitu.ops.activation import silu_and_mul_torch
 
-triton, has_triton = try_import_platform_dep("triton")
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+from chitu.optdep import triton, cpuinfer
 
 
 def cpuinfer_silu_and_mul(input_tensor, CPUInfer, silu_and_mul):
@@ -24,7 +23,7 @@ def cpuinfer_silu_and_mul(input_tensor, CPUInfer, silu_and_mul):
     return output_tensor
 
 
-@pytest.mark.skipif(not has_cpuinfer, reason="cpuinfer module not available")
+@pytest.mark.skipif(not cpuinfer, reason="cpuinfer module not available")
 @pytest.mark.parametrize("input_size", [512, 1024, 8192])
 @pytest.mark.parametrize("qlen", [1, 16, 30])
 @pytest.mark.parametrize("compute_dtype", [torch.float32, torch.bfloat16])

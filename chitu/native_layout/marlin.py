@@ -13,10 +13,11 @@ from chitu.native_layout.common import (
     Packed4BitWeightAlongKContig,
     Packed4BitWeightAlongKContigInt32,
 )
-from chitu.import_utils import try_import_platform_dep
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
+
+from chitu.optdep import chitu_backend
+
+has_marlin = bool(chitu_backend) and hasattr(chitu_backend, "gptq_marlin_gemm")
 if has_marlin:
     from chitu_backend import gptq_marlin_repack
 

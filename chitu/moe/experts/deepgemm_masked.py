@@ -23,11 +23,11 @@ from chitu.moe.batched_expert_result import (
 )
 from chitu.ops.quant import blockfp8_act_quant, silu_and_mul_and_blockfp8_act_quant
 from chitu.ops.quant.blockfp8.matmul import blockfp8_gemm_wants_packed_ue8m0_scale
-from chitu.utils import try_import_opt_dep
+
 from chitu.ops import silu_and_mul
 from chitu.lazy import eval_lazy
 
-deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+from chitu.optdep import deep_gemm
 
 
 @functools.singledispatch
@@ -190,7 +190,7 @@ def _(
             (E, M, K), device=device, dtype=torch.bfloat16
         )
     elif w1.dtype != torch.float8_e4m3fn:
-        assert has_deep_gemm, "BF16 masked path requires deep_gemm backend"
+        assert deep_gemm, "BF16 masked path requires deep_gemm backend"
 
         # For bf16, DeepGEMM requires reduction dimensions % 64 == 0. Search `DG_HOST_ASSERT(k % 64 == 0)`
         # in `third_party/nvidia/DeepGEMM/csrc/jit_kernels/impls/sm90_bf16_gemm.hpp` for details.

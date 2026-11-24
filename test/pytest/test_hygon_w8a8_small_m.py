@@ -62,12 +62,7 @@ def test_auto_dispatches_to_external_gemm(ops, external, monkeypatch, m, n, k):
 
 
 def test_missing_external_module_keeps_native_backend(ops, monkeypatch):
-    class MissingModule:
-        def __getattr__(self, name):
-            raise AssertionError("The unavailable optional kernel module was accessed")
-
-    monkeypatch.setattr(ops, "has_hygon_w8a8", False)
-    monkeypatch.setattr(ops, "hygon_w8a8", MissingModule())
+    monkeypatch.setattr(ops, "hygon_w8a8", None)
     assert ops.w8a8_gemm_per_token_per_channel.resolve_impl() == "hipblaslt_w8a8_gemm"
     a = torch.ones((1, 2048), device="cuda", dtype=torch.int8)
     b = torch.ones((16384, 2048), device="cuda", dtype=torch.int8)
@@ -111,7 +106,7 @@ def test_other_projections_keep_original_backend(ops, monkeypatch, m, n, k):
     monkeypatch.setattr(
         ops, "w8a8_gemm_per_token_per_channel_hipblaslt_w8a8_gemm", counted
     )
-    if ops.has_hygon_w8a8:
+    if ops.hygon_w8a8:
         monkeypatch.setattr(ops.hygon_w8a8, "small_m_gemm", unexpected)
     out = ops.w8a8_gemm_per_token_per_channel(a, a_scale, b, b_scale, impl="auto")
     assert len(calls) == 1

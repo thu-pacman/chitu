@@ -2,10 +2,10 @@ import pytest
 import torch
 
 from chitu.ops import add_shared_experts
-from chitu.import_utils import try_import_platform_dep
+
 from chitu.testing import gen_token_to_expert_indices
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+from chitu.optdep import chitu_backend
 
 
 @pytest.mark.parametrize("bs", [0, 1, 64])
@@ -17,7 +17,7 @@ chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 def test_add_shared_experts(
     bs, n_routed_experts, topk, n_shared_experts, dtype, impl, record_benchmark
 ):
-    if impl == "cuda" and not has_chitu_backend:
+    if impl == "cuda" and not chitu_backend:
         pytest.skip("chitu_backend not available")
 
     weights = torch.randn(bs, topk, dtype=dtype, device="cuda")

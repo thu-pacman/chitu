@@ -2,11 +2,9 @@ import torch
 import pytest
 
 from chitu.testing import assert_close
-from chitu.utils import try_import_platform_dep
 from chitu.ops.mhc import mhc_pre, mhc_post
 
-triton, has_triton = try_import_platform_dep("triton")
-tilelang, has_tilelang = try_import_platform_dep("tilelang")
+from chitu.optdep import triton, tilelang
 
 
 def generate_test_data_pre(
@@ -81,9 +79,9 @@ def generate_test_data_post(
 @pytest.mark.parametrize("hc_mult", [4])
 @pytest.mark.parametrize("impl", ["triton", "tilelang"])
 def test_mhc_post(n, h, hc_mult, record_benchmark, impl):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
-    if impl == "tilelang" and not has_tilelang:
+    if impl == "tilelang" and not tilelang:
         pytest.skip("tilelang is missing")
     test_data = generate_test_data_post(n=n, h=h, hc_mult=hc_mult)
     test_data["impl"] = "torch"
@@ -103,9 +101,9 @@ def test_mhc_post(n, h, hc_mult, record_benchmark, impl):
 @pytest.mark.parametrize("hc_mult", [4])
 @pytest.mark.parametrize("impl", ["triton", "tilelang"])
 def test_mhc_pre_matches_torch(n, hidden_size, hc_mult, record_benchmark, impl) -> None:
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
-    if impl == "tilelang" and not has_tilelang:
+    if impl == "tilelang" and not tilelang:
         pytest.skip("tilelang is missing")
     test_data = generate_test_data_pre(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
     test_data["impl"] = "torch"

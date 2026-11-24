@@ -7,9 +7,9 @@ import functools
 import torch
 
 from chitu.lazy import single_dispatch_lazy_tensor
-from chitu.utils import try_import_platform_dep
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+
+from chitu.optdep import chitu_backend
 
 
 # SPDX-SnippetBegin

@@ -8,7 +8,7 @@ import torch
 import functools
 
 from chitu.checkpoint_prefix import CheckpointPrefix
-from chitu.utils import try_import_opt_dep
+
 from chitu.quantization import (
     NormalLinear,
     Blockfp8Linear,
@@ -29,9 +29,7 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
 )
 
-muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
-    "muxi_layout_kernels", "muxi_layout_kernels"
-)
+from chitu.optdep import muxi_layout_kernels
 
 
 @single_dispatch_lazy_tensor

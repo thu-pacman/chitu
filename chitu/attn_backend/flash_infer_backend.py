@@ -17,10 +17,10 @@ from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.static_tensor import StaticTensor
 from chitu.ops import append_to_paged_kv_cache
-from chitu.utils import try_import_opt_dep, pad_tensor, ceil_div
+from chitu.utils import pad_tensor, ceil_div
 from chitu.distributed.parallel_state import get_dp_size
 
-flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
+from chitu.optdep import flashinfer
 
 
 def _mla_paged_plan_buffers(

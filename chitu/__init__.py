@@ -5,11 +5,10 @@
 import os
 import sys
 
-from chitu.import_utils import try_import_and_setup_torch_gcu
 
 # Enflame GCU early setup (no-op without torch_gcu / triton_gcu). MUST run before
 # any other chitu submodule import.
-try_import_and_setup_torch_gcu()
+from chitu.optdep import torch_gcu  # noqa: F401
 
 # Package-level logging setup is for normal runtime imports. Boot-time and docs
 # generation imports avoid runtime dependencies such as torch.

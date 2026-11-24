@@ -9,31 +9,25 @@ from chitu.device_type import is_hygon
 from chitu.native_layout import NpuFractalZnTensor
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.utils import make_op_dispatcher
-from chitu.import_utils import (
-    try_import_platform_dep,
-    try_import_opt_dep,
-    try_import_and_setup_torch_npu,
-)
+
 from chitu.lazy import eval_lazy, single_dispatch_lazy_tensor
 
-triton, has_triton = try_import_platform_dep("triton")
-lmslim, has_lmslim = try_import_platform_dep("lmslim")
-lightop, has_lightop = try_import_platform_dep("lightop")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-hygon_w8a8, has_hygon_w8a8 = try_import_opt_dep(
-    "hygon_w8a8_kernel.dense", "hygon_w8a8_kernel"
+from chitu.optdep import (
+    triton,
+    lmslim,
+    lightop,
+    torch_npu,
+    hygon_w8a8_kernel_dense as hygon_w8a8,
 )
 
-# Although imported lmslim and lightop, some version of them does not contain the following
-# sub-package. So treat the following with `try_import_platform_dep`, too.
-lmslim_quant_ops, has_lmslim_quant_ops = try_import_platform_dep(
-    "lmslim.quantize.quant_ops"
-)
+# Some versions of lmslim and lightop do not contain the following sub-package,
+# so it is optional on its own.
+from chitu.optdep import lmslim_quantize_quant_ops as lmslim_quant_ops
 
-if has_triton:
+if triton:
     from chitu.ops.triton_ops import w8a8_gemm_per_token_per_channel_triton
 
-if has_lmslim:
+if lmslim:
     from lmslim.layers.gemm.int8_utils import (
         per_token_quant_int8 as hygon_per_token_quant_int8,
     )
@@ -51,15 +45,15 @@ def w8a8_gemm_per_token_per_channel(
 
 @w8a8_gemm_per_token_per_channel.register_auto
 def _auto_w8a8_gemm_per_token_per_channel():
-    if has_lmslim_quant_ops and hasattr(lmslim_quant_ops, "hipblaslt_w8a8_gemm"):
-        if has_hygon_w8a8 and is_hygon():
+    if lmslim_quant_ops and hasattr(lmslim_quant_ops, "hipblaslt_w8a8_gemm"):
+        if hygon_w8a8 and is_hygon():
             return "hygon_w8a8_gemm"
         return "hipblaslt_w8a8_gemm"
-    if has_lightop and hasattr(lightop, "gemm_w8a8_smooth"):
+    if lightop and hasattr(lightop, "gemm_w8a8_smooth"):
         return "lightop_gemm_w8a8_smooth"
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
-    if has_triton:
+    if triton:
         return "triton"
     raise NotImplementedError(
         "No available implementation for w8a8_gemm_per_token_per_channel"
@@ -68,7 +62,8 @@ def _auto_w8a8_gemm_per_token_per_channel():
 
 @w8a8_gemm_per_token_per_channel.register(
     "hipblaslt_w8a8_gemm",
-    available=has_lmslim_quant_ops and hasattr(lmslim_quant_ops, "hipblaslt_w8a8_gemm"),
+    available=bool(lmslim_quant_ops)
+    and hasattr(lmslim_quant_ops, "hipblaslt_w8a8_gemm"),
 )
 @single_dispatch_lazy_tensor
 def w8a8_gemm_per_token_per_channel_hipblaslt_w8a8_gemm(
@@ -102,20 +97,20 @@ def w8a8_gemm_per_token_per_channel_hipblaslt_w8a8_gemm(
 
 @w8a8_gemm_per_token_per_channel.register(
     "hygon_w8a8_gemm",
-    available=has_triton
-    and has_lmslim_quant_ops
+    available=bool(triton)
+    and bool(lmslim_quant_ops)
     and hasattr(lmslim_quant_ops, "hipblaslt_w8a8_gemm"),
 )
 @single_dispatch_lazy_tensor
 def w8a8_gemm_per_token_per_channel_hygon(a, a_s, b, b_s):
-    if has_hygon_w8a8 and hygon_w8a8.can_use_small_m_gemm(a, a_s, b, b_s):
+    if hygon_w8a8 and hygon_w8a8.can_use_small_m_gemm(a, a_s, b, b_s):
         return hygon_w8a8.small_m_gemm(a, a_s, b, b_s)
     return w8a8_gemm_per_token_per_channel_hipblaslt_w8a8_gemm(a, a_s, b, b_s)
 
 
 @w8a8_gemm_per_token_per_channel.register(
     "lightop_gemm_w8a8_smooth",
-    available=has_lightop and hasattr(lightop, "gemm_w8a8_smooth"),
+    available=bool(lightop) and hasattr(lightop, "gemm_w8a8_smooth"),
 )
 @single_dispatch_lazy_tensor
 def w8a8_gemm_per_token_per_channel_lightop_gemm_w8a8_smooth(
@@ -149,7 +144,7 @@ def w8a8_gemm_per_token_per_channel_lightop_gemm_w8a8_smooth(
     return out
 
 
-@w8a8_gemm_per_token_per_channel.register("torch_npu", available=has_torch_npu)
+@w8a8_gemm_per_token_per_channel.register("torch_npu", available=bool(torch_npu))
 @single_dispatch_lazy_tensor
 def w8a8_gemm_per_token_per_channel_torch_npu(
     a: torch.Tensor,
@@ -185,7 +180,7 @@ def w8a8_gemm_per_token_per_channel_torch_npu(
 
 
 w8a8_gemm_per_token_per_channel.register_candidate("triton")
-if has_triton:
+if triton:
     w8a8_gemm_per_token_per_channel.register("triton")(
         w8a8_gemm_per_token_per_channel_triton
     )
@@ -197,21 +192,21 @@ def a8_per_token_act_quant(act, scale_dtype=torch.float, impl: str = "auto"): ..
 
 @a8_per_token_act_quant.register_auto
 def _auto_a8_per_token_act_quant():
-    if has_lmslim:
+    if lmslim:
         return "hygon"
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     return "torch"
 
 
-@a8_per_token_act_quant.register("hygon", available=has_lmslim)
+@a8_per_token_act_quant.register("hygon", available=bool(lmslim))
 @single_dispatch_lazy_tensor
 def a8_per_token_act_quant_hygon(act: torch.Tensor, scale_dtype=torch.float):
     q_act, scales = hygon_per_token_quant_int8(act)
     return q_act, scales.to(scale_dtype).view(*q_act.shape[:-1])
 
 
-if has_lightop and hasattr(lightop, "fuse_silu_mul_quant"):
+if lightop and hasattr(lightop, "fuse_silu_mul_quant"):
 
     @a8_per_token_act_quant_hygon.register
     def _(act: silu_and_mul.lazy_tensor_type(), scale_dtype=torch.float):
@@ -235,7 +230,7 @@ if has_lightop and hasattr(lightop, "fuse_silu_mul_quant"):
         )
 
 
-@a8_per_token_act_quant.register("torch_npu", available=has_torch_npu)
+@a8_per_token_act_quant.register("torch_npu", available=bool(torch_npu))
 @single_dispatch_lazy_tensor
 def a8_per_token_act_quant_torch_npu(act, scale_dtype=torch.float):
     q_act, scales = torch_npu.npu_dynamic_quant(act)
@@ -262,7 +257,7 @@ def silu_and_mul_and_a8_per_token_act_quant(
 
 @silu_and_mul_and_a8_per_token_act_quant.register_auto
 def _auto_silu_and_mul_and_a8_per_token_act_quant():
-    if has_lightop and hasattr(lightop, "fuse_silu_mul_quant"):
+    if lightop and hasattr(lightop, "fuse_silu_mul_quant"):
         return "hygon"
     raise NotImplementedError(
         f"No available impl for silu_and_mul_and_a8_per_token_act_quant"
@@ -270,7 +265,7 @@ def _auto_silu_and_mul_and_a8_per_token_act_quant():
 
 
 @silu_and_mul_and_a8_per_token_act_quant.register(
-    "hygon", available=has_lightop and hasattr(lightop, "fuse_silu_mul_quant")
+    "hygon", available=bool(lightop) and hasattr(lightop, "fuse_silu_mul_quant")
 )
 def silu_and_mul_and_a8_per_token_act_quant_hygon(
     act, swiglu_limit: Optional[float] = None, scale_dtype=torch.float

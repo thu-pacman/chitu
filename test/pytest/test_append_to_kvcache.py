@@ -6,11 +6,10 @@ import torch
 
 from chitu.testing import assert_close
 from chitu.device_type import has_accelerator, has_native_fp8
-from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
+
 from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
 
-triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+from chitu.optdep import triton, torch_npu
 
 
 def _make_page_table(
@@ -163,7 +162,7 @@ def test_append_to_indexer_paged_kv_deepgemm(
     record_benchmark,
     impl,
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     device = "cuda"
@@ -258,7 +257,7 @@ def test_append_to_paged_kv_cache_decode(
     record_benchmark,
     impl,
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     device = "cuda"
@@ -331,7 +330,7 @@ def test_paged_append_with_seqids_matches_torch(
     record_benchmark,
     impl,
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     device = "cuda"
@@ -403,10 +402,10 @@ def test_dense_append_decode_matches_torch(
     impl,
     record_benchmark,
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     if impl == "torch_npu":
-        if not has_torch_npu:
+        if not torch_npu:
             pytest.skip("torch_npu is missing")
         if dtype == torch.float8_e4m3fn:
             pytest.skip("torch.float8_e4m3fn is not supported by torch_npu")
@@ -461,10 +460,10 @@ def test_dense_append_decode_matches_torch(
 def test_dense_append_with_seqids_matches_torch(
     dtype, tail_shape, batch_size, num_tokens, seq_len, impl, record_benchmark
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     if impl == "torch_npu":
-        if not has_torch_npu:
+        if not torch_npu:
             pytest.skip("torch_npu is missing")
         if dtype == torch.float8_e4m3fn:
             pytest.skip("torch.float8_e4m3fn is not supported by torch_npu")
@@ -513,9 +512,9 @@ def test_dense_append_with_seqids_matches_torch(
 
 @pytest.mark.parametrize("impl", ["torch", "triton", "torch_npu"])
 def test_dense_empty_this_kv_semantics(impl):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
-    if impl == "torch_npu" and not has_torch_npu:
+    if impl == "torch_npu" and not torch_npu:
         pytest.skip("torch_npu is missing")
 
     device = "cuda"
@@ -538,7 +537,7 @@ def test_dense_empty_this_kv_semantics(impl):
 
 @pytest.mark.parametrize("impl", ["torch", "triton"])
 def test_paged_empty_this_kv_semantics(impl):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     device = "cuda"
     dtype = torch.float16
@@ -581,9 +580,9 @@ def test_paged_empty_this_kv_semantics(impl):
 @pytest.mark.parametrize("impl", ["torch", "triton"])
 @pytest.mark.skipif(not has_accelerator(), reason="Requires an accelerator")
 def test_paged_dcp(impl):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
-    if impl == "torch" and has_torch_npu:
+    if impl == "torch" and torch_npu:
         pytest.skip("Ascend Torch DCP append is not supported")
 
     device = "cuda"
@@ -622,7 +621,7 @@ def test_paged_dcp(impl):
 
 
 @pytest.mark.skipif(
-    not has_triton or not has_accelerator() or has_torch_npu,
+    not triton or not has_accelerator() or bool(torch_npu),
     reason="Requires CUDA/HIP Triton and graph support",
 )
 def test_paged_dcp_graph():
@@ -677,7 +676,7 @@ def test_paged_offset_overflow_case_matches_torch_with_i64(impl):
     This test constructs a paged KV that can overflow int32 offsets when use_i64_offsets is False.
     It validates that enabling i64 offsets produces correct results matching torch reference.
     """
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     device = "cuda"
     dtype = torch.int8
@@ -745,9 +744,9 @@ def test_dense_offset_overflow_case_matches_torch_with_i64(impl):
     This test constructs a dense KV that can overflow int32 offsets when use_i64_offsets is False.
     It validates that enabling i64 offsets produces correct results matching torch reference.
     """
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
-    if impl == "torch_npu" and not has_torch_npu:
+    if impl == "torch_npu" and not torch_npu:
         pytest.skip("torch_npu is missing")
 
     device = "cuda"

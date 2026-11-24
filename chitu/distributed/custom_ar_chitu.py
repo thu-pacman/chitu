@@ -11,10 +11,10 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from chitu.device_type import is_hygon
-from chitu.import_utils import try_import_platform_dep
+
 from chitu.accelerator_monitor import check_accelerator_fully_connected
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+from chitu.optdep import chitu_backend
 
 logger = getLogger(__name__)
 
@@ -47,7 +47,7 @@ def _init_backend():
         return
     _backend_checked = True
     try:
-        if has_chitu_backend:
+        if chitu_backend:
             chitu_backend.meta_size()
             custom_ar = True
         else:
@@ -541,7 +541,7 @@ class ChituCustomAllreduce:
                 return
 
             if self._ptr:
-                if has_chitu_backend:
+                if chitu_backend:
                     dispose_fn = getattr(chitu_backend, "dispose", None)
                     if callable(dispose_fn):
                         dispose_fn(self._ptr)
@@ -651,7 +651,7 @@ class ChituCustomAllreduce:
     ) -> None:
         if rank is None:
             rank = dist.get_rank(group=group)
-        if has_chitu_backend:
+        if chitu_backend:
             try:
                 if pointers[rank] != 0:
                     free_fn = getattr(chitu_backend, "free_shared_buffer", None)

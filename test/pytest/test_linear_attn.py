@@ -17,15 +17,15 @@ from chitu.ops.linear_attn import (
     recurrent_kimi_delta_attention,
     recurrent_kimi_delta_attention_torch,
 )
-from chitu.utils import try_import_opt_dep
+
 from chitu.testing import AssertOpCalled, assert_close
 
 if is_muxi():
-    has_fla = False
+    fla = None
 else:
-    fla, has_fla = try_import_opt_dep("fla", "fla")
+    from chitu.optdep import fla
 
-if has_fla:
+if fla:
     from fla.ops import chunk_gated_delta_rule as chunk_gated_delta_rule_fla
     from fla.ops import (
         fused_recurrent_gated_delta_rule as fused_recurrent_gated_delta_rule_fla,
@@ -43,7 +43,7 @@ def test_chunk_gated_delta_rule(
     linear_n_v_heads,
     record_benchmark,
 ):
-    if not has_fla:
+    if not fla:
         pytest.skip("fla is missing")
 
     torch.set_default_dtype(torch.float32)
@@ -91,7 +91,7 @@ def test_recurrent_gated_delta_rule(
     linear_n_v_heads,
     record_benchmark,
 ):
-    if not has_fla:
+    if not fla:
         pytest.skip("fla is missing")
 
     torch.set_default_dtype(torch.float32)

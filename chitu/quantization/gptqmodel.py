@@ -6,11 +6,9 @@ import torch
 
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
-from chitu.utils import try_import_opt_dep
 
-gptqmodel_marlin_kernels, has_gptqmodel_marlin_kernels = try_import_opt_dep(
-    "gptqmodel_marlin_kernels", "quant"
-)
+
+from chitu.optdep import gptqmodel_marlin_kernels
 
 
 def apply_gptq_marlin_linear(

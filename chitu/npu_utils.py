@@ -7,11 +7,7 @@ import functools
 import torch
 
 from chitu.global_vars import get_global_args
-from chitu.utils import (
-    try_import_opt_dep,
-    try_import_and_setup_torch_npu,
-    next_power_of_two,
-)
+from chitu.utils import next_power_of_two
 from chitu.ops import a8_per_token_act_quant
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
@@ -29,8 +25,7 @@ from chitu.native_layout import (
     NpuFractalZnTensor,
 )
 
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
+from chitu.optdep import torch_npu, cinfer_ascendc
 
 logger = logging.getLogger(__name__)
 

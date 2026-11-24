@@ -8,9 +8,9 @@ from typing import Optional
 import torch.distributed as dist
 
 from chitu.device_type import is_hygon
-from chitu.utils import ceil_div, try_import_opt_dep
+from chitu.utils import ceil_div
 
-deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
+from chitu.optdep import deep_ep
 
 
 class DeepEPBuffer:

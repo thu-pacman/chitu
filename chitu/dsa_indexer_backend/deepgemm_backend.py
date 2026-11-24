@@ -7,7 +7,7 @@ import torch
 
 from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.kv_cache import KVCacheAccessor, PagedKVCacheAccessor
-from chitu.utils import try_import_opt_dep, try_import_platform_dep
+
 from .base import DSAIndexer
 from .nvidia_topk import NvidiaTopKMixin
 
@@ -18,13 +18,13 @@ from chitu.ops import (
 )
 from chitu.static_tensor import StaticTensor
 
-triton, has_triton = try_import_platform_dep("triton")
-deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+from chitu.optdep import triton, deep_gemm
+
 support_indexer_deepgemm = (
     is_nvidia()
     and torch.cuda.get_device_capability()[0] in (9, 10)
-    and has_triton
-    and has_deep_gemm
+    and bool(triton)
+    and bool(deep_gemm)
 )
 
 

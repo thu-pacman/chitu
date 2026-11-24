@@ -28,11 +28,7 @@ import torch
 import torch.distributed as dist
 
 from chitu.global_vars import get_global_args
-from chitu.import_utils import (
-    try_import_and_setup_torch_npu,
-    try_import_platform_dep,
-    try_import_opt_dep,
-)
+
 from chitu.device_type import is_ascend
 from chitu.serve.request_id import gen_req_id
 
@@ -498,7 +494,7 @@ def log_with_rank(msg, rank=0, prefix="", level=WARNING, logger=logger):
             logger.log(level, msg)
 
 
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+from chitu.optdep import torch_npu
 
 
 def invalidate_cached_property(obj, name):
@@ -533,7 +529,7 @@ def try_get_profiler(
     repeat: int = 1,
     with_stack: bool = False,
 ):
-    if has_torch_npu:
+    if torch_npu:
         from chitu.npu_utils import try_get_npu_profiler
 
         return try_get_npu_profiler(

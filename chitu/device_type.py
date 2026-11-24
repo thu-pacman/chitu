@@ -98,6 +98,5 @@ def is_enflame():
 
 
 if hasattr(torch, "musa") and torch.musa.is_available():
-    from chitu.utils import try_import_opt_dep
 
-    torchada, has_torchada = try_import_opt_dep("torchada", "torchada")
+    from chitu.optdep import torchada

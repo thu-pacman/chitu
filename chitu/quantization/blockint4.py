@@ -28,7 +28,7 @@ from chitu.moe.batched_expert_result import (
     PerTokenBatchedExpertResult,
     PerExpertDenseBatchedExpertResultMinimal,
 )
-from chitu.utils import try_import_platform_dep
+
 from chitu.native_layout import (
     NativeLayoutMixin,
     Packed4BitWeightAlongKContigInt32,
@@ -37,16 +37,16 @@ from chitu.native_layout import (
 )
 from chitu.quantization.gptqmodel import marlin_make_empty_g_idx
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-triton, has_triton = try_import_platform_dep("triton")
-has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
-has_marlin_moe = has_chitu_backend and hasattr(chitu_backend, "moe_wna16_marlin_gemm")
-aiter, has_aiter = try_import_platform_dep("aiter")
+from chitu.optdep import chitu_backend, triton
 
-if has_aiter:
+has_marlin = bool(chitu_backend) and hasattr(chitu_backend, "gptq_marlin_gemm")
+has_marlin_moe = bool(chitu_backend) and hasattr(chitu_backend, "moe_wna16_marlin_gemm")
+from chitu.optdep import aiter
+
+if aiter:
     from aiter.moe import aiter_moe, get_aiter_moe_config, MoeQuantType, MoeSolutionType
     from aiter.ops.shuffle import w4a16_marlin_weight_1, w4a16_marlin_weight_2
-if has_triton:
+if triton:
     from chitu.moe.experts.triton_batched_experts import (
         invoke_fused_moe_wna16_triton_kernel,
     )
@@ -293,7 +293,7 @@ class BlockInt4TritonMixin(BlockInt4ExpertBlockDispatchMixin):
 
 
 @QuantizationRegistry.register_moe_experts(
-    "blockint4", merge_gate_up=False, when=lambda _: has_triton, priority=0
+    "blockint4", merge_gate_up=False, when=lambda _: bool(triton), priority=0
 )
 class TritonBlockInt4MoeExpertsUnmerged(
     BlockInt4TritonMixin, BlockInt4MoeExpertsUnmergedBase
@@ -370,7 +370,7 @@ class TritonBlockInt4MoeExpertsUnmerged(
 
 
 @QuantizationRegistry.register_moe_experts(
-    "blockint4", merge_gate_up=True, when=lambda _: has_triton, priority=0
+    "blockint4", merge_gate_up=True, when=lambda _: bool(triton), priority=0
 )
 class TritonBlockInt4MoeExpertsMerged(
     BlockInt4TritonMixin, BlockInt4MoeExpertsMergedBase
@@ -786,7 +786,7 @@ class MarlinBlockInt4MoeExpertsMerged(
 
 
 @QuantizationRegistry.register_moe_experts(
-    "blockint4", merge_gate_up=True, when=lambda _: has_aiter, priority=1
+    "blockint4", merge_gate_up=True, when=lambda _: bool(aiter), priority=1
 )
 class AiterBlockInt4MoeExpertsMerged(BlockInt4MoeExpertsMergedBase):
     """aiter blockint4 MoE consumes merged gate/up weights repacked to uint8 pack2."""

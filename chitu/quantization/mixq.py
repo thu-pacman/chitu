@@ -6,7 +6,7 @@ import torch
 
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
-from chitu.utils import try_import_platform_dep
+
 from chitu.ops.quant import mixq_gemm
 from chitu.native_layout import (
     NativeLayoutMixin,
@@ -15,7 +15,7 @@ from chitu.native_layout import (
     HygonMixQFp16TileTensor,
 )
 
-hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
+from chitu.optdep import sugon_mixQ4_kernels as hygon_mixq_kernels
 
 
 class MixQLinear(NativeLayoutMixin, QuantizedLinearBase):
@@ -52,7 +52,7 @@ class MixQLinear(NativeLayoutMixin, QuantizedLinearBase):
         self.fp_features_num = fp_features_num
         self.process_block_size = process_block_size
         self.quantized_in_features = quantized_in_features
-        self.use_hygon = bool(has_hygon)
+        self.use_hygon = bool(bool(hygon_mixq_kernels))
 
         self.weight = torch.nn.Parameter(
             torch.zeros(
@@ -155,7 +155,7 @@ class HygonMixQLinear(MixQLinear):
         self.apply_native_layout(self.fp_weight, HygonMixQFp16TileTensor)
 
 
-if has_hygon:
+if hygon_mixq_kernels:
     QuantizationRegistry.register_linear("mixq", HygonMixQLinear)
 else:
     QuantizationRegistry.register_linear("mixq", MixQLinear)

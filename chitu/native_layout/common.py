@@ -12,9 +12,9 @@ import torch
 import torch.nn.functional as F
 
 from chitu.native_layout.base import NativeLayoutTensor
-from chitu.import_utils import try_import_platform_dep
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+
+from chitu.optdep import chitu_backend
 
 
 @dataclass
@@ -213,7 +213,7 @@ class Packed4BitWeightAlongK(NativeLayoutTensor):
         assert k % (tensor.k_cnt * tensor.k_stride) == 0
         assert k % (k_cnt * k_stride) == 0
         if (
-            has_chitu_backend
+            chitu_backend
             and tensor.k_stride == 1
             and tensor.k_cnt == 2
             and tensor.pack_to_unsigned

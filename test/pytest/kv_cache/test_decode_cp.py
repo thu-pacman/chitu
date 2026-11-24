@@ -20,10 +20,9 @@ from chitu.ops import (
 )
 from chitu.ops.decode_cp import pack_dcp_partials
 from chitu.task_type import TaskType
-from chitu.utils import try_import_platform_dep
 
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
 
 @pytest.fixture(autouse=True)
@@ -100,7 +99,7 @@ def test_group_allocation():
 
 
 @pytest.mark.skipif(
-    not has_accelerator() or not has_triton,
+    not has_accelerator() or not triton,
     reason="Decode-CP partial merge requires an accelerator and Triton",
 )
 def test_partial_graph():

@@ -5,13 +5,12 @@
 import torch
 
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep
+
 from chitu.lazy import single_dispatch_lazy_tensor
 
-triton, has_triton = try_import_platform_dep("triton")
-hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
+from chitu.optdep import triton, sugon_mixQ4_kernels as hygon_mixq_kernels
 
-if has_triton:
+if triton:
     from chitu.ops.triton_ops import (
         mixq_w8a8_gemm_triton,
         mixq_w4a4_gemm_triton,
@@ -35,14 +34,14 @@ def mixq_gemm(
 
 @mixq_gemm.register_auto
 def _auto_mixq_gemm():
-    if has_triton:
+    if triton:
         return "triton"
-    if has_hygon:
+    if hygon_mixq_kernels:
         return "hygon"
     raise NotImplementedError("Unsupported implementation: auto")
 
 
-@mixq_gemm.register("hygon", available=has_hygon)
+@mixq_gemm.register("hygon", available=bool(hygon_mixq_kernels))
 @single_dispatch_lazy_tensor
 def _mixq_gemm_hygon(
     a: torch.Tensor,
@@ -72,7 +71,7 @@ def _mixq_gemm_hygon(
     raise NotImplementedError(f"Unsupported bits num: w{w_bits}a{a_bits}")
 
 
-@mixq_gemm.register("triton", available=has_triton)
+@mixq_gemm.register("triton", available=bool(triton))
 @single_dispatch_lazy_tensor
 def _mixq_gemm_triton(
     a: torch.Tensor,

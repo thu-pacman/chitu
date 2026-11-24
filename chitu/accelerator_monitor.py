@@ -8,17 +8,16 @@ import logging
 import os
 
 from chitu.device_type import is_hygon
-from chitu.import_utils import try_import_opt_dep, try_import_platform_dep
 
-pynvml, has_pynvml = try_import_opt_dep("pynvml", "nvidia-ml-py")
-amdsmi, has_amdsmi = try_import_platform_dep("amdsmi")
+
+from chitu.optdep import pynvml, amdsmi
 
 logger = logging.getLogger(__name__)
 
 
 @functools.cache
 def get_nvml():
-    if not has_pynvml:
+    if not pynvml:
         raise RuntimeError("nvidia-ml-py is not available")
     try:
         pynvml.nvmlInit()
@@ -30,7 +29,7 @@ def get_nvml():
 
 @functools.cache
 def get_amdsmi():
-    if not has_amdsmi:
+    if not amdsmi:
         raise RuntimeError("AMD SMI is not available")
     try:
         amdsmi.amdsmi_init()
@@ -202,7 +201,7 @@ def _get_nvml_memory_bytes(device_index: int, pid: int | None):
                         f"with both APIs: {e}; fallback error: {e2}"
                     ) from e2
             for proc in processes:
-                if proc.pid != pid:
+                if proc.pid != pid:  # type: ignore
                     continue
                 proc_used = getattr(proc, "usedGpuMemory", None)
                 if proc_used is not None and proc_used > 0:

@@ -10,9 +10,7 @@ from typing_extensions import override
 
 from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.global_vars import get_global_args
-from chitu.utils import (
-    ceil_div,
-)
+from chitu.utils import ceil_div
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import (
     QuantizedLinearBase,

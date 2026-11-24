@@ -84,26 +84,23 @@ from chitu.device_type import has_accelerator, is_hygon, is_muxi
 from chitu.global_vars import set_global_args
 from chitu.kv_cache import PagedKVCacheAccessor
 from chitu.testing import assert_close
-from chitu.utils import (
-    try_import_and_setup_torch_npu,
-    try_import_opt_dep,
-    try_import_platform_dep,
+
+
+from chitu.optdep import (
+    flash_attn,
+    flash_attn_interface as flash_attn3,
+    flashinfer,
+    flash_mla,
+    torch_npu,
+    hpc as hunyuan_ops,
+    triton,
 )
 
-flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
-flash_attn3, has_flash_attn3 = try_import_opt_dep(
-    "flash_attn_interface", "flash_attn_interface"
-)
-flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
-flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-hunyuan_ops, has_hunyuan_ops = try_import_opt_dep("hpc", "hpc_ops")
 
+has_triton_ops = bool(triton) and has_accelerator()
 # `chitu.ops.triton_ops` imports triton at module level, so it cannot be
 # imported on a platform without it -- Ascend, for one. Only the fp8 MLA cache
 # case needs it, and that case is skipped there.
-triton, has_triton = try_import_platform_dep("triton")
-has_triton_ops = has_triton and has_accelerator()
 if has_triton_ops:
     from chitu.ops.triton_ops import quant_pertoken_kvcache_dsa
 
@@ -156,7 +153,7 @@ def _flash_mla_in_graph() -> bool:
 
 
 def _flash_attn_available() -> bool:
-    return has_flash_attn or has_flash_attn3
+    return bool(flash_attn) or bool(flash_attn3)
 
 
 def _merge(base: dict, extra: dict) -> dict:
@@ -282,7 +279,7 @@ _CASES = [
         # `cache_type != "paged"` would make this True; this case is paged.
         mtp_verify=False,
         build=lambda: NpuAttnBackend(qk_nope_head_dim=QK_NOPE_HEAD_DIM),
-        skip=None if has_torch_npu else "torch_npu is missing",
+        skip=None if torch_npu else "torch_npu is missing",
     ),
     _Case(
         name="hunyuan_gqa",
@@ -294,7 +291,7 @@ _CASES = [
         ),
         dtype=torch.bfloat16,
         overlay={"float_16bit_variant": "bfloat16"},
-        skip=None if has_hunyuan_ops else "hunyuan_ops (hpc) is missing",
+        skip=None if hunyuan_ops else "hunyuan_ops (hpc) is missing",
     ),
     _Case(
         name="dllm_gqa",
@@ -337,7 +334,7 @@ _CASES = [
         # same restriction applies even though flash_attn_interface imports.
         skip=(
             None
-            if has_flash_attn3 and not is_muxi()
+            if flash_attn3 and not is_muxi()
             else "MLA paged decode with flash_attn needs the FA3 path"
         ),
     ),
@@ -362,7 +359,7 @@ _CASES = [
         in_graph=True,
         mtp_verify=True,
         build=lambda: _flashinfer("mla"),
-        skip=None if has_flashinfer else "flashinfer is missing",
+        skip=None if flashinfer else "flashinfer is missing",
     ),
     _Case(
         name="flash_infer_dense",
@@ -370,7 +367,7 @@ _CASES = [
         in_graph=False,
         mtp_verify=False,
         build=lambda: _flashinfer("gqa"),
-        skip=None if has_flashinfer else "flashinfer is missing",
+        skip=None if flashinfer else "flashinfer is missing",
     ),
     _Case(
         name="flash_mla_dense",
@@ -379,7 +376,7 @@ _CASES = [
         mtp_verify=True,
         build=lambda: FlashMLABackend(qk_nope_head_dim=QK_NOPE_HEAD_DIM),
         dtype=torch.bfloat16,
-        skip=None if has_flash_mla else "flash_mla is missing",
+        skip=None if flash_mla else "flash_mla is missing",
     ),
     _Case(
         name="flash_mla_dense_e5m2",
@@ -398,7 +395,7 @@ _CASES = [
         },
         skip=(
             None
-            if (is_hygon() and has_flash_mla and has_flash_mla_e5m2)
+            if (is_hygon() and flash_mla and has_flash_mla_e5m2)
             else "fp8_e5m2 FlashMLA is Hygon-only"
         ),
     ),
@@ -413,7 +410,7 @@ _CASES = [
         ),
         dtype=torch.bfloat16,
         overlay={"models": {"index_topk": 2048}},
-        skip=None if has_flash_mla else "flash_mla is missing",
+        skip=None if flash_mla else "flash_mla is missing",
     ),
     _Case(
         name="flash_mla_sparse_fp8",
@@ -432,7 +429,7 @@ _CASES = [
         # raises before the flags can be checked.
         skip=(
             None
-            if (has_flash_mla and has_triton_ops and not is_muxi())
+            if (flash_mla and has_triton_ops and not is_muxi())
             else "flash_mla or the triton DSA quantizer is missing, or no FP8 kernel"
         ),
     ),
@@ -449,7 +446,7 @@ _CASES = [
         ),
         dtype=torch.bfloat16,
         overlay={"models": {"index_topk": 2048}},
-        skip=None if has_flash_attn3 else "flash_attn_interface (FA3) is missing",
+        skip=None if flash_attn3 else "flash_attn_interface (FA3) is missing",
     ),
 ]
 

@@ -6,10 +6,11 @@ import torch
 
 from chitu.device_type import has_accelerator
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep
 
-triton, has_triton = try_import_platform_dep("triton")
-has_triton_impl = has_triton and has_accelerator()
+
+from chitu.optdep import triton
+
+has_triton_impl = bool(triton) and has_accelerator()
 
 
 @make_op_dispatcher

@@ -18,7 +18,7 @@ import torch
 
 from chitu.device_type import has_accelerator
 from chitu.ops.utils import add_op_callback, remove_op_callback
-from chitu.utils import try_import_and_setup_torch_npu
+
 
 TConfig = TypeVar("TConfig")
 logger = logging.getLogger(__name__)
@@ -47,7 +47,8 @@ def do_bench_graph(
     assert return_mode in ("min", "max", "mean", "median")
     if min_repeat < 1:
         raise ValueError(f"min_repeat must be >= 1, got {min_repeat}")
-    try_import_and_setup_torch_npu()
+    from chitu.optdep import torch_npu  # noqa: F401
+
     if not has_accelerator():
         raise RuntimeError(
             "do_bench_graph requires CUDA (or Ascend redirected as CUDA)."

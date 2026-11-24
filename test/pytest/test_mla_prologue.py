@@ -4,10 +4,10 @@ import torch
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.ops import mla_prologue, a8_per_token_act_quant
 from chitu.native_layout import NativeLayoutTensor, PermutedTensor, NpuFractalZnTensor
-from chitu.utils import try_import_and_setup_torch_npu
+
 from chitu.testing import assert_close
 
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+from chitu.optdep import torch_npu
 
 
 def _to_plain(t):
@@ -23,7 +23,7 @@ def _to_plain(t):
 @pytest.mark.parametrize("n_local_heads", [32])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
-@pytest.mark.skipif(not has_torch_npu, reason="torch_npu not available")
+@pytest.mark.skipif(not torch_npu, reason="torch_npu not available")
 def test_mla_prologue_torch_npu(
     bs_seq: int,
     dim: int,
@@ -111,7 +111,7 @@ def test_mla_prologue_torch_npu(
 @pytest.mark.parametrize("n_local_heads", [32])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
-@pytest.mark.skipif(not has_torch_npu, reason="torch_npu not available")
+@pytest.mark.skipif(not torch_npu, reason="torch_npu not available")
 def test_mla_prologue_torch_npu_int8_weight_q_b_proj(
     bs_seq: int,
     dim: int,
@@ -210,7 +210,7 @@ def test_mla_prologue_torch_npu_int8_weight_q_b_proj(
 @pytest.mark.parametrize("n_local_heads", [32])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
-@pytest.mark.skipif(not has_torch_npu, reason="torch_npu not available")
+@pytest.mark.skipif(not torch_npu, reason="torch_npu not available")
 def test_mla_prologue_torch_npu_int8(
     bs_seq: int,
     dim: int,

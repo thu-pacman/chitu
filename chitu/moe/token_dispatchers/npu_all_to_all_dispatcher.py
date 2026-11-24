@@ -21,9 +21,9 @@ from chitu.moe.batched_routed_activation import (
 )
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.npu_utils import fused_experts_npu_tp_split, fused_experts_npu_tp_all_gather
-from chitu.utils import try_import_and_setup_torch_npu
 
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+from chitu.optdep import torch_npu
 
 
 class MoENpuAllToAllTokenDispatcher(MoETokenDispatcher):

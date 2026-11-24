@@ -14,7 +14,7 @@ from chitu.device_type import is_blackwell, is_hygon
 from chitu.global_vars import get_global_args
 from chitu.utils import parse_dtype, ceil_div
 from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
-from chitu.import_utils import try_import_opt_dep
+
 from chitu.distributed.comm_group import CommGroup
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_routed_activation import (
@@ -29,7 +29,7 @@ from chitu.ops.quant import a8_per_token_act_quant
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
 
-deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
+from chitu.optdep import deep_ep
 
 logger = getLogger(__name__)
 

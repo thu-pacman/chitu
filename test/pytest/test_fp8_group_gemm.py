@@ -5,17 +5,17 @@ from omegaconf import OmegaConf
 from chitu.ops import blockfp8_einsum_shc_hdc_shd
 from chitu.global_vars import set_global_args
 from chitu.device_type import is_nvidia
-from chitu.utils import try_import_platform_dep
+
 from chitu.testing import assert_close
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
 
 @pytest.mark.parametrize("batch_size", [0, 1, 2])
 @pytest.mark.parametrize("n_heads,in_feats,out_feats", [(16, 128, 512), (16, 512, 128)])
 @pytest.mark.parametrize("compute_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("soft_fp8", [False, True])
-@pytest.mark.skipif(not has_triton, reason="triton is not available")
+@pytest.mark.skipif(not triton, reason="triton is not available")
 def test_blockfp8_einsum_shc_hdc_shd(
     n_heads, batch_size, in_feats, out_feats, compute_dtype, soft_fp8, record_benchmark
 ):

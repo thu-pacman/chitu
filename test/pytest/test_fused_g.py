@@ -2,10 +2,10 @@ import torch
 import pytest
 
 from chitu.ops.fused_g import fused_g
-from chitu.utils import try_import_platform_dep
+
 from chitu.testing import assert_close
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
 
 @pytest.mark.parametrize(
@@ -16,7 +16,7 @@ triton, has_triton = try_import_platform_dep("triton")
 @pytest.mark.parametrize("impl", ["triton", "torch"])
 @torch.inference_mode()
 def test_fused_g(default_dtype, dim, bs, impl, record_benchmark):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     a = torch.randn(bs, dim, dtype=default_dtype).cuda()

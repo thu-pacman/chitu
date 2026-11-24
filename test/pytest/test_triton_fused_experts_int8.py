@@ -5,10 +5,11 @@
 import pytest
 import torch
 
-from chitu.import_utils import try_import_platform_dep
 
-triton, has_triton = try_import_platform_dep("triton")
-if has_triton:
+from chitu.optdep import triton
+
+
+if triton:
     from chitu.ops.triton_ops.triton_group_gemm import fused_moe_kernel_int8
     from chitu.ops.triton_ops.utils import to_triton_dtype
 
@@ -95,7 +96,7 @@ def _run_direct_kernel_with_padding_token_block(padding_token_id):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.skipif(not has_triton, reason="triton is not available")
+@pytest.mark.skipif(not triton, reason="triton is not available")
 def test_fused_moe_kernel_int8_masks_far_padding_activation_scales():
     # padding_token_id is large enough that if the kernel try to load the activation scale
     # for the padding token it will trigger CUDA illegal memory access.

@@ -17,16 +17,9 @@ from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
 from chitu.ops.page_table import topk_ids_to_page_ids
-from chitu.utils import (
-    try_import_and_setup_torch_npu,
-    try_import_opt_dep,
-    max_alloc_seq_len,
-)
+from chitu.utils import max_alloc_seq_len
 
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-cinfer_ascendc, has_cinfer_ascendc = try_import_opt_dep(
-    "cinfer_ascendc", "ascend_kernels"
-)
+from chitu.optdep import torch_npu, cinfer_ascendc
 
 core_num_each_platform = {
     "Ascend910_9361": 40,
@@ -158,7 +151,7 @@ class NpuAttnBackend(RefAttnBackend):
 
     @classmethod
     def should_use_attn_from_cinfer_ascendc(cls, model_type, batch_size):
-        return has_cinfer_ascendc and hasattr(cinfer_ascendc, "incre_flash_attention")
+        return bool(cinfer_ascendc) and hasattr(cinfer_ascendc, "incre_flash_attention")
 
     def prepare_metadata_for_prefill(self, seq_len_delta: BatchedSeqLenDelta):
         """construct attention mask for prefilling, different sequences will not attend each other

@@ -7,25 +7,18 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from chitu.utils import (
-    try_import_opt_dep,
-    try_import_platform_dep,
-    try_import_and_setup_torch_npu,
-    is_power_of_two,
-)
+from chitu.utils import is_power_of_two
 from chitu.global_vars import get_global_args
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
 from chitu.ops.utils import make_op_dispatcher
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
-    "muxi_layout_kernels", "muxi_layout_kernels"
-)
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
-hard_fp4_kernels, has_hard_fp4_kernels = try_import_opt_dep(
-    "hard_fp4_kernels", "hard_fp4_kernels"
+from chitu.optdep import (
+    chitu_backend,
+    torch_npu,
+    muxi_layout_kernels,
+    cpuinfer,
+    hard_fp4_kernels,
 )
 
 
@@ -88,7 +81,7 @@ def _auto_moe_gate(
 ):
     num_experts = scores.shape[-1]
     if (
-        has_muxi_layout_kernels
+        muxi_layout_kernels
         and num_expert_group == 8
         and topk_group == 4
         and topk == 8
@@ -103,14 +96,14 @@ def _auto_moe_gate(
     if get_global_args().infer.op_impl == "cpu":
         return "cpu"
     if (
-        has_hard_fp4_kernels
+        hard_fp4_kernels
         and num_experts <= 256
         and is_power_of_two(num_experts)
         and score_func in ["softmax"]
     ):
         return "blackwell"
     if (
-        has_chitu_backend
+        chitu_backend
         and topk in [6, 8, 16]
         and (
             (8 <= num_experts <= 256 and is_power_of_two(num_experts))
@@ -126,7 +119,7 @@ def _auto_moe_gate(
     ):
         return "cuda"
     if (
-        has_torch_npu
+        torch_npu
         and num_experts in [256, 384]
         and norm_prob
         and score_func in ["softmax", "sigmoid"]
@@ -137,7 +130,7 @@ def _auto_moe_gate(
     ):
         return "npu_moe_gating_top_k"
     if (
-        has_torch_npu
+        torch_npu
         and score_func == "softmax"
         and e_score_correction_bias is None
         and num_expert_group == 1
@@ -202,7 +195,7 @@ def moe_gate_torch(
     return _postprocess_moe_gate(indices, weights, routed_scaling_factor, output_dtypes)
 
 
-@moe_gate.register("cuda", available=has_chitu_backend)
+@moe_gate.register("cuda", available=bool(chitu_backend))
 def moe_gate_cuda(
     scores,
     topk,
@@ -235,7 +228,7 @@ def moe_gate_cuda(
     return topk_ids, topk_weights
 
 
-@moe_gate.register("muxi", available=has_muxi_layout_kernels)
+@moe_gate.register("muxi", available=bool(muxi_layout_kernels))
 def moe_gate_muxi(
     scores: torch.Tensor,
     topk: int,
@@ -305,7 +298,7 @@ def moe_gate_muxi(
     )
 
 
-@moe_gate.register("cpu", available=has_cpuinfer)
+@moe_gate.register("cpu", available=bool(cpuinfer))
 def moe_gate_cpu(
     scores,
     topk,
@@ -384,7 +377,7 @@ def moe_gate_cpu(
     return _postprocess_moe_gate(indices, weights, routed_scaling_factor, output_dtypes)
 
 
-@moe_gate.register("npu_moe_gating_top_k", available=has_torch_npu)
+@moe_gate.register("npu_moe_gating_top_k", available=bool(torch_npu))
 def moe_gate_npu_moe_gating_top_k(
     scores,
     topk,
@@ -446,7 +439,7 @@ def moe_gate_npu_moe_gating_top_k(
     return _postprocess_moe_gate(indices, weights, routed_scaling_factor, output_dtypes)
 
 
-@moe_gate.register("npu_moe_gating_top_k_softmax", available=has_torch_npu)
+@moe_gate.register("npu_moe_gating_top_k_softmax", available=bool(torch_npu))
 def moe_gate_npu_moe_gating_top_k_softmax(
     scores,
     topk,
@@ -468,7 +461,7 @@ def moe_gate_npu_moe_gating_top_k_softmax(
     return _postprocess_moe_gate(indices, weights, routed_scaling_factor, output_dtypes)
 
 
-@moe_gate.register("blackwell", available=has_hard_fp4_kernels)
+@moe_gate.register("blackwell", available=bool(hard_fp4_kernels))
 def moe_gate_blackwell(
     scores,
     topk,

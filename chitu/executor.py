@@ -57,7 +57,6 @@ from chitu.distributed.comm_group import CommGroup
 from chitu.moe import get_moe_impl
 from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransferHook
 from chitu.utils import (
-    try_import_and_setup_torch_npu,
     dataclass_from_dict,
     dataclass_to_dict,
     create_tensor,
@@ -73,7 +72,7 @@ from chitu.boot.tcp_ip import get_local_ip, is_localhost
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
 
 logger = getLogger(__name__)
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+from chitu.optdep import torch_npu
 
 # Although tags are not fully supported in the NCCL backend, they are helpful to understand the code
 TASK_TENSOR_TAG = 1

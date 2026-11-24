@@ -171,5 +171,7 @@ setup(
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": HybridBuildExtension, "build_py": my_build_py},
-    package_data={"chitu": ["config/**/*.yaml"]},
+    # `optdep/*.pyi` is the type stub for `chitu.optdep`. Without it, an
+    # installed wheel has no completion for optional dependencies.
+    package_data={"chitu": ["config/**/*.yaml", "optdep/*.pyi"]},
 )

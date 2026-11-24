@@ -36,7 +36,7 @@ from chitu.kv_cache import (
     KVCacheBase,
     PagedKVCacheAccessor,
 )
-from chitu.import_utils import try_import_platform_dep
+
 from chitu.ops.minimax_sparse.attn_runner import run_minimax_sparse_flash_decode
 from chitu.ops.minimax_sparse.indexer_decode import indexer_classic_decode_after_append
 from chitu.ops.minimax_sparse.select_impl import (
@@ -69,9 +69,9 @@ from chitu.quantization.utils import (
 )
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear, RowParallelLinear
 
-_, _has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
-if _has_triton:
+if triton:
     from chitu.ops.minimax_sparse.attn_runner_triton import (
         run_minimax_sparse_decode_triton,
         run_minimax_sparse_prefill_triton,

@@ -9,10 +9,12 @@ import torch.nn.functional as F
 from chitu.moe.batched_routed_activation import (
     PerExpertDenseBatchedRoutedActivationMinimal,
 )
-from chitu.utils import try_import_platform_dep
 
-triton, has_triton = try_import_platform_dep("triton")
-if has_triton:
+
+from chitu.optdep import triton
+
+
+if triton:
     from chitu.moe.experts.triton_batched_experts import triton_batched_experts
 from chitu.testing import assert_close
 
@@ -96,7 +98,7 @@ def _zero_padding_(*tensors, n_tokens_per_expert, M):
         t[~mask.expand_as(t)] = 0
 
 
-@pytest.mark.skipif(not has_triton, reason="triton is not available")
+@pytest.mark.skipif(not triton, reason="triton is not available")
 @pytest.mark.parametrize(
     "E, M, K, N",
     [

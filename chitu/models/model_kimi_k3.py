@@ -86,9 +86,9 @@ from chitu.ops import (
 from chitu.quantization import QuantizationRegistry
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear, RowParallelLinear
 from chitu.distributed.parallel_state import get_tp_size
-from chitu.utils import try_import_opt_dep
 
-_flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
+
+from chitu.optdep import flash_attn as _flash_attn
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +250,7 @@ class KimiK3VisionEncoderLayer(nn.Module):
         self.qkv_hidden_size = int(config.qkv_hidden_size)
         self.head_dim = self.qkv_hidden_size // self.num_heads
         self.scaling = self.head_dim**-0.5
-        self.use_flash_attn = has_flash_attn
+        self.use_flash_attn = bool(_flash_attn)
         self.attn_backend = (
             FlashAttnBackend() if self.use_flash_attn else RefAttnBackend()
         )

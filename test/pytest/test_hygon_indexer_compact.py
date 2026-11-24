@@ -20,7 +20,7 @@ requires_hygon_deepgemm = pytest.mark.skipif(
     reason="Hygon DeepGEMM compact-capable mqa_logits is not available",
 )
 requires_installed_hygon_deepgemm = pytest.mark.skipif(
-    not (is_hygon() and dsa_indexer_module.has_hygon_deepgemm),
+    not (is_hygon() and bool(dsa_indexer_module.hygon_deepgemm)),
     reason="Hygon DeepGEMM is not installed",
 )
 

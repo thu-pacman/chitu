@@ -17,11 +17,11 @@ from chitu.ops.quant.blockfp8.convert import blockfp8_weight_dequant_impl_for
 from chitu.device_type import has_native_fp8
 from chitu.lazy import eval_lazy
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.utils import try_import_platform_dep, ceil_div
+from chitu.utils import ceil_div
 from chitu.global_vars import set_global_args
 from chitu.testing import assert_close, AssertOpCalled
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
 
 def init_b_and_b_s(dim, block_size):
@@ -107,7 +107,7 @@ def test_silu_and_mul_and_blockfp8_act_quant(
         < bs * dim * dtype.itemsize * 20
     ):
         pytest.skip("No enough device memory on this platform")
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("Triton is not available")
 
     set_global_args(
@@ -159,7 +159,7 @@ def test_silu_and_mul_oai_and_blockfp8_act_quant_lazy_fusion(
         < bs * dim * dtype.itemsize * 20
     ):
         pytest.skip("No enough device memory on this platform")
-    if not has_triton:
+    if not triton:
         pytest.skip("Triton is not available")
 
     swiglu_alpha = 1.702
@@ -342,7 +342,7 @@ def test_soft_fp8_dequant_is_close_to_dequant(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-@pytest.mark.skipif(not has_triton, reason="triton is not available")
+@pytest.mark.skipif(not triton, reason="triton is not available")
 def test_blockfp8_weight_dequant_auto_selects_impl_by_raise_lower_bit_float_to():
     torch.set_default_dtype(torch.bfloat16)
     dim = 256

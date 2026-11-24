@@ -18,14 +18,14 @@ from chitu.ops import (
     dsa_fp8_paged_kvcache_read_dequant,
     read_from_paged_kv_cache,
 )
-from chitu.utils import try_import_opt_dep, ceil_div
+from chitu.utils import ceil_div
 from chitu.distributed.parallel_state import get_dp_size
 from chitu.device_type import has_accelerator, is_hygon, is_muxi
 from chitu.static_tensor import StaticTensor
 
-flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
+from chitu.optdep import flash_mla
 
-if has_flash_mla and has_accelerator():
+if flash_mla and has_accelerator():
     try:
         from flash_mla.flash_mla_interface import FlashMLASchedMeta
 

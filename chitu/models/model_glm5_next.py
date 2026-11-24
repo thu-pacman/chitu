@@ -75,9 +75,9 @@ from chitu.ops.linear_attn import (
 from chitu.quantization import QuantizationRegistry
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear, RowParallelLinear
 from chitu.distributed.parallel_state import get_tp_size
-from chitu.utils import try_import_opt_dep
 
-flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
+
+from chitu.optdep import flash_attn
 
 
 def get_mtp_accept_indices():
@@ -187,7 +187,7 @@ class Glm5NextVisionAttention(nn.Module):
             hidden_size,
             bias=bool(getattr(config, "attention_bias", True)),
         )
-        self.attn_backend = FlashAttnBackend() if has_flash_attn else RefAttnBackend()
+        self.attn_backend = FlashAttnBackend() if flash_attn else RefAttnBackend()
 
     def forward(
         self,
@@ -211,7 +211,7 @@ class Glm5NextVisionAttention(nn.Module):
             rotary_type="separated",
         )
 
-        if has_flash_attn:
+        if flash_attn:
             seq_len_delta = BatchedSeqLenDelta(
                 [0] * len(seq_lengths),
                 seq_lengths,

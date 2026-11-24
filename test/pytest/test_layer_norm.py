@@ -2,10 +2,10 @@ import torch
 import pytest
 
 from chitu.ops import layer_norm
-from chitu.utils import try_import_platform_dep
+
 from chitu.testing import assert_close
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
 
 @pytest.mark.parametrize(
@@ -22,7 +22,7 @@ triton, has_triton = try_import_platform_dep("triton")
 def test_layer_norm_operator(
     default_dtype, weight_dtype, compute_dtype, dim, bs, impl, record_benchmark
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     torch.manual_seed(1234)
@@ -71,7 +71,7 @@ def test_layer_norm_operator(
 def test_layer_norm_in_place(
     default_dtype, weight_dtype, compute_dtype, dim, bs, impl, record_benchmark
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     torch.manual_seed(1234)

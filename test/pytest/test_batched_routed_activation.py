@@ -16,22 +16,14 @@ from chitu.ops import (
     moe_sum_per_expert_dense,
 )
 from chitu.utils import ceil_div
-from chitu.import_utils import (
-    try_import_platform_dep,
-    try_import_opt_dep,
-    try_import_and_setup_torch_npu,
-)
+
 from chitu.device_type import has_native_fp8
 from chitu.testing import gen_token_to_expert_indices
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
-    "muxi_layout_kernels", "muxi_layout_kernels"
-)
+from chitu.optdep import chitu_backend, triton, torch_npu, muxi_layout_kernels
 
-if has_triton:
+
+if triton:
     from chitu.ops.triton_ops.moe_sum import (
         moe_sum_per_token_triton,
     )
@@ -265,12 +257,12 @@ def test_batched_routed_activation_indexed_to_expert_block_indexed(
     invalid_rate,
     impl,
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
-    if impl == "cuda" and not has_chitu_backend:
+    if impl == "cuda" and not chitu_backend:
         pytest.skip("chitu_backend is missing")
     if impl == "muxi":
-        if not has_muxi_layout_kernels:
+        if not muxi_layout_kernels:
             pytest.skip("muxi_layout_kernels is missing")
         if block_size != 16:
             pytest.skip("muxi only supports block_size=16")
@@ -363,7 +355,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted_with_scale(
     distribution,
     impl,
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     (
@@ -426,7 +418,7 @@ def test_batched_routed_activation_blockfp8_large_token_count(
     routed tokens, that offset can exceed int32 range and cause an illegal
     address if the kernel does not promote the offset to int64.
     """
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     quant_block_size = scale_block_shape[1]
@@ -488,7 +480,7 @@ def test_batched_routed_activation_blockfp8_large_token_count(
     ],
     ids=["int32_path", "int64_path"],
 )
-@pytest.mark.skipif(not has_triton, reason="triton is missing")
+@pytest.mark.skipif(not triton, reason="triton is missing")
 def test_moe_sum_per_token_offset_type(M, topk, N, expect_i64):
     """分别测试 moe_sum_per_token 的 INT32 和 INT64 index path
 
@@ -546,7 +538,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted(
     invalid_rate,
     impl,
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     torch.set_default_dtype(torch.bfloat16)
@@ -630,7 +622,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted(
 def test_batched_routed_activation_indexed_to_per_expert_dense(
     num_experts, num_tokens, hidden_size, topk, distribution, impl
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     activation = torch.rand(
@@ -682,7 +674,7 @@ def test_batched_routed_activation_indexed_to_per_expert_dense(
 def test_batched_routed_activation_indexed_to_per_expert_dense_with_scale(
     num_experts, num_tokens, hidden_size, topk, scale_block_shape, distribution, impl
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     quant_block_size = scale_block_shape[1]
@@ -767,7 +759,7 @@ def test_batched_routed_activation_indexed_to_concat_permuted(
     distribution,
     impl,
 ):
-    if impl == "torch_npu" and not has_torch_npu:
+    if impl == "torch_npu" and not torch_npu:
         pytest.skip("torch_npu is missing")
 
     activation = torch.rand(

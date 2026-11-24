@@ -5,12 +5,12 @@
 import torch
 
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep
+
 from chitu.batched_seq_len import BatchedSeqLenDelta
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
-if has_triton:
+if triton:
     from chitu.ops.triton_ops import (
         blockfp8_index_score_dense_dsv32_triton,
         blockfp8_index_score_ragged_q_dense_k_dsv32_triton,
@@ -37,7 +37,7 @@ def blockfp8_index_score_dense_dsv32(
 
 @blockfp8_index_score_dense_dsv32.register_auto
 def _auto_blockfp8_index_score_dense_dsv32():
-    if has_triton:
+    if triton:
         return "triton"
     return "torch"
 
@@ -77,7 +77,7 @@ def blockfp8_index_score_dense_dsv32_torch(
 
 
 blockfp8_index_score_dense_dsv32.register_candidate("triton")
-if has_triton:
+if triton:
     blockfp8_index_score_dense_dsv32.register("triton")(
         blockfp8_index_score_dense_dsv32_triton
     )
@@ -147,7 +147,7 @@ def blockfp8_index_score_ragged_q_dense_k_dsv32(
 
 @blockfp8_index_score_ragged_q_dense_k_dsv32.register_auto
 def _auto_blockfp8_index_score_ragged_q_dense_k_dsv32():
-    if has_triton:
+    if triton:
         return "triton"
     return "torch"
 
@@ -167,7 +167,7 @@ def _blockfp8_index_score_ragged_q_dense_k_dsv32_torch(
     )
 
 
-@blockfp8_index_score_ragged_q_dense_k_dsv32.register("triton", available=has_triton)
+@blockfp8_index_score_ragged_q_dense_k_dsv32.register("triton", available=bool(triton))
 def _blockfp8_index_score_ragged_q_dense_k_dsv32_triton(
     q: torch.Tensor,
     q_s: torch.Tensor,
@@ -235,7 +235,7 @@ def blockfp8_index_score_ragged_q_paged_k_dsv32(
 
 @blockfp8_index_score_ragged_q_paged_k_dsv32.register_auto
 def _auto_blockfp8_index_score_ragged_q_paged_k_dsv32():
-    if has_triton:
+    if triton:
         return "triton"
     return "torch"
 
@@ -264,7 +264,7 @@ def _blockfp8_index_score_ragged_q_paged_k_dsv32_torch(
     )
 
 
-@blockfp8_index_score_ragged_q_paged_k_dsv32.register("triton", available=has_triton)
+@blockfp8_index_score_ragged_q_paged_k_dsv32.register("triton", available=bool(triton))
 def _blockfp8_index_score_ragged_q_paged_k_dsv32_triton(
     q: torch.Tensor,
     q_s: torch.Tensor,

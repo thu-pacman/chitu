@@ -11,14 +11,14 @@ from chitu.utils import ceil_div
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.global_vars import get_global_args
 from chitu.device_type import is_enflame
-from chitu.import_utils import ensure_gcu_c_ops
+from chitu.optdep import ensure_gcu_c_ops
 from chitu.ops.utils import make_op_dispatcher
 from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
-from chitu.utils import parse_dtype, try_import_platform_dep
+from chitu.utils import parse_dtype
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
-if has_triton:
+if triton:
     from chitu.ops.triton_ops import (
         blockfp8_weight_dequant_triton,
         soft_fp8_blockfp8_weight_dequant_triton,
@@ -289,7 +289,7 @@ def blockfp8_weight_dequant_impl_for(soft_fp8: bool) -> str:
     if soft_fp8:
         if is_enflame():
             return "soft_torch"
-        if has_triton:
+        if triton:
             return "soft_triton"
         return "soft_torch"
     return "triton"
@@ -307,11 +307,11 @@ def _auto_blockfp8_weight_dequant():
 
 
 blockfp8_weight_dequant.register_candidate("triton")
-if has_triton:
+if triton:
     blockfp8_weight_dequant.register("triton")(blockfp8_weight_dequant_triton)
 
 blockfp8_weight_dequant.register_candidate("soft_triton")
-if has_triton:
+if triton:
     blockfp8_weight_dequant.register("soft_triton")(
         soft_fp8_blockfp8_weight_dequant_triton
     )
@@ -450,7 +450,7 @@ def blockfp8_act_quant(
 def _auto_blockfp8_act_quant():
     if is_enflame():
         return "gcu"
-    if has_triton:
+    if triton:
         return "triton"
     return "torch"
 
@@ -485,7 +485,7 @@ def blockfp8_act_quant_torch(
 
 
 blockfp8_act_quant.register_candidate("triton")
-if has_triton:
+if triton:
     blockfp8_act_quant.register("triton")(blockfp8_act_quant_triton)
 
 
@@ -534,7 +534,7 @@ def _auto_fp8_e4m3fn_quant_per_tensor():
 
 
 fp8_e4m3fn_quant_per_tensor.register_candidate("triton")
-if has_triton:
+if triton:
     fp8_e4m3fn_quant_per_tensor.register("triton")(fp8_e4m3fn_quant_per_tensor_triton)
 
 
@@ -561,7 +561,7 @@ def _auto_silu_and_mul_and_blockfp8_act_quant():
 
 
 silu_and_mul_and_blockfp8_act_quant.register_candidate("triton")
-if has_triton:
+if triton:
     silu_and_mul_and_blockfp8_act_quant.register("triton")(
         silu_and_mul_and_blockfp8_act_quant_triton
     )

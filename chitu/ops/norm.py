@@ -8,28 +8,22 @@ import torch
 import torch.nn.functional as F
 
 from chitu.device_type import has_accelerator
-from chitu.utils import (
-    try_import_platform_dep,
-    try_import_opt_dep,
-    try_import_and_setup_torch_npu,
-)
+
 from chitu.global_vars import get_global_args
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
 from chitu.ops.utils import compatible_with_inplace, make_op_dispatcher
 
-triton, has_triton = try_import_platform_dep("triton")
-has_triton_impl = has_triton and has_accelerator()
+from chitu.optdep import triton
+
+has_triton_impl = bool(triton) and has_accelerator()
 if has_triton_impl:
     from chitu.ops.triton_ops import (
         rms_norm_triton,
         rms_norm_residual_triton,
         layer_norm_triton,
     )
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
-tbsgemm, has_tbsgemm = try_import_opt_dep("tbsgemm", "muxi_w8a8_kernels")
+from chitu.optdep import torch_npu, chitu_backend, cpuinfer, tbsgemm
 
 
 @make_op_dispatcher
@@ -108,13 +102,13 @@ def _auto_rms_norm(
     eps,
     compute_dtype: torch.dtype,
 ):
-    if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
+    if cpuinfer and get_global_args().infer.op_impl == "cpu":  # type: ignore
         return "cpu"
-    if out is not None and has_chitu_backend:
+    if out is not None and chitu_backend:
         return "cuda"
-    if has_tbsgemm and get_global_args().dtype == "float16" and eps == 1e-6:
+    if tbsgemm and get_global_args().dtype == "float16" and eps == 1e-6:  # type: ignore
         return "muxi_w8a8_kernels"
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     if has_triton_impl:
         return "triton"
@@ -128,7 +122,7 @@ if has_triton_impl:
     rms_norm.register("triton")(rms_norm_triton)
 
 
-@rms_norm.register("cpu", available=has_cpuinfer)
+@rms_norm.register("cpu", available=bool(cpuinfer))
 @compatible_with_inplace
 def rms_norm_cpu(
     x: torch.Tensor, weight: torch.Tensor, *, eps, compute_dtype: torch.dtype
@@ -170,7 +164,7 @@ def rms_norm_cpu(
     return output
 
 
-@rms_norm.register("cuda", available=has_chitu_backend)
+@rms_norm.register("cuda", available=bool(chitu_backend))
 def rms_norm_cuda(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -190,7 +184,7 @@ def rms_norm_cuda(
     return out.view(x_shape)
 
 
-@rms_norm.register("muxi_w8a8_kernels", available=has_tbsgemm)
+@rms_norm.register("muxi_w8a8_kernels", available=bool(tbsgemm))
 @compatible_with_inplace
 def rms_norm_muxi(
     x: torch.Tensor,
@@ -207,7 +201,7 @@ def rms_norm_muxi(
     return tbsgemm.norm(x, weight)
 
 
-@rms_norm.register("torch_npu", available=has_torch_npu)
+@rms_norm.register("torch_npu", available=bool(torch_npu))
 @compatible_with_inplace
 def rms_norm_npu(
     x: torch.Tensor,

@@ -77,9 +77,10 @@ from chitu.distributed.pd_disaggregation.pd_coordination import PDCoordinationSe
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.transfer_engine import (
     MooncakeBootstrapServer,
 )
-from chitu.import_utils import try_import_opt_dep
 
-mooncake, has_mooncake = try_import_opt_dep("mooncake", "mooncake")
+
+from chitu.optdep import mooncake
+
 
 # Add project root to path (required for correct module imports in pytest)
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -209,31 +210,23 @@ atexit.register(_print_benchmark_results)
 
 def _check_impl_available(impl: str) -> bool:
     """Check if an implementation is available."""
+    import chitu.optdep as optdep
+
     try:
         if impl == "triton":
-            from chitu.utils import try_import_platform_dep
-
-            _, has = try_import_platform_dep("triton")
-            return has
+            return bool(optdep.triton)
         elif impl == "cuda":
-            from chitu.utils import try_import_platform_dep
-
-            _, has = try_import_platform_dep("chitu_backend")
-            return has
+            return bool(optdep.chitu_backend)
         elif impl == "torch_npu":
-            from chitu.utils import try_import_and_setup_torch_npu
-
-            _, has = try_import_and_setup_torch_npu()
-            return has
+            return bool(optdep.torch_npu)
         elif impl in ["torch", "ref"]:
             return True
         elif impl == "cpuinfer":
-            from chitu.utils import try_import_opt_dep
-
-            _, has = try_import_opt_dep("cpuinfer", "cpu")
-            return has
+            return bool(optdep.cpuinfer)
         else:
             return True  # Unknown impl, assume available
+    except Exception:
+        return False
     except Exception:
         return False
 
@@ -539,7 +532,7 @@ def pytest_configure(config):
 def _set_mooncake_env():
     # If mooncake is unavailable, fall back to mock.
     if "MOONCAKE_MOCK_MODE" not in os.environ:
-        if has_mooncake:
+        if mooncake:
             os.environ["MOONCAKE_MOCK_MODE"] = "0"
         else:
             os.environ["MOONCAKE_MOCK_MODE"] = "1"

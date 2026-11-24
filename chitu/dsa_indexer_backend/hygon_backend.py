@@ -7,7 +7,7 @@ import torch
 
 from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.kv_cache import KVCacheAccessor, PagedKVCacheAccessor
-from chitu.utils import try_import_opt_dep, try_import_platform_dep
+
 from .base import DSAIndexer
 
 import inspect
@@ -21,8 +21,7 @@ from chitu.ops import append_to_paged_kv_cache, read_from_paged_kv_cache
 from chitu.utils import ceil_div
 
 logger = getLogger(__name__)
-hygon_deepgemm, has_hygon_deepgemm = try_import_opt_dep("deepgemm", "deep_gemm")
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+from chitu.optdep import deepgemm as hygon_deepgemm, chitu_backend
 
 
 def _has_hygon_compact_mqa_logits(module, available: bool) -> bool:
@@ -58,12 +57,12 @@ def _has_hygon_compact_mqa_logits(module, available: bool) -> bool:
 
 
 has_hygon_compact_mqa_logits = _has_hygon_compact_mqa_logits(
-    hygon_deepgemm, has_hygon_deepgemm
+    hygon_deepgemm, bool(hygon_deepgemm)
 )
 support_indexer_hygon = (
     is_hygon()
-    and has_chitu_backend
-    and has_hygon_deepgemm
+    and bool(chitu_backend)
+    and bool(hygon_deepgemm)
     and has_hygon_compact_mqa_logits
     and hasattr(hygon_deepgemm, "paged_mqa_logits")
     and hasattr(hygon_deepgemm, "get_paged_mqa_logits_metadata")
@@ -78,7 +77,7 @@ _PLAN_VALUES = frozenset((1, 2, 4, 8, 16))
 # This tier is what a launch preceding the first reservation (warmup) runs on;
 # `reserve_metadata_for_decode` pins each capture's own bound.
 _MAX_PLAN_PARTS = 16
-has_hygon_decode_topk_workspace = has_chitu_backend and all(
+has_hygon_decode_topk_workspace = bool(chitu_backend) and all(
     callable(getattr(chitu_backend, symbol, None))
     for symbol in (
         "hygon_indexer_topk_with_workspace",
