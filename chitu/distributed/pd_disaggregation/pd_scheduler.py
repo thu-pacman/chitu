@@ -1174,9 +1174,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             time_since_task_created = info.time_since_task_created(now)
             prefix_len = int(getattr(task, "prefix_tokens_len", 0))
 
-            hit_tokens = Backend.schedulers[target_dp_rank]._num_prefill_cached_tokens(
-                task
-            )
+            scheduler = Backend.schedulers[target_dp_rank]
+            hit_tokens = scheduler._num_prefill_cached_tokens(task)
             required_tokens = max(
                 0, prefix_len + int(self._decode_prealloc_reserved_tokens)
             )
@@ -1193,12 +1192,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             assert (
                 not task.new_cache_ids
             ), f"task.new_cache_ids should be empty before prealloc"
-            (
-                capacity_status,
-                num_cached_tokens,
-                hit_block_counts,
-            ) = Backend.schedulers[target_dp_rank]._prepare_pd_decode_kvcache(
-                rid, required_tokens
+            capacity_status, hit_block_counts = scheduler._prepare_pd_decode_kvcache(
+                task, required_tokens, hit_tokens
             )
 
             if capacity_status == KVCacheCapacityStatus.EXCEEDS_CAPACITY:
@@ -1223,7 +1218,6 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 cache_manager_hit_block_counts=hit_block_counts,
             )
             info.last_prepare_ts = now
-            prealloc_charge_tokens = max(0, required_tokens - num_cached_tokens)
             info.prealloc_tokens = prealloc_charge_tokens
 
             task.status = TaskStatus.PDDecodePrealloc
