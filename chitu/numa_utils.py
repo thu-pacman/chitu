@@ -6,6 +6,7 @@ from logging import getLogger
 import subprocess
 import os
 import re
+from typing import Optional
 
 import torch
 
@@ -106,7 +107,14 @@ def _bind_process_to_numa_id(numa_id: int):
     logger.info(f"Bound process to NUMA node {numa_id}")
 
 
-def bind_process_to_numa(binding_type: str):
+def bind_process_to_numa(binding_type: str, device_id: Optional[int] = None):
+    """Bind the current process according to ``binding_type``.
+
+    ``device_id`` is the device this rank owns. Pass it explicitly when binding runs
+    before CUDA is initialized, otherwise ``numa_near_device`` has to call
+    ``torch.cuda.current_device()``, which initializes CUDA itself.
+    """
+
     if binding_type == "none":
         pass
 
@@ -115,7 +123,8 @@ def bind_process_to_numa(binding_type: str):
         _bind_process_to_numa_id(local_rank)
 
     elif binding_type == "numa_near_device":
-        device_id = torch.cuda.current_device()
+        if device_id is None:
+            device_id = torch.cuda.current_device()
         try:
             numa_id = _get_numa_of_gpu(device_id)
             _bind_process_to_numa_id(numa_id)

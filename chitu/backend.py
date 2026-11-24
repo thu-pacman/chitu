@@ -360,6 +360,23 @@ class Backend:
 
         # Get rank from environment variable because we have not initialize torch.distributed yet
 
+        rank = int(os.environ.get("RANK", 0))
+
+        # Bind CPU/memory before the CUDA device is selected and before NCCL is
+        # initialized, so that the NCCL helper threads and the pinned host buffers are
+        # allocated on the NUMA node that owns this rank's GPU. The device is passed
+        # explicitly because `torch.cuda.current_device()` would initialize CUDA here.
+        bind_process_to_numa(
+            args.infer.bind_process_to_cpu,
+            device_id=(
+                args.infer.device_ids[rank]
+                if args.infer.op_impl != "cpu"
+                and args.infer.device_ids is not None
+                and rank < len(args.infer.device_ids)
+                else None
+            ),
+        )
+
         # Bind process to GPU. Please put it before init_process_group
         if args.infer.op_impl != "cpu":
             set_cuda_device()
@@ -372,8 +389,6 @@ class Backend:
 
         if Backend.use_gloo:
             Backend.group_gloo = torch.distributed.new_group(backend="gloo")
-
-        bind_process_to_numa(args.infer.bind_process_to_cpu)
 
         parallelism_sizes = calculate_parallelism_sizes(args)
         global_rank = torch.distributed.get_rank()
