@@ -24,11 +24,13 @@ from chitu.quantization import (
 from chitu.moe.batched_routed_activation import (
     PerExpertDenseBatchedRoutedActivationMinimal,
 )
-from chitu.utils import try_import_platform_dep
+
 from chitu.native_layout import init_native_layout
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
+from chitu.optdep import chitu_backend
+
+
+has_marlin = bool(chitu_backend) and hasattr(chitu_backend, "gptq_marlin_gemm")
 has_marlin_moe = has_marlin and hasattr(chitu_backend, "moe_wna16_marlin_gemm")
 
 pytestmark = [
@@ -192,8 +194,8 @@ def test_registry_prefers_marlin_blockint4_moe(merge_gate_up):
 def test_hygon_prefill_predicate_short_circuits_without_backend(monkeypatch):
     """Non-Hygon registry checks must not require Hygon runtime configuration."""
 
-    monkeypatch.setattr(blockint4, "has_aiter", False)
-    monkeypatch.setattr(blockint4, "has_hygon_w4a16_kernel", False)
+    monkeypatch.setattr(blockint4, "aiter", None)
+    monkeypatch.setattr(blockint4, "hygon_w4a16_kernel", None)
     monkeypatch.setattr(
         blockint4,
         "get_global_args",

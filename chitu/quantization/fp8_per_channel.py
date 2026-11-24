@@ -23,12 +23,12 @@ from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
     PerTokenBatchedExpertResult,
 )
-from chitu.utils import try_import_platform_dep
-
-triton, has_triton = try_import_platform_dep("triton")
 
 
-@QuantizationRegistry.register_linear("fp8_per_channel", when=lambda _: has_triton)
+from chitu.optdep import triton
+
+
+@QuantizationRegistry.register_linear("fp8_per_channel", when=lambda _: bool(triton))
 class Fp8PerChannelLinear(QuantizedLinearBase):
     """
     FP8 per-channel weight quantized linear layer.
@@ -100,7 +100,7 @@ def _fp8_per_channel_gemm(
 
 
 @QuantizationRegistry.register_moe_experts(
-    "fp8_per_channel", merge_gate_up=True, when=lambda _: has_triton
+    "fp8_per_channel", merge_gate_up=True, when=lambda _: bool(triton)
 )
 class Fp8PerChannelMoeExpertsMerged(QuantizedMoeExpertsMerged):
     """

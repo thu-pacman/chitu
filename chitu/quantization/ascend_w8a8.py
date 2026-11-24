@@ -6,7 +6,7 @@ from typing import Optional
 from typing_extensions import override
 import torch
 
-from chitu.utils import try_import_and_setup_torch_npu
+
 from chitu.quantization.base import QuantizedLinearBase
 from chitu.distributed.parallel_state import get_tp_group
 from chitu.quantization.registry import QuantizationRegistry
@@ -19,7 +19,7 @@ from chitu.native_layout import (
 from chitu.lazy import eval_lazy
 from chitu.device_type import is_ascend_950
 
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+from chitu.optdep import torch_npu
 
 
 @QuantizationRegistry.register_linear("ascend_w8a8")

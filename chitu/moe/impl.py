@@ -10,7 +10,7 @@ import torch
 
 from chitu.lazy import eval_lazy
 from chitu.task_type import TaskType
-from chitu.utils import try_import_opt_dep, try_import_and_setup_torch_npu, ceil_div
+from chitu.utils import ceil_div
 from chitu.moe.token_dispatchers import (
     MoETokenDispatcher,
     MoEAllGatherTokenDispatcher,
@@ -38,13 +38,11 @@ from chitu.distributed.parallel_state import (
 )
 from chitu.distributed.comm_group import CommGroup
 
-deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
-deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+from chitu.optdep import deep_ep, deep_gemm, torch_npu
 
 logger = logging.getLogger(__name__)
 
-if has_deep_ep:
+if deep_ep:
     from .token_dispatchers import MoELowLatencyTokenDispatcher
     from .token_dispatchers import MoENormalTokenDispatcher
 
@@ -469,10 +467,10 @@ class MoEImplEP(MoEImplBase):
             if (
                 self.dp_size > 1
                 and (self.etp_size == 1 or self.etp_size == self.tp_size)
-                and has_deep_ep
+                and deep_ep
             ):
                 self.prefill_token_dispatcher_impl = "deepep-nl"
-            elif self.dp_size > 1 and self.etp_size == 1 and has_torch_npu:
+            elif self.dp_size > 1 and self.etp_size == 1 and torch_npu:
                 self.prefill_token_dispatcher_impl = "npu_all_to_all"
             else:
                 self.prefill_token_dispatcher_impl = "allgather"
@@ -481,17 +479,17 @@ class MoEImplEP(MoEImplBase):
             if (
                 self.dp_size > 1
                 and (self.etp_size == 1 or self.etp_size == self.tp_size)
-                and has_deep_ep
+                and deep_ep
             ):
                 self.decode_token_dispatcher_impl = "deepep-ll"
             elif (
                 self.dp_size > 1
                 and self.etp_size == 1
-                and has_torch_npu
+                and torch_npu
                 and not (is_ascend_910b() and self.tp_size > 1)
             ):
                 self.decode_token_dispatcher_impl = "npu_distribute"
-            elif self.dp_size > 1 and self.etp_size == 1 and has_torch_npu:
+            elif self.dp_size > 1 and self.etp_size == 1 and torch_npu:
                 self.decode_token_dispatcher_impl = "npu_all_to_all"
             else:
                 self.decode_token_dispatcher_impl = "allgather"

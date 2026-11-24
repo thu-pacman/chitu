@@ -14,13 +14,14 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from chitu.utils import try_import_and_setup_torch_npu
+
 from chitu.distributed.comm_group import CommGroup
 from chitu.device_type import has_accelerator
 
 LOCAL_WORLD_SIZE = None
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-if not has_torch_npu:
+from chitu.optdep import torch_npu
+
+if not torch_npu:
     LOCAL_WORLD_SIZE = int(os.environ.get("LOCAL_WORLD_SIZE", "8"))
 
 logger = getLogger(__name__)

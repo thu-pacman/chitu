@@ -6,11 +6,11 @@ import torch
 import torch.nn.functional as F
 
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep
 
-triton, has_triton = try_import_platform_dep("triton")
 
-if has_triton:
+from chitu.optdep import triton
+
+if triton:
     from chitu.ops.triton_ops import fused_g_triton
 
 
@@ -37,7 +37,7 @@ def fused_g(
 
 @fused_g.register_auto
 def _auto_fused_g():
-    if has_triton:
+    if triton:
         return "triton"
     return "torch"
 
@@ -48,5 +48,5 @@ def fused_g_torch(a: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor):
 
 
 fused_g.register_candidate("triton")
-if has_triton:
+if triton:
     fused_g.register("triton")(fused_g_triton)

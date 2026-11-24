@@ -7,13 +7,13 @@ import torch
 
 from chitu.device_type import has_accelerator, is_ascend_950
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
+
 from chitu.global_vars import get_global_args
 
-triton, has_triton = try_import_platform_dep("triton")
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-has_triton_impl = has_triton and has_accelerator()
+from chitu.optdep import triton, chitu_backend
+from chitu.optdep import torch_npu
+
+has_triton_impl = bool(triton) and has_accelerator()
 
 if has_triton_impl:
     from chitu.ops.triton_ops import (
@@ -385,7 +385,7 @@ def _auto_append_to_dense_kv_cache(
     delta_seq_ids: Optional[torch.Tensor] = None,
     use_i64_offsets: bool = False,
 ):
-    if has_torch_npu and is_ascend_950():
+    if torch_npu and is_ascend_950():
         return "torch_npu"
     if has_triton_impl:
         return "triton"
@@ -419,7 +419,7 @@ def append_to_dense_kv_cache_torch(
     )
 
 
-@append_to_dense_kv_cache.register("torch_npu", available=has_torch_npu)
+@append_to_dense_kv_cache.register("torch_npu", available=bool(torch_npu))
 def append_to_dense_kv_cache_torch_npu(
     kv_cache: torch.Tensor,  # (batch_size, seq_len, other contiguous dims...)
     this_kv: torch.Tensor,  # (num_tokens, other contiguous dims...)
@@ -767,9 +767,7 @@ def dsa_fp8_kvcache_dequant(kv_fp8: torch.Tensor, out: Optional[torch.Tensor] = 
     """
     if not kv_fp8.is_cuda:
         raise NotImplementedError("DSA FP8 KV dequant only supports CUDA tensors")
-    if not has_chitu_backend or not hasattr(
-        chitu_backend, "cuda_dsa_fp8_kvcache_dequant"
-    ):
+    if not chitu_backend or not hasattr(chitu_backend, "cuda_dsa_fp8_kvcache_dequant"):
         raise NotImplementedError(
             "DSA FP8 KV dequant requires chitu_backend built with "
             "cuda_dsa_fp8_kvcache_dequant"
@@ -786,7 +784,7 @@ def dsa_fp8_paged_kvcache_read_dequant(
 ):
     """Read FlashMLA DSA FP8 paged KV cache and dequantize to ragged bf16."""
     if (
-        has_chitu_backend
+        chitu_backend
         and hasattr(chitu_backend, "cuda_dsa_fp8_paged_kvcache_read_dequant")
         and kv_fp8.is_cuda
     ):

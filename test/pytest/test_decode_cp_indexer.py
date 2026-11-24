@@ -16,7 +16,7 @@ from chitu.dsa_indexer_backend import (
 )
 import chitu.dsa_indexer_backend.base as dsa_indexer_module
 from chitu.dsa_indexer_backend.hygon_backend import support_indexer_hygon
-from chitu.dsa_indexer_backend.triton_backend import has_triton
+from chitu.dsa_indexer_backend.triton_backend import triton
 from chitu.kv_cache import GlobalLocalMap, PagedKVCache, PagedKVCacheAccessor
 
 
@@ -237,7 +237,7 @@ def test_backend_topk(impl):
 
     if impl == "hygon" and not support_indexer_hygon:
         pytest.skip("Decode-CP Hygon indexer requires Hygon paged MQA")
-    if impl == "triton_bf16" and (not torch.cuda.is_available() or not has_triton):
+    if impl == "triton_bf16" and (not torch.cuda.is_available() or not triton):
         pytest.skip("Decode-CP Triton indexer requires an accelerator and Triton")
 
     num_heads, head_dim, page_size = 32, 128, 64

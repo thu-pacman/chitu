@@ -7,7 +7,7 @@ import functools
 import torch
 
 from chitu.checkpoint_prefix import CheckpointPrefix
-from chitu.utils import try_import_platform_dep
+
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedMoeExpertsMerged
 from chitu.moe.batched_routed_activation import (
@@ -15,13 +15,14 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
 )
 
-lmslim, has_lmslim = try_import_platform_dep("lmslim")
-if has_lmslim:
+from chitu.optdep import lmslim
+
+if lmslim:
     from lmslim.layers.fused_moe.fuse_moe_w4a8 import fused_experts_impl_w4a8
 
 
 @QuantizationRegistry.register_moe_experts(
-    "hygon_w4a8", merge_gate_up=True, when=lambda _: has_lmslim
+    "hygon_w4a8", merge_gate_up=True, when=lambda _: bool(lmslim)
 )
 class HygonW4A8MoeExpertsMerged(QuantizedMoeExpertsMerged):
     def __init__(

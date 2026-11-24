@@ -26,11 +26,11 @@ from chitu.npu_utils import (
     fused_experts_npu_tp_all_gather,
     get_hcomm_info,
 )
-from chitu.utils import try_import_and_setup_torch_npu, ceil_div
+from chitu.utils import ceil_div
 from chitu.device_type import is_ascend_910b
 from chitu.global_vars import get_global_args
 
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+from chitu.optdep import torch_npu
 
 
 class MoENpuDistributeTokenDispatcher(MoETokenDispatcher):

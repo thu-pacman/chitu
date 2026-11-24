@@ -35,12 +35,7 @@ from chitu.distributed.parallel_state import (
 from chitu.global_vars import set_global_args, get_global_args
 from chitu.models.model_deepseek_v3 import AttentionDeepSeekV3, Indexer
 from chitu.native_layout import init_native_layout
-from chitu.utils import (
-    ceil_div,
-    try_import_opt_dep,
-    try_import_platform_dep,
-    try_import_and_setup_torch_npu,
-)
+from chitu.utils import ceil_div
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.device_type import is_hygon, is_muxi, has_accelerator, has_native_fp8
 from chitu.testing import assert_close
@@ -64,19 +59,17 @@ from chitu.kv_cache.providers.deepseek_v3 import (
     deepseek_v3_kv_cache_spec,
 )
 
-triton, has_triton = try_import_platform_dep("triton")
-flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
-flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
-flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-flash_attn3, has_flash_attn3 = try_import_opt_dep(
-    "flash_attn_interface", "flash_attn_interface"
-)
-deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
-hunyuan_ops, has_hunyuan_ops = try_import_opt_dep("hpc", "hpc_ops")
-scipy, has_scipy = try_import_opt_dep("scipy", "scipy")
-fast_hadamard_transform, has_fast_hadamard_transform = try_import_opt_dep(
-    "fast_hadamard_transform", "fast_hadamard_transform"
+from chitu.optdep import (
+    triton,
+    flash_attn,
+    flashinfer,
+    flash_mla,
+    torch_npu,
+    flash_attn_interface as flash_attn3,
+    deep_gemm,
+    hpc as hunyuan_ops,
+    scipy,
+    fast_hadamard_transform,
 )
 
 
@@ -100,7 +93,7 @@ def _make_csa_hca_attn_backend(
 
 def _skip_unsupported_csa_hca_impl(impl: str):
     if impl == "flash_mla":
-        if not has_flash_mla:
+        if not flash_mla:
             pytest.skip("flash_mla is missing")
         if not hasattr(flash_mla, "flash_mla_sparse_fwd"):
             pytest.skip("flash_mla is too old to have `flash_mla_sparse_fwd`")
@@ -351,7 +344,7 @@ def test_dsa_indexer_paged_kv(
     impl,
     record_benchmark,
 ):
-    if not has_triton:
+    if not triton:
         pytest.skip("triton is missing")
     if impl == "deepgemm":
         if not support_indexer_deepgemm:
@@ -552,7 +545,7 @@ def test_dsa_indexer_paged_kv_bf16(
 ):
     if impl == "hygon" and not support_indexer_hygon:
         pytest.skip("hygon indexer requires compact-capable Hygon DeepGEMM")
-    if impl == "triton_bf16" and not (torch.cuda.is_available() and has_triton):
+    if impl == "triton_bf16" and not (torch.cuda.is_available() and triton):
         pytest.skip("triton_bf16 indexer requires CUDA + triton")
 
     _, total_memory = torch.cuda.mem_get_info()
@@ -793,7 +786,7 @@ def test_triton_bf16_index_score_ragged_qk_nocp(
     non-causal window (ke = seq_len + ks) which that suite does not exercise.
     Each query attends only to its own sequence's keys in the ragged concat K.
     """
-    if not (torch.cuda.is_available() and has_triton):
+    if not (torch.cuda.is_available() and triton):
         pytest.skip("triton_bf16 indexer requires CUDA + triton")
 
     _, total_memory = torch.cuda.mem_get_info()
@@ -887,7 +880,7 @@ def test_triton_bf16_index_score_ragged_qk_cp(pcp_size, stage, n_heads, head_dim
     Focus: multi-seq must not bleed across sequences — the exact scenario where
     the hygon CP branch (which zeroes ks) is wrong.
     """
-    if not (torch.cuda.is_available() and has_triton):
+    if not (torch.cuda.is_available() and triton):
         pytest.skip("triton_bf16 indexer requires CUDA + triton")
 
     _, total_memory = torch.cuda.mem_get_info()
@@ -1015,15 +1008,15 @@ def test_mla_prefill_ragged_qkvo(
     if local_n_heads >= 64 and total_memory < 80:
         pytest.skip("Skip testing h_q>=64 on devices with not enough memory")
 
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     if impl == "npu":
-        if not has_torch_npu:
+        if not torch_npu:
             pytest.skip("torch_npu is missing")
         # if topk is not None:
         #     pytest.skip("torch_npu does not support topk")
     if impl == "flash_mla":
-        if not has_accelerator() or not has_flash_mla:
+        if not has_accelerator() or not flash_mla:
             pytest.skip("flash_mla is missing")
         if topk is None:  # skip since default triton fall-back
             pytest.skip("flash_mla prefill only supports sparse attention for now")
@@ -1176,15 +1169,15 @@ def test_mla_prefill_ragged_qo_paged_kv(
     impl,
     record_benchmark,
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     if impl == "flashinfer":
-        if not has_flashinfer or packaging.version.parse(
+        if not flashinfer or packaging.version.parse(
             flashinfer.__version__
         ) < packaging.version.parse("0.2.0"):
             pytest.skip("flashinfer is missing or too old")
     if impl == "npu":
-        if not has_torch_npu:
+        if not torch_npu:
             pytest.skip("torch_npu is missing")
 
     torch.set_default_dtype(torch.float16)
@@ -1310,13 +1303,13 @@ def test_flash_mla_fp8_kvcache_dequant_bf16_prefill(
     local_n_heads,
     record_benchmark,
 ):
-    if not has_accelerator() or not has_flash_mla:
+    if not has_accelerator() or not flash_mla:
         pytest.skip("flash_mla is missing")
     if is_hygon() or is_muxi():
         pytest.skip("FlashMLA FP8 is not supported on Hygon/Muxi")
     if not hasattr(flash_mla, "flash_mla_sparse_fwd"):
         pytest.skip("flash_mla is too old to have `flash_mla_sparse_fwd`")
-    if not has_triton:
+    if not triton:
         pytest.skip("triton is required for DSA FP8 KV quantization")
 
     torch.set_default_dtype(torch.bfloat16)
@@ -1573,7 +1566,7 @@ def test_mla_decode_dense_kv(
     record_benchmark,
 ):
     if impl == "triton":
-        if not has_triton:
+        if not triton:
             pytest.skip("triton is missing")
         if is_muxi():
             if topk is not None:
@@ -1585,7 +1578,7 @@ def test_mla_decode_dense_kv(
                 # muxi runs a fallback path when topk is None, but requries triton >= 3.2.0
                 pytest.skip("triton too old")
     if impl == "npu":
-        if not has_torch_npu:
+        if not torch_npu:
             pytest.skip("torch_npu is missing")
         if topk is not None:
             pytest.skip("torch_npu does not support topk")
@@ -1731,20 +1724,20 @@ def test_mla_decode_paged_kv(
         pytest.skip("Skip testing h_q>=64 on devices with not enough memory")
 
     if impl == "triton":
-        if not has_triton:
+        if not triton:
             pytest.skip("triton is missing")
         if topk is not None and is_muxi():
             # It runs forever for unknown reasons (FIXME)
             pytest.skip("triton does not support topk")
     if impl == "flashinfer":
-        if not has_flashinfer or packaging.version.parse(
+        if not flashinfer or packaging.version.parse(
             flashinfer.__version__
         ) < packaging.version.parse("0.2.0"):
             pytest.skip("flashinfer is missing or too old")
         if topk is not None:
             pytest.skip("flashinfer does not support topk")
     if impl == "npu":
-        if not has_torch_npu:
+        if not torch_npu:
             pytest.skip("torch_npu is missing")
         if not use_separated_kv_lora_k_pe:
             pytest.skip("NpuAttnBackend only supports separated kv_lora/k_pe storage")
@@ -1759,7 +1752,7 @@ def test_mla_decode_paged_kv(
             # is undocumented.
             pytest.skip("torch_npu does not support 20 heads")
     if impl == "flash_mla":
-        if not has_accelerator() or not has_flash_mla:
+        if not has_accelerator() or not flash_mla:
             pytest.skip("flash_mla is missing")
         if topk is None and page_size != 64:
             pytest.skip("MLA paged decode requires page_size=64 in dense mode")
@@ -1770,9 +1763,9 @@ def test_mla_decode_paged_kv(
             # fails to support.
             pytest.skip("flash_mla does not support #heads=20 on muxi")
     if impl == "flash_attn":
-        if not has_flash_attn and not has_flash_attn3:
+        if not flash_attn and not flash_attn3:
             pytest.skip("flash_attn/flash_attn_interface is missing")
-        if not has_flash_attn3:
+        if not flash_attn3:
             pytest.skip(
                 "MLA paged decode with flash_attn requires flash_attn_interface"
             )
@@ -1937,7 +1930,7 @@ def test_deepseek_v4_decode_compressor_dispatch(
     start_positions,
 ):
     del name
-    if not torch.cuda.is_available() or not has_triton:
+    if not torch.cuda.is_available() or not triton:
         pytest.skip("DeepSeek-V4 decode compressor dispatch test requires CUDA Triton")
 
     from chitu.ops.deepseek_compressor import decode_compressor
@@ -2098,7 +2091,7 @@ def test_deepseek_v4_decode_compressor_dispatch(
 
 @pytest.mark.parametrize("use_hadamard", [False, True])
 def test_deepseek_v4_decode_postprocess_dispatch_dense_kv_cache(use_hadamard):
-    if not torch.cuda.is_available() or not has_triton:
+    if not torch.cuda.is_available() or not triton:
         pytest.skip("DeepSeek-V4 postprocess dispatch test requires CUDA Triton")
 
     from chitu.ops.deepseek_compressor import try_fused_decode_postprocess_write_cache
@@ -2191,7 +2184,7 @@ def test_deepseek_v4_decode_postprocess_dispatch_dense_kv_cache(use_hadamard):
 
 
 def test_deepseek_v4_decode_postprocess_dispatch_resolves_flashmla_packed_cache():
-    if not torch.cuda.is_available() or not has_triton:
+    if not torch.cuda.is_available() or not triton:
         pytest.skip("DeepSeek-V4 postprocess dispatch test requires CUDA Triton")
 
     from chitu.ops.deepseek_compressor import try_fused_decode_postprocess_write_cache
@@ -2896,7 +2889,7 @@ def test_csa_hca_decode_paged_kv(
         pytest.skip("cuda is missing")
     if impl == "flash_mla":
         _skip_unsupported_csa_hca_impl(impl)
-        if not has_triton:
+        if not triton:
             pytest.skip("triton is missing")
         if not has_native_fp8():
             pytest.skip("FlashMLA DeepSeek-V4 csa_hca decode requires native FP8")
@@ -3123,7 +3116,7 @@ def test_csa_hca_decode_mtp_paged_kv(
     if not has_accelerator():
         pytest.skip("cuda is missing")
     _skip_unsupported_csa_hca_impl("flash_mla")
-    if not has_triton:
+    if not triton:
         pytest.skip("triton is missing")
     if not has_native_fp8():
         pytest.skip("FlashMLA DeepSeek-V4 csa_hca decode requires native FP8")
@@ -3338,7 +3331,7 @@ def test_hopper_mixed_decode_paged_kv(
     softmax_scale,
     record_benchmark,
 ):
-    if not has_flash_attn3:
+    if not flash_attn3:
         pytest.skip("flash_attn_interface is missing")
     if not has_accelerator():
         pytest.skip("CUDA accelerator is required")
@@ -3468,22 +3461,22 @@ def test_prefill_ragged_qkvo(
     impl,
     record_benchmark,
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     if impl == "flashinfer":
-        if not has_flashinfer or packaging.version.parse(
+        if not flashinfer or packaging.version.parse(
             flashinfer.__version__
         ) < packaging.version.parse("0.2.0"):
             pytest.skip("flashinfer is missing or too old")
         if qk_head_dim != v_head_dim:
             pytest.skip("flashinfer does not support qk_head_dim != v_head_dim")
     if impl == "flash_attn":
-        if not has_flash_attn:
+        if not flash_attn:
             pytest.skip("flash_attn is missing")
         if qk_head_dim > 256 or v_head_dim > 256:
             pytest.skip("FlashAttention only supports head dimension at most 256")
     if impl == "npu":
-        if not has_torch_npu:
+        if not torch_npu:
             pytest.skip("torch_npu is missing")
 
     torch.set_default_dtype(torch.float16)
@@ -3588,13 +3581,13 @@ def test_decode_dense_kv(
     prev_seq_len_list, n_heads, n_kv_heads, head_dim, impl, record_benchmark
 ):
     if impl == "triton" and (
-        not has_triton
+        not triton
         or packaging.version.parse(triton.__version__)
         < packaging.version.parse("3.2.0")
     ):
         pytest.skip("triton is missing or too old")
     if impl == "flashinfer" and (
-        not has_flashinfer
+        not flashinfer
         or packaging.version.parse(flashinfer.__version__)
         < packaging.version.parse("0.2.3")
     ):
@@ -3602,9 +3595,9 @@ def test_decode_dense_kv(
     if impl == "flashinfer" and is_muxi():
         pytest.skip("Muxi's flashinfer port has no single_decode_with_kv_cache")
     if impl == "flash_attn":
-        if not has_flash_attn:
+        if not flash_attn:
             pytest.skip("flash_attn is missing")
-    if impl == "npu" and not has_torch_npu:
+    if impl == "npu" and not torch_npu:
         pytest.skip("torch_npu is missing")
     if is_hygon() and head_dim == 256:
         pytest.skip("flash_attn decode head_dim=256 is not supported on Hygon")
@@ -3744,20 +3737,20 @@ def test_decode_paged_kv(
     impl,
     record_benchmark,
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     if impl == "flashinfer" and (
-        not has_flashinfer
+        not flashinfer
         or packaging.version.parse(flashinfer.__version__)
         < packaging.version.parse("0.2.3")
     ):
         pytest.skip("flashinfer is missing or too old")
-    if impl == "flash_attn" and not has_flash_attn:
+    if impl == "flash_attn" and not flash_attn:
         pytest.skip("flash_attn is missing")
-    if impl == "npu" and not has_torch_npu:
+    if impl == "npu" and not torch_npu:
         pytest.skip("torch_npu is missing")
     if impl == "hunyuan_attn":
-        if not has_hunyuan_ops:
+        if not hunyuan_ops:
             pytest.skip("hunyuan_ops is missing")
         if not has_accelerator():
             pytest.skip("CUDA accelerator is required")
@@ -3903,23 +3896,23 @@ def test_prefill_ragged_qo_paged_kv(
     impl,
     record_benchmark,
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     if impl == "flashinfer":
-        if not has_flashinfer or packaging.version.parse(
+        if not flashinfer or packaging.version.parse(
             flashinfer.__version__
         ) < packaging.version.parse("0.2.0"):
             pytest.skip("flashinfer is missing or too old")
     if impl == "flash_attn":
-        if not has_flash_attn:
+        if not flash_attn:
             pytest.skip("flash_attn is missing")
         if head_dim > 256:
             pytest.skip("FlashAttention only supports head dimension at most 256")
-    if impl == "npu" and not has_torch_npu:
+    if impl == "npu" and not torch_npu:
         pytest.skip("torch_npu is missing")
 
     if impl == "hunyuan_attn":
-        if not has_hunyuan_ops:
+        if not hunyuan_ops:
             pytest.skip("hunyuan_ops is missing")
         if not has_accelerator():
             pytest.skip("CUDA accelerator is required")
@@ -4267,7 +4260,7 @@ def test_mla_kv_pack_matches_cat():
 
     torch.manual_seed(0)
     impls = ["torch", "auto"]
-    if has_triton:
+    if triton:
         impls.append("triton")
 
     def _check(nope, rope, v_dim, n_heads, kv_full, k_pe, impl):
@@ -4569,7 +4562,7 @@ def _ref_qk_transform(
         q_rotary_end=rope_head_dim,
         k_rotary_end=rope_head_dim,
         rotary_type=rope_layout,
-        impl="torch_npu" if has_torch_npu else "auto",
+        impl="torch_npu" if torch_npu else "auto",
     )
     if use_hadamard_transform:
         q_rot = hadamard_transform(q_rot, scale=head_dim**-0.5)
@@ -4600,7 +4593,7 @@ def test_build_index_qk(path, impl, rope_layout, s):
         comparison, looser tolerances).
     """
     if path == "fp8":
-        if not (has_scipy or has_fast_hadamard_transform):
+        if not (scipy or fast_hadamard_transform):
             pytest.skip(
                 "A Hadamard transform implementation (scipy or "
                 "fast_hadamard_transform) is required;"

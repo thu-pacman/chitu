@@ -13,10 +13,11 @@ import torch
 from chitu.batched_seq_len import BatchedSeqLenDeltaView
 from chitu.distributed.parallel_state import get_dp_size
 from chitu.ops.topk import topk_indices
-from chitu.utils import ceil_div, try_import_platform_dep
+from chitu.utils import ceil_div
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-has_nvidia_indexer_topk = has_chitu_backend and all(
+from chitu.optdep import chitu_backend
+
+has_nvidia_indexer_topk = bool(chitu_backend) and all(
     callable(getattr(chitu_backend, name, None))
     for name in (
         "nvidia_indexer_topk",

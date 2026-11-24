@@ -17,6 +17,7 @@ from chitu.cp_linear_attention import (
     build_contiguous_cp_plan,
     build_layout_route,
     build_reshuffle_route,
+    build_zigzag_route,
     contiguous_interval,
     contiguous_rank_indices,
     contiguous_rank_of_position,
@@ -42,7 +43,11 @@ def _contiguous_context(rank, world_size):
 
     return CPContextContiguous(
         world_size,
-        SimpleNamespace(rank_in_group=rank, is_first_rank=rank == 0),
+        SimpleNamespace(
+            rank_in_group=rank,
+            is_first_rank=rank == 0,
+            gpu_group=None,
+        ),
     )
 
 
@@ -79,10 +84,8 @@ def test_layout_transform_round_trips_interleaved_context(monkeypatch):
         calls.append((rank, send, recv, group))
         return x + (1.0 if send == "fwd" else -1.0)
 
-    monkeypatch.setattr("chitu.cp_linear_attention.build_layout_route", _fake_route)
-    monkeypatch.setattr(
-        "chitu.cp_linear_attention.all_to_all_reshape", _fake_all_to_all
-    )
+    monkeypatch.setattr("chitu.cp_utils.build_layout_route", _fake_route)
+    monkeypatch.setattr("chitu.cp_utils.all_to_all_reshape", _fake_all_to_all)
 
     x_target, restore_route = to_layout(x, ctx, 12, "contiguous")
     x_restored = from_layout(x_target, restore_route, ctx)
@@ -90,6 +93,44 @@ def test_layout_transform_round_trips_interleaved_context(monkeypatch):
     assert calls == [(1, "fwd", "fwd", None), (1, "bwd", "bwd", None)]
     torch.testing.assert_close(x_target, x + 1.0)
     torch.testing.assert_close(x_restored, x)
+
+
+def _assert_route_equal(got, want):
+    assert len(got) == len(want)
+    for got_part, want_part in zip(got, want):
+        assert len(got_part) == len(want_part)
+        for got_item, want_item in zip(got_part, want_part):
+            if isinstance(got_item, torch.Tensor):
+                assert torch.equal(got_item, want_item)
+            else:
+                assert got_item == want_item
+
+
+def test_layout_transform_round_trips_zigzag(monkeypatch):
+    ctx = _contiguous_context(1, 4)
+    x = torch.arange(16, dtype=torch.float32).view(4, 4)
+    fwd_route = build_zigzag_route(4, 16, to_zigzag=True)
+    bwd_route = build_zigzag_route(4, 16, to_zigzag=False)
+    calls = []
+
+    def _fake_all_to_all(x, rank, send, recv, send_counts, recv_counts, group):
+        calls.append((rank, send, recv, send_counts, recv_counts, group))
+        return x
+
+    monkeypatch.setattr("chitu.cp_utils.all_to_all_reshape", _fake_all_to_all)
+
+    x_target, restore_route = to_layout(x, ctx, 16, "zigzag")
+    assert x_target is x
+    assert restore_route is not None
+    _assert_route_equal(restore_route, bwd_route)
+    assert calls[0][0] == 1
+    _assert_route_equal(calls[0][1:5], fwd_route)
+    assert calls[0][5] is None
+
+    x_restored = from_layout(x_target, restore_route, ctx)
+    assert x_restored is x
+    _assert_route_equal(calls[1][1:5], bwd_route)
+    assert calls[1][5] is None
 
 
 @pytest.mark.parametrize("rank", range(4))
@@ -305,6 +346,21 @@ def test_merge_prefix_states_empty_slots_is_identity():
     s0 = torch.randn(h, k, v, dtype=torch.float32)
     got = merge_prefix_states(torch.empty(0, h, k, k), torch.empty(0, h, k, v), s0)
     assert torch.allclose(got, s0)
+
+
+def test_merge_prefix_states_v_first_matches_naive_loop():
+    torch.manual_seed(2)
+    n_slots, h, k, v = 4, 2, 4, 3
+    m = torch.randn(n_slots, h, k, k, dtype=torch.float32) * 0.1
+    ext = torch.randn(n_slots, h, v, k, dtype=torch.float32)
+    s0 = torch.randn(h, v, k, dtype=torch.float32)
+
+    got = merge_prefix_states(m, ext, s0, state_v_first=True)
+
+    want = s0.clone()
+    for j in range(n_slots):
+        want = want @ m[j].transpose(-1, -2) + ext[j]
+    assert torch.allclose(got, want, atol=1e-5)
 
 
 def _random_kda_inputs(T, H, K, V, seed=0):

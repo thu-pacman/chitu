@@ -40,24 +40,24 @@ from chitu.moe import MoEImplEP, MoEImplNoEP
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
 from chitu.global_vars import set_global_args
 from chitu.utils import ceil_div
-from chitu.import_utils import (
-    try_import_platform_dep,
-    try_import_opt_dep,
-    try_import_and_setup_torch_npu,
-)
+
 from chitu.testing import assert_close
 from chitu.native_layout import init_native_layout
 
-triton, has_triton = try_import_platform_dep("triton")
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-aiter, has_aiter = try_import_platform_dep("aiter")
-_, has_aiter_moe = try_import_platform_dep("aiter.moe")
-lightop, has_lightop = try_import_platform_dep("lightop")
-_, has_hygon_deepgemm = try_import_opt_dep("deepgemm", "deep_gemm")
-deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
-deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
+from chitu.optdep import (
+    triton,
+    chitu_backend,
+    aiter,
+    aiter_moe,
+    lightop,
+    deepgemm as hygon_deepgemm,
+    deep_gemm,
+    deep_ep,
+    torch_npu,
+)
+
+
+has_marlin = bool(chitu_backend) and hasattr(chitu_backend, "gptq_marlin_gemm")
 has_marlin_moe = has_marlin and hasattr(chitu_backend, "moe_wna16_marlin_gemm")
 
 
@@ -260,14 +260,14 @@ def test_parallel_moe_block(
     else:
         if token_dispatcher_impl is not None:
             pytest.skip("token_dispatcher_impl is not available without EP")
-    if token_dispatcher_impl in {"deepep-nl", "deepep-ll"} and not has_deep_ep:
+    if token_dispatcher_impl in {"deepep-nl", "deepep-ll"} and not deep_ep:
         pytest.skip("DeepEP is not available")
-    if experts_impl == "triton" and not has_triton:
+    if experts_impl == "triton" and not triton:
         pytest.skip("triton is not available")
     if (
         token_dispatcher_impl in {"npu_all_to_all", "npu_distribute"}
         or experts_impl == "torch_npu"
-    ) and not has_torch_npu:
+    ) and not torch_npu:
         pytest.skip("torch_npu is not available")
     if token_dispatcher_impl == "deepep-nl" and task_type == TaskType.Decode:
         pytest.skip(f"{token_dispatcher_impl} is only for prefill")
@@ -785,11 +785,11 @@ def test_parallel_moe_block_blockfp8(
     else:
         if token_dispatcher_impl is not None:
             pytest.skip("token_dispatcher_impl is not available without EP")
-    if token_dispatcher_impl in {"deepep-nl", "deepep-ll"} and not has_deep_ep:
+    if token_dispatcher_impl in {"deepep-nl", "deepep-ll"} and not deep_ep:
         pytest.skip("DeepEP is not available")
-    if experts_impl == "triton" and not has_triton:
+    if experts_impl == "triton" and not triton:
         pytest.skip("triton is not available")
-    if experts_impl == "deepgemm" and not has_deep_gemm:
+    if experts_impl == "deepgemm" and not deep_gemm:
         pytest.skip("deep_gemm is not available")
     if token_dispatcher_impl == "deepep-nl" and task_type == TaskType.Decode:
         pytest.skip(f"{token_dispatcher_impl} is only for prefill")
@@ -1336,14 +1336,14 @@ def test_parallel_moe_block_w8a8_per_token_per_channel_dyn(
     if (
         token_dispatcher_impl in {"npu_all_to_all", "npu_distribute"}
         or experts_impl == "torch_npu"
-    ) and not has_torch_npu:
+    ) and not torch_npu:
         pytest.skip("torch_npu is not available")
-    if experts_impl == "triton" and not has_triton:
+    if experts_impl == "triton" and not triton:
         pytest.skip("triton is not available")
     if experts_impl.startswith("hygon_") and not is_hygon():
         pytest.skip("Hygon W8A8 backends require Hygon platform")
     if experts_impl == "hygon_aiter":
-        if not has_aiter_moe:
+        if not aiter_moe:
             pytest.skip("aiter.moe is not available")
         if n_fused_shared_experts > 0:
             pytest.skip(
@@ -1354,12 +1354,12 @@ def test_parallel_moe_block_w8a8_per_token_per_channel_dyn(
                 "Currently hygon_aiter adapter in chitu requires all experts to be local"
             )
     if experts_impl == "hygon_lightop" and not (
-        has_lightop
+        lightop
         and hasattr(lightop, "gemm_w8a8_smooth")
         and hasattr(lightop, "moe_gemm_w8a8")
     ):
         pytest.skip("lightop W8A8 MoE is not available")
-    if experts_impl == "hygon_deepgemm" and not has_hygon_deepgemm:
+    if experts_impl == "hygon_deepgemm" and not hygon_deepgemm:
         pytest.skip("hygon deepgemm W8A8 MoE is not available")
 
     # Filter distributed settings
@@ -1864,12 +1864,12 @@ def test_parallel_moe_block_blockint4(
             pytest.skip("token_dispatcher_impl is required for EP")
     elif token_dispatcher_impl is not None:
         pytest.skip("token_dispatcher_impl is not available without EP")
-    if experts_impl == "triton" and not has_triton:
+    if experts_impl == "triton" and not triton:
         pytest.skip("triton is not available")
     if experts_impl == "marlin" and not has_marlin_moe:
         pytest.skip("marlin blockint4 backend is not available")
     if experts_impl == "aiter":
-        if not has_aiter:
+        if not aiter:
             pytest.skip("aiter is not available")
         if not merge_gate_up:
             pytest.skip("aiter blockint4 uses merged gate/up")

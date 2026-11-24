@@ -3,13 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
-from chitu.utils import try_import_platform_dep
+
 from .torch_backend import TorchIndexer
 from .bf16_backend import BF16Indexer
 from .nvidia_topk import NvidiaTopKMixin
 
-triton, has_triton = try_import_platform_dep("triton")
-if has_triton:
+from chitu.optdep import triton
+
+if triton:
     from chitu.ops.triton_ops.indexer_score_bf16 import (
         build_qblock_schedule,
         _bucket_max_n,
@@ -18,7 +19,7 @@ if has_triton:
 
 
 def _validate_triton_bf16_indexer_config(args):
-    if not has_triton:
+    if not triton:
         raise ValueError("indexer_type=triton_bf16 requires triton")
     if args.infer.cache_type != "paged":
         raise ValueError(

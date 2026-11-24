@@ -26,9 +26,9 @@ from chitu.models.model_hf_llama import (
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import apply_rotary_pos_emb
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear
-from chitu.utils import try_import_opt_dep
 
-flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
+
+from chitu.optdep import flash_attn
 
 logger = getLogger(__name__)
 
@@ -170,7 +170,7 @@ class VisionAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scaling = self.head_dim**-0.5
-        self.use_flash_attn = has_flash_attn
+        self.use_flash_attn = bool(flash_attn)
         if self.use_flash_attn:
             self.attn_backend = FlashAttnBackend()
         else:

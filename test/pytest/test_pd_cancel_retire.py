@@ -56,6 +56,7 @@ tests are the exception: those values are set in ``__init__``, so those tests
 run the real ``__init__`` with only those collaborators stubbed.
 """
 
+import asyncio
 import threading
 import time
 import types
@@ -76,6 +77,8 @@ from chitu.distributed.pd_disaggregation.kv_transfer.prefill import KVManagerPre
 from chitu.distributed.pd_disaggregation.kv_transfer.protocol import (
     ProtocolSerializer,
     RankTransferDone,
+    RankTransferFailed,
+    RemoveRequest,
 )
 from chitu.distributed.pd_disaggregation.kv_transfer.static_transfer_plan import (
     StaticTransferPlan,
@@ -88,14 +91,18 @@ from chitu.distributed.pd_disaggregation.pd_scheduler import (
     DecodeOnlyManager,
     PDInstanceRequestManager,
     PDSchedulerMode,
+    PrefillOnlyManager,
 )
 from chitu.finish_reason import FinishReason
 from chitu.global_vars import get_global_args, set_global_args
 from chitu.kv_cache import BlockRuntime, PagedKVCacheManager, TokenBlock
 from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
 from chitu.metrics import task_stats
+from chitu.metadata_serializer import MetadataSerializer
 from chitu.scheduler import Scheduler
 from chitu.task import (
+    PackedTasks,
+    PackedTasksBase,
     SampleParams,
     Task,
     TaskCollector,
@@ -103,6 +110,8 @@ from chitu.task import (
     TaskStatus,
     UserRequest,
 )
+
+pytestmark = pytest.mark.pd_unit
 
 # --------------------------------------------------------------------------
 # fixtures / helpers
@@ -147,7 +156,7 @@ class _FakeEndpoint:
     def __init__(self):
         self.frames: list = []
 
-    def send(self, payload: bytes) -> None:
+    def send(self, payload: bytes, *, block: bool = True) -> None:
         self.frames.append(ProtocolSerializer.unpack(payload))
 
     def init_master(self, has_slave: bool = False) -> None:
@@ -199,6 +208,7 @@ def _make_prefill_manager(
     manager.is_decode = False
     manager.instance_id = 0
     manager.prefill_scheduler_id = 0
+    manager.dp_rank = manager.pp_rank = manager.tp_rank = manager.cp_rank = 0
     manager.is_ctrl_rank = True
     manager.world_size = world_size
     manager.dp_way_size = dp_way_size
@@ -207,7 +217,6 @@ def _make_prefill_manager(
     manager._peer_cache_generations = {}
     manager._prefill_transfer_state_lock = threading.Lock()
     manager._completed_prefill_requests = set()
-    manager._transfer_failed_requests = set()
     manager._transfer_done_reqs = []
     manager._transfer_failure_callback = None
     manager.token_sender = None
@@ -843,6 +852,7 @@ def _make_decode_manager(kv_manager) -> DecodeOnlyManager:
     """
     manager = object.__new__(DecodeOnlyManager)
     manager.kv_manager = kv_manager
+    manager.local_instance_id = 0
     manager.pending_decode_requests = {}
     manager._deferred_kv_teardown = set()
     manager._decode_prealloc_tokens_inflight = 0
@@ -1353,26 +1363,28 @@ def test_decode_postpones_release_until_prefill_done_arrives():
 # --------------------------------------------------------------------------
 
 
-def _make_cache_manager() -> PagedKVCacheManager:
+def _make_cache_manager(*, dp_rank: int = 0) -> PagedKVCacheManager:
     return PagedKVCacheManager(
         num_blocks=8,
         num_hot_req=2,
         max_seq_len=2048,
-        dp_rank=0,
+        dp_rank=dp_rank,
         block_size=512,
         enable_prefix_caching=False,
     )
 
 
-def _attach_one_block(manager: PagedKVCacheManager, task: Task) -> BlockRuntime:
+def _attach_one_block(
+    manager: PagedKVCacheManager, task: Task, cache_idx: int = 0
+) -> BlockRuntime:
     """Give ``task`` one owned block, the state it has right before finalize."""
     block = TokenBlock(
         identity=manager.identity_builder.make_identity(
             [], canonical_prefix_hashes=False
         ),
-        runtime=BlockRuntime(0, active_cnt=1),
+        runtime=BlockRuntime(cache_idx, active_cnt=1),
     )
-    manager.task_to_cache_ids[task.task_id] = {0}
+    manager.task_to_cache_ids[task.task_id] = {cache_idx}
     manager.task_to_token_blocks[task.task_id] = [block]
     manager.active_blocks[block.runtime.cache_idx] = block.runtime
     return block.runtime
@@ -1464,3 +1476,516 @@ def test_finalize_releases_at_once_when_the_transfer_is_no_longer_on_the_wire(
     assert task.task_id not in manager.task_to_token_blocks
     assert manager._release_defer_since == {}
     assert runtime.active_cnt == 0
+
+
+def test_failed_prefill_keeps_source_until_the_existing_grace_expires(monkeypatch):
+    import chitu.kv_cache.cache_manager as cache_module
+    from chitu.distributed.pd_disaggregation.kv_transfer.transfer_plan import (
+        KVTransferExecutionError,
+    )
+
+    manager = _make_prefill_manager(plan_keys=((1, 0),))
+    task = _make_task("failed-source")
+    manager._task_infos[task.task_id] = _info(
+        task.task_id, decode_sid=0, is_decode_allocated=True
+    )
+    manager.transfer_engine = types.SimpleNamespace(engine=object())
+    monkeypatch.setattr(manager, "get_send_buffers", lambda *_: TransferBuffers())
+
+    def failed_send(_engine):
+        raise KVTransferExecutionError("KV transfer completion failed with status -1")
+
+    monkeypatch.setattr(
+        prefill_module,
+        "create_transfer_plan",
+        lambda *_: types.SimpleNamespace(execute_send=failed_send),
+    )
+    task_stats.mark_kv_send_started(task.task_id)
+    _run_transfer_worker(manager, task.task_id)
+    assert task.task_id not in task_stats.kv_send_inflight_request_ids()
+    manager.remove_request(task.task_id)
+    assert manager._task_infos == {}
+    assert manager.should_postpone_release(task.task_id)
+
+    cache = _make_cache_manager()
+    runtime = _attach_one_block(cache, task)
+    monkeypatch.setattr(Backend, "kv_manager", manager)
+    clock = [100.0]
+    monkeypatch.setattr(
+        cache_module, "time", types.SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    assert not cache.finalize_metadata_all_decode(task)
+    clock[0] = 159.999
+    assert not cache.finalize_metadata_all_decode(task)
+    assert runtime.active_cnt == 1
+    assert cache._release_defer_since[task.task_id] == 100.0
+    clock[0] = 160.0
+    assert cache.finalize_metadata_all_decode(task)
+    assert runtime.active_cnt == 0 and not cache._release_defer_since
+    TaskPool.remove(task.task_id)
+    assert not manager.should_postpone_release(task.task_id)
+
+
+@pytest.mark.parametrize(
+    "local_allocation", [True, False], ids=["owning-rank", "dp-control-rank"]
+)
+@pytest.mark.parametrize(
+    "late_completion", [False, True], ids=["grace-expires", "late-completion"]
+)
+@pytest.mark.parametrize("failure_source", ["timeout", "prefill-failed"])
+def test_decode_failure_preserves_grace_until_blocks_are_released(
+    local_allocation, late_completion, failure_source, monkeypatch
+):
+    import chitu.kv_cache.cache_manager as cache_module
+    from chitu.distributed.pd_disaggregation.kv_transfer.protocol import (
+        DecodePrepare,
+        PrefillDone,
+    )
+
+    task = _make_task("failed-destination", status=TaskStatus.PDDecodePrealloc)
+    task.dp_rank = 0 if local_allocation else 1
+    healthy = _make_task("healthy-neighbour")
+    cache = _make_cache_manager()
+    failed_block = _attach_one_block(cache, task)
+    healthy_block = _attach_one_block(cache, healthy, cache_idx=1)
+    kv = object.__new__(KVManagerDecode)
+    kv.disaggregation_mode = DisaggregationMode.DECODE
+    kv.is_ctrl_rank = True
+    kv.dp_rank = 0
+    kv.pp_rank = kv.tp_rank = kv.cp_rank = kv.instance_id = 0
+    kv._kv_cfg = OmegaConf.create(
+        {"transfer_timeout": 120.0, "transfer_grace_timeout": 60.0}
+    )
+    kv.session_id = "decode-session"
+    kv._task_infos = {}
+    kv._transfer_done_states = {}
+    kv._early_prefill_failures = set()
+    kv._release_defer_s = 60.0
+    kv.endpoints = types.SimpleNamespace(decode_prepare=_FakeEndpoint())
+    monkeypatch.setattr(kv, "refresh_prefill_peer", lambda *_: None)
+    monkeypatch.setattr(kv, "prepare_kv_transfer", lambda *_: None)
+    kv.handle_decode_prepare(
+        ProtocolSerializer.pack(
+            DecodePrepare(
+                task.task_id,
+                prefill_sid=0,
+                prefix_len=7,
+                new_cache_ids={MAIN_CACHE_NAME: [0]},
+                dp_rank=task.dp_rank,
+            )
+        )
+    )
+    manager = _make_decode_manager(kv)
+    task.pd_scheduler_info.prealloc_tokens = 7
+    manager._decode_prealloc_tokens_inflight = 7
+    manager._decode_prealloc_tokens_inflight_by_dp = (
+        [7, 0] if local_allocation else [0, 7]
+    )
+    monkeypatch.setattr(Backend, "kv_manager", kv)
+    monkeypatch.setattr(Backend, "cache_managers", [{MAIN_CACHE_NAME: cache}])
+    clock = [100.0]
+    monkeypatch.setattr(
+        cache_module, "time", types.SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    monkeypatch.setattr(
+        "chitu.global_vars._GLOBAL_ARGS",
+        OmegaConf.create({"infer": {"schedule_overlap": True}}),
+    )
+    scheduler = Scheduler(
+        max_running_tasks=4,
+        prefill_num_tasks=1,
+        decode_num_tasks=4,
+        scheduler_type="fcfs",
+        cache_manager_dict={MAIN_CACHE_NAME: cache},
+        num_scheduler_groups=1,
+    )
+
+    for _ in range(2):
+        if failure_source == "timeout":
+            manager._fail_decode_wait_timeout(task.task_id)
+        else:
+            asyncio.run(
+                manager.process_request(
+                    {"type": "pd_prefill_fail", "request_id": task.task_id}
+                )
+            )
+            assert kv.is_prefill_failed(task.task_id)
+    assert task.status == TaskStatus.Stopped
+    assert task.task_id in TaskPool.pool and task.task_id not in TaskPool.pending_remove
+    assert manager._decode_prealloc_tokens_inflight == 0
+    assert manager._decode_prealloc_tokens_inflight_by_dp == [0, 0]
+    assert manager._deferred_kv_teardown == {task.task_id}
+    assert bool(kv._task_infos) is local_allocation
+    assert task.task_id in kv._transfer_done_states
+    assert kv.endpoints.decode_prepare.frames == []
+    assert cache._release_defer_since[task.task_id] == 100.0
+    clock[0] = 159.999
+    assert scheduler.update([task.task_id]) == []
+    manager._reap_deferred_kv_teardown()
+    assert manager._deferred_kv_teardown == {task.task_id}
+    assert failed_block.active_cnt == healthy_block.active_cnt == 1
+
+    done = ProtocolSerializer.pack(PrefillDone(task.task_id, 42, 0))
+    if late_completion:
+        kv.handle_prefill_done(done)
+        manager._decode_check_and_promote()
+        assert task.status == TaskStatus.Stopped
+        assert task.req.num_output_tokens == 0
+    else:
+        clock[0] = 160.0
+    assert scheduler.update([task.task_id]) == [task.task_id]
+    assert task.task_id not in TaskPool.pool
+    # This also runs after Scheduler.update when there is no new PD scheduling
+    # tick, so an idle instance does not retain the last request's metadata.
+    manager._reap_deferred_kv_teardown()
+    assert failed_block.active_cnt == 0
+    assert healthy_block.active_cnt == 1 and healthy.can_schedule()
+    assert not manager._deferred_kv_teardown
+    assert kv._task_infos == kv._transfer_done_states == {}
+    assert kv._early_prefill_failures == set()
+    assert not cache._release_defer_since
+    assert [frame.req_id for frame in kv.endpoints.decode_prepare.frames] == [
+        task.task_id
+    ]
+    kv.handle_prefill_done(done)
+    assert kv._task_infos == kv._transfer_done_states == {}
+
+
+def test_decode_failure_before_prepare_survives_early_cleanup(monkeypatch):
+    from chitu.distributed.pd_disaggregation.kv_transfer.protocol import DecodePrepare
+
+    kv = object.__new__(KVManagerDecode)
+    kv.disaggregation_mode = DisaggregationMode.DECODE
+    kv.is_ctrl_rank = True
+    kv.dp_rank = 0
+    kv.pp_rank = kv.tp_rank = kv.cp_rank = kv.instance_id = 0
+    kv._kv_cfg = OmegaConf.create(
+        {"transfer_timeout": 120.0, "transfer_grace_timeout": 60.0}
+    )
+    kv._task_infos = {}
+    kv._transfer_done_states = {}
+    kv._early_prefill_failures = set()
+    monkeypatch.setattr(kv, "refresh_prefill_peer", lambda *_: None)
+    prepared = []
+    monkeypatch.setattr(kv, "prepare_kv_transfer", prepared.append)
+    kv.cancel_prefill_wait("early-failure")
+    kv.remove_request("early-failure")
+    assert kv._early_prefill_failures == {"early-failure"}
+    kv.handle_decode_prepare(
+        ProtocolSerializer.pack(
+            DecodePrepare(
+                "early-failure", prefill_sid=0, prefix_len=1, new_cache_ids={}
+            )
+        )
+    )
+    assert kv.is_prefill_failed("early-failure")
+    assert kv._task_infos["early-failure"].prefill_done_event.is_set()
+    assert kv._early_prefill_failures == set()
+    assert prepared == ["early-failure"]
+    kv.remove_request("early-failure")
+    assert kv._task_infos == kv._transfer_done_states == {}
+
+
+def test_cancel_while_waiting_for_gpu_does_not_submit_a_new_transfer(monkeypatch):
+    manager = _make_prefill_manager(plan_keys=((1, 0),))
+    task = _make_task("cancel-before-submit")
+    manager._task_infos[task.task_id] = _info(
+        task.task_id, decode_sid=0, is_decode_allocated=True
+    )
+    manager.transfer_engine = types.SimpleNamespace(engine=object())
+    monkeypatch.setattr(manager, "get_send_buffers", lambda *_: TransferBuffers())
+    submissions = []
+    monkeypatch.setattr(
+        prefill_module,
+        "create_transfer_plan",
+        lambda *_: types.SimpleNamespace(
+            execute_send=lambda engine: submissions.append(engine),
+            total_bytes_per_session=lambda: {},
+        ),
+    )
+    monkeypatch.setattr(
+        _FakeCudaEvent, "synchronize", lambda self: manager.remove_request(task.task_id)
+    )
+    task_stats.mark_kv_send_started(task.task_id)
+    _run_transfer_worker(manager, task.task_id)
+    assert submissions == []
+    assert task.task_id not in task_stats.kv_send_inflight_request_ids()
+    # Cancellation retires advertised buffers without aggregate completion,
+    # so the control rank conservatively keeps the existing release grace.
+    assert task.kv_transfer_pending
+    assert manager.should_postpone_release(task.task_id)
+    assert manager.endpoints.rank_transfer_done.frames == []
+    cache = _make_cache_manager()
+    runtime = _attach_one_block(cache, task)
+    monkeypatch.setattr(Backend, "kv_manager", manager)
+    assert not cache.finalize_metadata_all_decode(task)
+    assert runtime.active_cnt == 1
+
+
+def _install_transfer_plan(manager, monkeypatch, *, failure=None, before_finish=None):
+    """Replace only the native send; keep the production worker and protocol."""
+    manager.transfer_engine = types.SimpleNamespace(engine=object())
+    monkeypatch.setattr(manager, "get_send_buffers", lambda *_: TransferBuffers())
+    submissions = []
+
+    def execute_send(engine):
+        submissions.append(engine)
+        if before_finish is not None:
+            before_finish()
+        if failure is not None:
+            raise failure
+
+    monkeypatch.setattr(
+        prefill_module,
+        "create_transfer_plan",
+        lambda *_: types.SimpleNamespace(
+            execute_send=execute_send,
+            total_bytes_per_session=lambda: {"decode-session": 16},
+        ),
+    )
+    return submissions
+
+
+def _use_prefill_stop_callback(kv):
+    manager = object.__new__(PrefillOnlyManager)
+    manager.kv_manager = kv
+    manager.token_manager = None
+    manager.pending_decode_requests = {}
+    manager.local_instance_id = 0
+    kv.set_transfer_failure_callback(manager._handle_kv_transfer_failure)
+    return manager
+
+
+@pytest.mark.parametrize("cancel_at_gpu_event", [False, True])
+def test_tp_follower_transfers_without_a_local_scheduling_task(
+    cancel_at_gpu_event, monkeypatch
+):
+    control_task = _make_task("tp-follower")
+    packed = PackedTasks([], tasks=[control_task], rank="cpu", metadata_only=True)
+    serializer = MetadataSerializer(mode="TP")
+    wire = serializer.serialize_metadata(packed)
+    follower = _make_prefill_manager(dp_way_size=2, world_size=2, plan_keys=((1, 0),))
+    follower.is_ctrl_rank = False
+    follower._task_infos[control_task.task_id] = _info(
+        control_task.task_id, decode_sid=0, is_decode_allocated=True
+    )
+    submissions = _install_transfer_plan(follower, monkeypatch)
+    if cancel_at_gpu_event:
+        monkeypatch.setattr(
+            _FakeCudaEvent,
+            "synchronize",
+            lambda self: follower.remove_request(control_task.task_id),
+        )
+
+    # TP dispatch transfers descriptors, not the control rank's TaskPool.
+    with monkeypatch.context() as rank:
+        rank.setattr(TaskPool, "pool", {})
+        rank.setattr(TaskPool, "id_list", [])
+        rank.setattr(task_stats, "_KV_SEND_INFLIGHT", {})
+        _, received, _, _ = serializer.deserialize_metadata(wire)
+        assert type(received) is PackedTasksBase
+        assert received.output_task_ids == [control_task.task_id]
+        assert TaskPool.pool == {}
+        task_stats.mark_kv_send_started(control_task.task_id)
+        _run_transfer_worker(follower, received.output_task_ids[0])
+        assert task_stats.kv_send_inflight_request_ids() == []
+        assert TaskPool.pool == {}
+
+    frames = follower.endpoints.rank_transfer_done.frames
+    if cancel_at_gpu_event:
+        assert submissions == [] and frames == []
+    else:
+        assert submissions == [follower.transfer_engine.engine]
+        assert len(frames) == 1 and isinstance(frames[0], RankTransferDone)
+        assert frames[0].req_id == control_task.task_id
+        assert frames[0].rank_bytes == {"decode-session": 16}
+
+
+def test_remote_dp_failure_keeps_control_allocator_grace(monkeypatch):
+    import chitu.kv_cache.cache_manager as cache_module
+    from chitu.distributed.pd_disaggregation.kv_transfer.transfer_plan import (
+        KVTransferExecutionError,
+    )
+
+    rid = "remote-dp-source"
+    control = _make_prefill_manager(world_size=2, plan_keys=((1, 0),))
+    task = _make_task(rid)
+    task.dp_rank = 1
+    control._task_infos[rid] = _info(rid, decode_sid=0, is_decode_allocated=True)
+    _use_prefill_stop_callback(control)
+    worker = _make_prefill_manager(world_size=2, plan_keys=((1, 0),))
+    worker.is_ctrl_rank = False
+    worker.dp_rank = 1
+    worker._task_infos[rid] = _info(rid, decode_sid=0, is_decode_allocated=True)
+    submissions = _install_transfer_plan(
+        worker,
+        monkeypatch,
+        failure=KVTransferExecutionError("partial native send failed"),
+    )
+    with monkeypatch.context() as rank:
+        rank.setattr(TaskPool, "pool", {})
+        rank.setattr(TaskPool, "id_list", [])
+        rank.setattr(task_stats, "_KV_SEND_INFLIGHT", {})
+        worker_task = _make_task(rid)
+        worker_task.dp_rank = 1
+        task_stats.mark_kv_send_started(rid)
+        _run_transfer_worker(worker, rid)
+        assert task_stats.kv_send_inflight_request_ids() == []
+    assert worker_task is not task
+    assert submissions == [worker.transfer_engine.engine]
+    assert not task.kv_transfer_pending
+    assert rid not in task_stats.kv_send_inflight_request_ids()
+    failure = worker.endpoints.rank_transfer_done.frames[0]
+    assert isinstance(failure, RankTransferFailed)
+    control.handle_rank_transfer_done(ProtocolSerializer.pack(failure))
+    assert task.status == TaskStatus.Stopped
+    assert task.kv_transfer_pending
+    assert rid not in control._task_infos
+
+    # Cleanup echoes and a late completion cannot erase the failed rank's hold.
+    for _ in range(2):
+        control.handle_decode_allocated(ProtocolSerializer.pack(RemoveRequest(rid)))
+        control.handle_rank_transfer_done(
+            ProtocolSerializer.pack(RankTransferDone(rid))
+        )
+    assert control.should_postpone_release(rid)
+    cache = _make_cache_manager(dp_rank=1)
+    runtime = _attach_one_block(cache, task)
+    monkeypatch.setattr(Backend, "kv_manager", control)
+    monkeypatch.setattr(
+        "chitu.global_vars._GLOBAL_ARGS",
+        OmegaConf.create({"infer": {"schedule_overlap": True}}),
+    )
+    scheduler = Scheduler(
+        max_running_tasks=4,
+        prefill_num_tasks=1,
+        decode_num_tasks=4,
+        scheduler_type="fcfs",
+        cache_manager_dict={MAIN_CACHE_NAME: cache},
+        num_scheduler_groups=1,
+    )
+    clock = [100.0]
+    monkeypatch.setattr(
+        cache_module, "time", types.SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    assert scheduler.update([rid]) == []
+    clock[0] = 159.999
+    assert scheduler.update([rid]) == []
+    assert TaskPool.pool[rid] is task and runtime.active_cnt == 1
+    assert cache._release_defer_since == {rid: 100.0}
+    clock[0] = 160.0
+    assert scheduler.update([rid]) == [rid]
+    assert rid not in TaskPool.pool and runtime.active_cnt == 0
+    assert cache._release_defer_since == {}
+
+
+@pytest.mark.parametrize("failure_during_local_send", [False, True])
+def test_local_send_success_does_not_clear_another_ranks_failure(
+    failure_during_local_send, monkeypatch
+):
+    rid = "partial-rank-completion"
+    control = _make_prefill_manager(dp_way_size=2, world_size=2, plan_keys=((1, 0),))
+    task = _make_task(rid)
+    control._task_infos[rid] = _info(rid, decode_sid=0, is_decode_allocated=True)
+    _use_prefill_stop_callback(control)
+    cache = _make_cache_manager()
+    runtime = _attach_one_block(cache, task)
+    monkeypatch.setattr(Backend, "kv_manager", control)
+    failure = ProtocolSerializer.pack(RankTransferFailed(rid, 0, 0, "remote failure"))
+    submissions = _install_transfer_plan(
+        control,
+        monkeypatch,
+        before_finish=(
+            (lambda: control.handle_rank_transfer_done(failure))
+            if failure_during_local_send
+            else None
+        ),
+    )
+    _run_transfer_worker(control, rid)
+    assert submissions == [control.transfer_engine.engine]
+    local_done = control.endpoints.rank_transfer_done.frames[0]
+    assert isinstance(local_done, RankTransferDone)
+    control.handle_rank_transfer_done(ProtocolSerializer.pack(local_done))
+    if not failure_during_local_send:
+        assert control._task_infos[rid].done_count == 1
+        assert control.should_postpone_release(rid)
+        assert not cache.finalize_metadata_all_decode(task)
+        assert runtime.active_cnt == 1
+        control.handle_rank_transfer_done(failure)
+    assert task.kv_transfer_pending
+    assert control.should_postpone_release(rid)
+    assert control._decode_endpoints[0].prefill_done.frames == []
+    assert not cache.finalize_metadata_all_decode(task)
+    assert runtime.active_cnt == 1
+
+
+def test_all_rank_completion_releases_without_waiting_for_grace(monkeypatch):
+    rid = "all-ranks-finished"
+    control = _make_prefill_manager(dp_way_size=2, world_size=2, plan_keys=((1, 0),))
+    task = _make_task(rid)
+    control._task_infos[rid] = _info(rid, decode_sid=0, is_decode_allocated=True)
+    cache = _make_cache_manager()
+    runtime = _attach_one_block(cache, task)
+    monkeypatch.setattr(Backend, "kv_manager", control)
+    control.handle_rank_transfer_done(
+        ProtocolSerializer.pack(
+            RankTransferDone(rid, rank_bytes={"decode-session": 16})
+        )
+    )
+    assert control.should_postpone_release(rid)
+    assert not cache.finalize_metadata_all_decode(task)
+    assert runtime.active_cnt == 1
+    control.handle_rank_transfer_done(
+        ProtocolSerializer.pack(
+            RankTransferDone(rid, rank_bytes={"decode-session": 16})
+        )
+    )
+    assert not task.kv_transfer_pending
+    assert not control.should_postpone_release(rid)
+    assert len(control._decode_endpoints[0].prefill_done.frames) == 1
+    assert cache.finalize_metadata_all_decode(task)
+    assert runtime.active_cnt == 0 and cache._release_defer_since == {}
+
+
+def test_bootstrap_retirement_without_allocation_has_no_transfer_hold(monkeypatch):
+    rid = "no-decode-allocation"
+    control = _make_prefill_manager()
+    task = _make_task(rid)
+    control._task_infos[rid] = _info(rid)
+    control.remove_request(rid)
+    assert not task.kv_transfer_pending
+    assert not control.should_postpone_release(rid)
+    cache = _make_cache_manager()
+    runtime = _attach_one_block(cache, task)
+    monkeypatch.setattr(Backend, "kv_manager", control)
+    assert cache.finalize_metadata_all_decode(task)
+    assert runtime.active_cnt == 0 and cache._release_defer_since == {}
+
+
+@pytest.mark.parametrize("retire_path", ["remove", "sweep"])
+def test_retirement_keeps_an_unfinished_remote_rank_protected(retire_path, monkeypatch):
+    rid = "remote-rank-not-finished"
+    control = _make_prefill_manager(dp_way_size=2, world_size=2)
+    task = _make_task(rid)
+    control._task_infos[rid] = _info(
+        rid,
+        decode_sid=0,
+        is_decode_allocated=True,
+        done_count=1,
+        last_progress_ts=time.monotonic() - 700.0,
+    )
+    assert rid not in task_stats.kv_send_inflight_request_ids()
+    if retire_path == "remove":
+        control.handle_decode_allocated(ProtocolSerializer.pack(RemoveRequest(rid)))
+    else:
+        control.sweep_stuck_transfers()
+    assert rid not in control._task_infos
+    assert task.status == TaskStatus.Stopped and task.kv_transfer_pending
+    # A relay echo and completion queued before retirement are still harmless.
+    control.handle_decode_allocated(ProtocolSerializer.pack(RemoveRequest(rid)))
+    control.handle_rank_transfer_done(ProtocolSerializer.pack(RankTransferDone(rid)))
+    cache = _make_cache_manager()
+    runtime = _attach_one_block(cache, task)
+    monkeypatch.setattr(Backend, "kv_manager", control)
+    assert not cache.finalize_metadata_all_decode(task)
+    assert runtime.active_cnt == 1

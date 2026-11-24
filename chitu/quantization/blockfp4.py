@@ -24,13 +24,7 @@ from chitu.ops.quant import (
     blockfp4_gemm,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_blackwell
-from chitu.utils import (
-    ceil_div,
-    try_import_opt_dep,
-    try_import_platform_dep,
-    try_import_and_setup_torch_npu,
-    parse_dtype,
-)
+from chitu.utils import ceil_div, parse_dtype
 from chitu.global_vars import get_global_args
 from chitu.native_layout import (
     NativeLayoutMixin,
@@ -51,14 +45,11 @@ from chitu.moe.batched_routed_activation import (
 )
 from chitu.ops.utils import make_op_dispatcher
 
-hard_fp4_kernels, has_hard_fp4_kernels = try_import_opt_dep(
-    "hard_fp4_kernels", "hard_fp4_kernels"
-)
-triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-if has_torch_npu:
+from chitu.optdep import hard_fp4_kernels, triton, torch_npu
+
+if torch_npu:
     from chitu.npu_utils import fused_experts_no_sum_npu
-if has_triton:
+if triton:
     from chitu.moe.experts import fused_experts_soft_fp4
 
 
@@ -390,7 +381,7 @@ class Blockfp4LinearPackKStride1(Blockfp4LinearBase):
 
 
 @QuantizationRegistry.register_linear(
-    "blockfp4", when=lambda _: has_torch_npu, priority=2
+    "blockfp4", when=lambda _: bool(torch_npu), priority=2
 )
 class Blockfp4LinearPackNPUNative(Blockfp4LinearBase):
     """
@@ -449,12 +440,12 @@ def fused_experts_no_sum_blockfp4_indexed(
 
 @fused_experts_no_sum_blockfp4_indexed.register_auto
 def _auto_fused_experts_no_sum_blockfp4_indexed():
-    if has_triton:
+    if triton:
         return "triton"
     raise NotImplementedError
 
 
-@fused_experts_no_sum_blockfp4_indexed.register("triton", available=has_triton)
+@fused_experts_no_sum_blockfp4_indexed.register("triton", available=bool(triton))
 def _fused_experts_no_sum_blockfp4_indexed_triton(
     hidden_states,
     w1,
@@ -512,12 +503,12 @@ def fused_experts_sum_blockfp4_indexed(
 
 @fused_experts_sum_blockfp4_indexed.register_auto
 def _auto_fused_experts_sum_blockfp4_indexed():
-    if has_triton:
+    if triton:
         return "triton"
     raise NotImplementedError
 
 
-@fused_experts_sum_blockfp4_indexed.register("triton", available=has_triton)
+@fused_experts_sum_blockfp4_indexed.register("triton", available=bool(triton))
 def _fused_experts_sum_blockfp4_indexed_triton(
     hidden_states,
     w1,
@@ -911,13 +902,13 @@ class Blockfp4MoeExpertsMergedBase(NativeLayoutMixin, QuantizedMoeExpertsMerged)
 @QuantizationRegistry.register_moe_experts(
     "blockfp4",
     merge_gate_up=True,
-    when=lambda _: is_blackwell() and has_hard_fp4_kernels,
+    when=lambda _: is_blackwell() and bool(hard_fp4_kernels),
     priority=1,
 )
 @QuantizationRegistry.register_moe_experts(
     "blockfp4_merged",
     merge_gate_up=True,
-    when=lambda _: is_blackwell() and has_hard_fp4_kernels,
+    when=lambda _: is_blackwell() and bool(hard_fp4_kernels),
     priority=1,
 )
 class Blockfp4MoeExpertsBlackwell(Blockfp4MoeExpertsMergedBase):
@@ -1030,10 +1021,10 @@ class Blockfp4MoeExpertsBlackwell(Blockfp4MoeExpertsMergedBase):
 
 
 @QuantizationRegistry.register_moe_experts(
-    "blockfp4", merge_gate_up=True, when=lambda _: is_nvidia() and has_triton
+    "blockfp4", merge_gate_up=True, when=lambda _: is_nvidia() and bool(triton)
 )
 @QuantizationRegistry.register_moe_experts(
-    "blockfp4_merged", merge_gate_up=True, when=lambda _: is_nvidia() and has_triton
+    "blockfp4_merged", merge_gate_up=True, when=lambda _: is_nvidia() and bool(triton)
 )
 class Blockfp4MoeExpertsPackKStride64(Blockfp4MoeExpertsMergedBase):
     """
@@ -1105,7 +1096,7 @@ class Blockfp4MoeExpertsPackKStride64(Blockfp4MoeExpertsMergedBase):
 @QuantizationRegistry.register_moe_experts(
     "blockfp4",
     merge_gate_up=False,
-    when=lambda _: has_torch_npu,
+    when=lambda _: bool(torch_npu),
     priority=2,
 )
 class Blockfp4MoeExpertsUnmergedPackNPUNative(Blockfp4MoeExpertsUnmergedBase):
@@ -1154,7 +1145,7 @@ class Blockfp4MoeExpertsUnmergedPackNPUNative(Blockfp4MoeExpertsUnmergedBase):
 @QuantizationRegistry.register_moe_experts(
     "blockfp4",
     merge_gate_up=True,
-    when=lambda _: has_torch_npu,
+    when=lambda _: bool(torch_npu),
     priority=2,
 )
 class Blockfp4MoeExpertsMergedPackNPUNative(Blockfp4MoeExpertsMergedBase):

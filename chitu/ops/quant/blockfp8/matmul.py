@@ -7,24 +7,17 @@ import torch
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.native_layout import DeepGemmScale
 from chitu.device_type import is_enflame
-from chitu.import_utils import ensure_gcu_c_ops
+from chitu.optdep import ensure_gcu_c_ops
 from chitu.global_vars import get_global_args
 from chitu.ops.utils import make_op_dispatcher
 from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
-from chitu.utils import (
-    try_import_platform_dep,
-    try_import_opt_dep,
-    try_import_and_setup_torch_npu,
-)
 
-triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
-deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
 
-if has_triton:
+from chitu.optdep import triton, torch_npu, cinfer_ascendc, deep_gemm, chitu_backend
+
+has_marlin = bool(chitu_backend) and hasattr(chitu_backend, "gptq_marlin_gemm")
+
+if triton:
     from chitu.ops.triton_ops import (
         blockfp8_gemm_triton,
         soft_fp8_blockfp8_gemm_triton,
@@ -57,7 +50,7 @@ def _auto_blockfp8_gemm(
         return "gcu"
     if (
         scale_block_shape == DEFAULT_SCALE_BLOCK_SHAPE
-        and has_deep_gemm
+        and deep_gemm
         and torch.get_default_dtype() == torch.bfloat16
         and (
             torch.cuda.get_device_capability()[0] == 9
@@ -65,7 +58,7 @@ def _auto_blockfp8_gemm(
         )
     ):
         return "deep_gemm"
-    if has_triton:
+    if triton:
         return "triton"
     raise NotImplementedError("No supported implementation found for blockfp8_gemm")
 
@@ -80,13 +73,13 @@ def blockfp8_gemm_wants_packed_ue8m0_scale(
         round_scale_to_pow2
         and list(scale_block_shape) == list(DEFAULT_SCALE_BLOCK_SHAPE)
         and torch.get_default_dtype() == torch.bfloat16
-        and has_deep_gemm
+        and bool(deep_gemm)
         and torch.cuda.is_available()
         and torch.cuda.get_device_capability()[0] == 10
     )
 
 
-@blockfp8_gemm.register("deep_gemm", available=has_deep_gemm)
+@blockfp8_gemm.register("deep_gemm", available=bool(deep_gemm))
 def blockfp8_gemm_deep_gemm(
     a: torch.Tensor,
     a_s: torch.Tensor | DeepGemmScale,
@@ -125,7 +118,7 @@ def blockfp8_gemm_deep_gemm(
 
 
 blockfp8_gemm.register_candidate("triton")
-if has_triton:
+if triton:
     blockfp8_gemm.register("triton")(blockfp8_gemm_triton)
 
 
@@ -203,19 +196,19 @@ def _auto_soft_fp8_blockfp8_gemm():
             "soft_fp8_blockfp8_gemm is not implemented on Enflame; "
             "fall back to soft-fp8 dequant + torch linear"
         )
-    if has_triton:
+    if triton:
         return "triton"
-    if has_torch_npu:
+    if torch_npu:
         return "npu"
     raise NotImplementedError("No supported implementation found")
 
 
 soft_fp8_blockfp8_gemm.register_candidate("triton")
-if has_triton:
+if triton:
     soft_fp8_blockfp8_gemm.register("triton")(soft_fp8_blockfp8_gemm_triton)
 
 
-@soft_fp8_blockfp8_gemm.register("npu", available=has_torch_npu)
+@soft_fp8_blockfp8_gemm.register("npu", available=bool(torch_npu))
 @single_dispatch_lazy_tensor
 def soft_fp8_blockfp8_gemm_npu(
     x: torch.Tensor,

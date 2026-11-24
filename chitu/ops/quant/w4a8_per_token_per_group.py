@@ -5,9 +5,9 @@
 import torch
 
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+
+from chitu.optdep import chitu_backend
 
 
 @make_op_dispatcher
@@ -27,12 +27,12 @@ def w4a8_gemm_per_token_per_group_asymm(
 
 @w4a8_gemm_per_token_per_group_asymm.register_auto
 def _auto_w4a8_gemm_per_token_per_group_asymm():
-    if has_chitu_backend:
+    if chitu_backend:
         return "cuda"
     raise NotImplementedError("No GEMM implementation available")
 
 
-@w4a8_gemm_per_token_per_group_asymm.register("cuda", available=has_chitu_backend)
+@w4a8_gemm_per_token_per_group_asymm.register("cuda", available=bool(chitu_backend))
 def _w4a8_gemm_per_token_per_group_asymm_cuda(
     a,
     a_s,

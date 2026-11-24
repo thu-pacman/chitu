@@ -17,14 +17,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 import torch
 
 from chitu.device_type import has_accelerator
-from chitu.utils import try_import_and_setup_torch_npu
 
 
 def _get_device_backend():
     """
     Return the backend module and default device used by op benchmarks.
     """
-    try_import_and_setup_torch_npu()
+    from chitu.optdep import torch_npu  # noqa: F401
+
     if has_accelerator():
         return torch.cuda, torch.device("cuda")
     raise RuntimeError("No supported device backend found (cuda required).")
@@ -166,7 +166,8 @@ def do_bench_graph(
     from contextlib import nullcontext
 
     # Setup NPU compatibility (if present) so `torch.cuda.*` can be used uniformly.
-    try_import_and_setup_torch_npu()
+    from chitu.optdep import torch_npu  # noqa: F401
+
     if not has_accelerator():
         raise RuntimeError(
             "do_bench_graph requires CUDA (or Ascend redirected as CUDA)."

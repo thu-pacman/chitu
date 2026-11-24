@@ -7,21 +7,22 @@ from typing import Optional, cast
 
 import torch
 
-from chitu.import_utils import try_import_platform_dep
+
 from chitu.logging_utils import ChituLogger
 from chitu.ops.utils import make_op_dispatcher
 from chitu.device_type import is_hygon, is_nvidia
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+from chitu.optdep import chitu_backend
+
 logger = cast(ChituLogger, getLogger(__name__))
 
 
 has_hygon_indexer_topk = (
-    has_chitu_backend
+    bool(chitu_backend)
     and hasattr(chitu_backend, "hygon_indexer_topk")
     and callable(chitu_backend.hygon_indexer_topk)
 )
-has_nvidia_indexer_topk = has_chitu_backend and callable(
+has_nvidia_indexer_topk = bool(chitu_backend) and callable(
     getattr(chitu_backend, "nvidia_indexer_topk", None)
 )
 
@@ -36,7 +37,7 @@ def topk_page_table_decode_cuda(
             logits.shape[0], 2048, dtype=torch.int32, device=logits.device
         )
 
-    assert has_chitu_backend
+    assert chitu_backend
     assert logits.dim() == 2
     assert logits.shape[0] == lengths.shape[0]
     assert logits.shape[0] == source_page_table.shape[0]
@@ -104,7 +105,7 @@ def _auto_topk_indices(
     ):
         return "nvidia_indexer" if has_nvidia_indexer_topk else "torch"
     if (
-        has_chitu_backend
+        chitu_backend
         and (k == 2048 or k == logits.shape[-1])
         and out_dtype == torch.int32
     ):
@@ -112,7 +113,7 @@ def _auto_topk_indices(
     return "torch"
 
 
-@topk_indices.register("cuda", available=has_chitu_backend)
+@topk_indices.register("cuda", available=bool(chitu_backend))
 def topk_indices_cuda(
     logits: torch.Tensor,
     k: int,

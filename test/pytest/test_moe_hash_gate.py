@@ -6,16 +6,16 @@ import torch
 import pytest
 
 from chitu.ops import moe_hash_gate
-from chitu.utils import try_import_platform_dep
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+
+from chitu.optdep import chitu_backend
 
 
 @pytest.mark.parametrize("bs", [0, 1, 2, 8, 128])
 @pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
 def test_moe_hash_gate_sqrtsoftplus_cuda(bs, x_dtype, weight_dtype):
-    if not has_chitu_backend:
+    if not chitu_backend:
         pytest.skip("chitu_backend is not available")
 
     torch.manual_seed(bs)

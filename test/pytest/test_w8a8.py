@@ -9,19 +9,20 @@ from chitu.ops import (
     silu_and_mul,
     w8a8_gemm_per_token_per_channel,
 )
-from chitu.import_utils import try_import_platform_dep, try_import_and_setup_torch_npu
+
 from chitu.testing import assert_close, AssertOpCalled
 
-triton, has_triton = try_import_platform_dep("triton")
-lmslim, has_lmslim = try_import_platform_dep("lmslim")
-lightop, has_lightop = try_import_platform_dep("lightop")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-
-# Although imported lmslim and lightop, some version of them does not contain the following
-# functions. So treat the following functions with `try_import_platform_dep`, too.
-lmslim_quant_ops, has_lmslim_quant_ops = try_import_platform_dep(
-    "lmslim.quantize.quant_ops"
+from chitu.optdep import (
+    triton,
+    lmslim,
+    lightop,
+    torch_npu,
+    lmslim_quantize_quant_ops as lmslim_quant_ops,
 )
+
+
+# Some versions of lmslim do not contain the following functions, so the
+# sub-package is optional on its own.
 
 
 def init_b_and_b_s(dim):
@@ -36,9 +37,9 @@ def init_b_and_b_s(dim):
 @pytest.mark.parametrize("N", [1024])
 @pytest.mark.parametrize("impl", ["hygon", "torch_npu"])
 def test_a8_per_token_act_quant(M, N, impl, record_benchmark):
-    if impl == "hygon" and not has_lmslim:
+    if impl == "hygon" and not lmslim:
         pytest.skip("lmslim is missing")
-    if impl == "torch_npu" and not has_torch_npu:
+    if impl == "torch_npu" and not torch_npu:
         pytest.skip("torch_npu is missing")
 
     x = torch.rand(M, N, device="cuda", dtype=torch.bfloat16)
@@ -62,7 +63,7 @@ def test_a8_per_token_act_quant(M, N, impl, record_benchmark):
 def test_silu_and_mul_and_a8_per_token_act_quant(
     M, N, silu_and_mul_impl, a8_per_token_act_quant_impl, record_benchmark
 ):
-    if a8_per_token_act_quant_impl == "hygon" and not has_lmslim:
+    if a8_per_token_act_quant_impl == "hygon" and not lmslim:
         pytest.skip("lmslim is missing")
 
     set_global_args(
@@ -77,7 +78,7 @@ def test_silu_and_mul_and_a8_per_token_act_quant(
     def testee():
         if (
             a8_per_token_act_quant_impl == "hygon"
-            and has_lightop
+            and lightop
             and hasattr(lightop, "fuse_silu_mul_quant")
         ):
             expected_call_cnt = 1
@@ -117,18 +118,18 @@ def test_silu_and_mul_and_a8_per_token_act_quant(
 def test_dequanted_gemm_is_close_to_w8a8_gemm(
     bs, dim, dtype: torch.dtype, impl, record_benchmark
 ):
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
-    if impl == "torch_npu" and not has_torch_npu:
+    if impl == "torch_npu" and not torch_npu:
         pytest.skip("torch_npu is missing")
     if impl == "hipblaslt_w8a8_gemm" and not (
-        has_lmslim_quant_ops and hasattr(lmslim_quant_ops, "hipblaslt_w8a8_gemm")
+        lmslim_quant_ops and hasattr(lmslim_quant_ops, "hipblaslt_w8a8_gemm")
     ):
         pytest.skip(
             "lmslim is missing or lsmlim does not have lsmlim.quantize.quant_ops.hipblaslt_w8a8_gemm"
         )
     if impl == "lightop_gemm_w8a8_smooth" and not (
-        has_lightop and hasattr(lightop, "gemm_w8a8_smooth")
+        lightop and hasattr(lightop, "gemm_w8a8_smooth")
     ):
         pytest.skip(
             "lightop is missing or lightop does not have lightop.gemm_w8a8_smooth"

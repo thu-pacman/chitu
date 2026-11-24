@@ -15,13 +15,13 @@ from chitu.static_tensor import StaticTensor
 from chitu.hybrid_device import CPUParameter
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import GGMLQuantizationType
-from chitu.utils import try_import_opt_dep
+
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
 )
 
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+from chitu.optdep import cpuinfer
 
 
 @QuantizationRegistry.register_moe_experts(

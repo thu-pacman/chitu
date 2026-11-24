@@ -19,16 +19,16 @@ import torch
 from chitu.lazy import eval_lazy
 from chitu.ops import situ_and_mul
 from chitu.testing import assert_close
-from chitu.utils import try_import_platform_dep
 
-triton, has_triton = try_import_platform_dep("triton")
+
+from chitu.optdep import triton
 
 
 @pytest.mark.parametrize("shape", [(1, 128), (8, 3072), (33, 6144), (128, 512)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("beta,linear_beta", [(4.0, 25.0), (1.0, None), (2.5, 7.0)])
 def test_situ_and_mul(shape, dtype, beta, linear_beta, record_benchmark):
-    if not has_triton:
+    if not triton:
         pytest.skip("triton is missing")
 
     torch.manual_seed(42)

@@ -815,10 +815,8 @@ class Scheduler:
         )
 
     def _prepare_pd_decode_kvcache(
-        self, task_id: str, pd_prealloc_tokens: int
-    ) -> tuple[KVCacheCapacityStatus, int, dict[str, int]]:
-        task = TaskPool.pool[task_id]
-        num_cached_tokens = self._num_prefill_cached_tokens(task)
+        self, task: Task, pd_prealloc_tokens: int, num_cached_tokens: int
+    ) -> tuple[KVCacheCapacityStatus, dict[str, int]]:
         cache_manager_hit_block_counts = {
             name: (
                 # 发给 prefill 端"跳过的块数"，只能是被 prefix cache 命中的可复用块，
@@ -838,7 +836,7 @@ class Scheduler:
             pd_prealloc_tokens=pd_prealloc_tokens,
         )
         if capacity_status is not KVCacheCapacityStatus.OK:
-            return capacity_status, num_cached_tokens, cache_manager_hit_block_counts
+            return capacity_status, cache_manager_hit_block_counts
         task.set_prefill_chunk_size_for_one_step(
             1 if num_uncomputed_tokens == 0 else num_uncomputed_tokens
         )
@@ -846,7 +844,7 @@ class Scheduler:
             task, num_cached_tokens, eager_prefix_cache_insert=False
         )
         task.consume_req_tokens()
-        return capacity_status, num_cached_tokens, cache_manager_hit_block_counts
+        return capacity_status, cache_manager_hit_block_counts
 
     def _schedule_prefill_tasks(self, task_ids: list[str]) -> list[str]:
         """Prefill tasks scheduling with congestion control

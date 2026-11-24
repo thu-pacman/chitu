@@ -7,14 +7,13 @@ import torch
 
 from chitu.device_type import is_enflame
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep
 
-_, has_triton = try_import_platform_dep("triton")
-_, has_tilelang = try_import_platform_dep("tilelang")
+from chitu.optdep import triton, tilelang, chitu_backend
 
-if has_tilelang:
+
+if tilelang:
     from chitu.ops.tilelang_ops import mhc_pre_tilelang, mhc_post_tilelang
-if has_triton:
+if triton:
     from chitu.ops.triton_ops import mhc_pre_triton, mhc_post_triton
 
 
@@ -42,9 +41,9 @@ def _auto_mhc_pre():
     # the numerically equivalent Torch path until a native kernel is added.
     if is_enflame():
         return "torch"
-    if has_tilelang:
+    if tilelang:
         return "tilelang"
-    if has_triton:
+    if triton:
         return "triton"
     return "torch"
 
@@ -65,9 +64,9 @@ def mhc_post(
 def _auto_mhc_post():
     if is_enflame():
         return "torch"
-    if has_triton:
+    if triton:
         return "triton"
-    if has_tilelang:
+    if tilelang:
         return "tilelang"
     return "torch"
 
@@ -136,14 +135,14 @@ def mhc_post_torch(
     return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
 
 
-if has_tilelang:
+if tilelang:
     mhc_pre.register("tilelang")(mhc_pre_tilelang)
     mhc_post.register("tilelang")(mhc_post_tilelang)
 else:
     mhc_pre.register_candidate("tilelang")
     mhc_post.register_candidate("tilelang")
 
-if has_triton:
+if triton:
     mhc_pre.register("triton")(mhc_pre_triton)
     mhc_post.register("triton")(mhc_post_triton)
 else:

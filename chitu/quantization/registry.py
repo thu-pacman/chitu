@@ -26,9 +26,10 @@ from chitu.quantization.utils import (
 )
 from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.distributed.parallel_state import get_tp_size
-from chitu.utils import try_import_and_setup_torch_npu
 
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+from chitu.optdep import torch_npu
+
 logger = getLogger(__name__)
 
 
@@ -255,7 +256,7 @@ class QuantizationRegistry:
 
         args = get_global_args()
         if (
-            has_torch_npu
+            torch_npu
             and (quant is None or can_use_mla_prologue_int8)
             and args.models.type == ModelType.DEEPSEEK_V3
             and getattr(args.models, "index_topk", None) is None

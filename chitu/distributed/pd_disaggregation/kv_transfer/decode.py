@@ -14,6 +14,7 @@ from chitu.testing.exception import (
     test_inject_exception_kv_wait_timeout,
 )
 from chitu.trace import Trace
+from chitu.task import TaskPool
 from chitu.metrics.prometheus_collector import inc_kv_transfer_failures
 
 from chitu.utils import ceil_div
@@ -391,14 +392,26 @@ class KVManagerDecode(KVManagerBase):
         on may still be running.
         """
         info = self._info(task_id, create=False)
-        return info is not None and not info.is_prefill_done
+        if info is not None:
+            return not info.is_prefill_done
+        # The control rank owns scheduling metadata even when another DP rank
+        # owns the advertised receive buffers. Its stopped task must retain the
+        # same release grace until completion or the configured deadline.
+        task = TaskPool.pool.get(task_id)
+        return (
+            task is not None
+            and task.kv_transfer_pending
+            and not self.is_prefill_done(task_id)
+        )
 
     def is_prefill_failed(self, req_id: str) -> bool:
         """Whether the Prefill side reported a request-level failure for this
         request (its KV will never arrive). Consumed by the decode scheduler to
         stop such a request before it is promoted into a decode batch."""
         info = self._info(req_id, create=False)
-        return info is not None and info.prefill_failed
+        return req_id in self._early_prefill_failures or (
+            info is not None and info.prefill_failed
+        )
 
     def cancel_prefill_wait(self, req_id: str) -> None:
         """Mark this request as prefill-failed.
@@ -418,9 +431,15 @@ class KVManagerDecode(KVManagerBase):
         info.prefill_done_event.set()
 
     def remove_request(self, request_id: str):
-        # Do NOT discard _early_prefill_failures: cancel_prefill_wait() adds
-        # the marker, then stop_request() -> remove_request() runs in the same
-        # tick. The marker is consumed in handle_decode_prepare() (recv thread).
+        # Only a failure that preceded the request itself must survive cleanup.
+        # A non-owning DP control rank never creates TaskInfo, but its transfer
+        # status still proves that DecodePrepare has already been handled.
+        if (
+            request_id in TaskPool.pool
+            or request_id in self._task_infos
+            or request_id in self._transfer_done_states
+        ):
+            self._early_prefill_failures.discard(request_id)
         self._remove_info(request_id)
         self._transfer_done_states.pop(request_id, None)
 

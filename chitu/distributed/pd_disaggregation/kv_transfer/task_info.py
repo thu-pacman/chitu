@@ -64,6 +64,9 @@ class TaskInfo:
     done_count: int = 0
     """RankTransferDone counter."""
 
+    transfer_failed: bool = False
+    """A terminal failure has already been accepted for this live request."""
+
     rank_bytes: dict[str, int] = field(default_factory=dict)
     """Per-session sent bytes, accumulated from RankTransferDone (P side)."""
 

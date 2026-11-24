@@ -72,9 +72,6 @@ class KVManagerPrefill(KVManagerBase):
         # origin/main's per-active-transfer lifetime and still support async PP
         # drain checks after RankTransferDone removes it.
         self._completed_prefill_requests: set[str] = set()
-        # Deduplicate transfer failures reported by multiple Prefill ranks.
-        # TODO: Need to be cleaned at suitable time to avoid memory leak
-        self._transfer_failed_requests: set[str] = set()
         # Let the Scheduler turn a transfer failure into a request error.
         # (request_id, decode_sid, decode_generation, error_message) -> None
         self._transfer_failure_callback: Callable[[str, int, int, str], None] | None = (
@@ -371,13 +368,32 @@ class KVManagerPrefill(KVManagerBase):
         self.token_sender = token_sender
 
     def should_postpone_release(self, task_id: str) -> bool:
-        """Whether this request's KV blocks may still be read by RDMA.
+        """Keep the release grace active until all sending ranks have finished.
 
-        True while this Prefill rank has the request's KV send in flight. The
-        write cannot be cancelled, so freeing the source blocks now would let
-        the next request overwrite memory that is still being read.
+        The control rank owns cache allocation for every DP lane, while its
+        local inflight registry only describes this process. TaskInfo aggregates
+        completion across ranks; retirement transfers that hold to the Task
+        before deleting TaskInfo. The cache manager bounds it by the existing
+        transfer_grace_timeout.
         """
-        return task_id in kv_send_inflight_request_ids()
+        with self._prefill_transfer_state_lock:
+            task = TaskPool.pool.get(task_id)
+            return (
+                task_id in kv_send_inflight_request_ids()
+                or (task is not None and task.kv_transfer_pending)
+                or (
+                    self.is_ctrl_rank
+                    and self._has_unfinished_transfer(self._info(task_id))
+                )
+            )
+
+    def _has_unfinished_transfer(self, info: TaskInfo | None) -> bool:
+        """Whether any rank may send KV after Decode has advertised its buffers."""
+        return (
+            info is not None
+            and info.is_decode_allocated
+            and info.done_count < self.dp_way_size
+        )
 
     def sweep_stuck_transfers(self) -> None:
         """Retire Prefill requests whose KV transfer stopped making progress.
@@ -423,9 +439,7 @@ class KVManagerPrefill(KVManagerBase):
                         continue
                 if now - info.last_progress_ts < info.transfer_grace_s:
                     continue
-                if self._task_infos.pop(rid, None) is None:
-                    # Claimed by someone else between the check and the pop.
-                    continue
+                self._remove_request_locked(rid)
                 stuck.append((rid, now - info.last_progress_ts))
 
         for rid, waited in stuck:
@@ -595,6 +609,8 @@ class KVManagerPrefill(KVManagerBase):
             info = self._info(msg.req_id)
             if info is None:
                 retire_reason = "no transfer state"
+            elif info.transfer_failed:
+                return
             elif (inst_id := self._decode_inst_id(info.decode_sid)) is None:
                 # `update_trace_info(create=True)` can register the request before
                 # `DecodeAllocated` arrives, so `decode_sid` is still None here. A
@@ -628,6 +644,9 @@ class KVManagerPrefill(KVManagerBase):
                         info.num_hit_tokens, int(task.req.num_hit_tokens)
                     )
                     if info.done_count == self.dp_way_size:
+                        # Only the aggregate completion can release the control
+                        # rank's hold; one local sender does not cover other ranks.
+                        task.kv_transfer_pending = False
                         if info.trace is not None:
                             info.trace.info({"name": "Prefill Complete"})
                         # Keep the done marker under the lock:
@@ -694,63 +713,40 @@ class KVManagerPrefill(KVManagerBase):
                 )
 
     def _handle_rank_transfer_failed(self, msg: RankTransferFailed) -> None:
-        inst_id = self._decode_inst_id(msg.decode_sid)
-        if inst_id is None:
-            logger.warning(
-                "[KV_TRANSFER][decode_peer_failed] unknown decode_sid=%s req_id=%s",
-                msg.decode_sid,
-                msg.req_id,
-            )
+        """Fail one live request without invalidating its shared Decode plan."""
         with self._prefill_transfer_state_lock:
-            if msg.req_id in self._transfer_failed_requests:
+            info = self._info(msg.req_id)
+            task = TaskPool.pool.get(msg.req_id)
+            # Only the control rank receives RankTransferFailed, and it owns
+            # the scheduling Task for every DP lane before native sends begin.
+            # A late DecodeAllocated may recreate Info after async PP consumes
+            # its completion marker; do not report or retain that retired state.
+            if task is None:
+                self._remove_info(msg.req_id)
                 return
-            if inst_id is None:
-                # Every Prefill rank derives `_decode_inst_ids` from the same
-                # config, so a slot this rank does not know is unknown to the
-                # others too: there is no plan to drop and nobody to relay the
-                # failure to.
-                peer_already_failed = True
-            else:
-                peer_already_failed = (
-                    self.static_transfer_plans.pop(
-                        (inst_id, msg.decode_generation), None
-                    )
-                    is None
-                )
-            self._transfer_failed_requests.add(msg.req_id)
+            if (
+                info is None
+                or info.transfer_failed
+                or info.done_count >= self.dp_way_size
+                or task.need_remove()
+                or (info.decode_sid, info.decode_generation)
+                != (msg.decode_sid, msg.decode_generation)
+            ):
+                return
+            info.transfer_failed = True
+            # The sender can be another DP/TP/PP rank, whose local inflight and
+            # Task state are invisible to the allocator on this control rank.
+            task.kv_transfer_pending = True
             self._completed_prefill_requests.add(msg.req_id)
 
         logger.warning(
-            "[KV_TRANSFER][decode_peer_failed] req_id=%s decode_sid=%s "
+            "[KV_TRANSFER][request_failed] req_id=%s decode_sid=%s "
             "generation=%s error=%s",
             msg.req_id,
             msg.decode_sid,
             msg.decode_generation,
             msg.error_message,
         )
-        if not peer_already_failed and self.world_size > 1:
-            # Reuse DecodeAllocated endpoint to notify other rank
-            #   DecodeAllocated -> decode_sid allocate buffer, can start prefill
-            #   DecodePeerFailed -> decode_sid not accessible, romove trasfer plan
-            try:
-                with self._blocking_send():
-                    self.endpoints.decode_allocated.send(
-                        ProtocolSerializer.pack(
-                            DecodePeerFailed(
-                                decode_sid=msg.decode_sid,
-                                decode_generation=msg.decode_generation,
-                            )
-                        )
-                    )
-            except Exception:
-                # This runs on the receive thread, where an exception means
-                # process exit. The relay only fails when another Prefill rank is
-                # unreachable, and that rank's own state is its problem.
-                logger.exception(
-                    "[KV_TRANSFER][decode_peer_failed] relay failed req_id=%s",
-                    msg.req_id,
-                )
-
         if self._transfer_failure_callback is not None:
             # tell PD scheduler to stop this request and return error message to client
             self._transfer_failure_callback(
@@ -759,6 +755,8 @@ class KVManagerPrefill(KVManagerBase):
                 msg.decode_generation,
                 msg.error_message,
             )
+        else:
+            self._retire_request(msg.req_id)
 
     def are_prefill_requests_completed(self, request_ids: list[str]) -> bool:
         """Check whether all RDMA transfers for a batch have completed."""
@@ -810,20 +808,38 @@ class KVManagerPrefill(KVManagerBase):
         assert isinstance(msg, DecodeAllocated)
         logger.debug(f"handle_decode_allocated {msg.req_id}")
 
+        # Workers can receive allocation before their Task arrives, so absence
+        # from TaskPool alone is not a retirement signal. Reuse the existing PP
+        # completion marker to reject known late messages before peer refresh.
+        with self._prefill_transfer_state_lock:
+            if msg.req_id in self._completed_prefill_requests:
+                return
+
         self.refresh_decode_peer(msg.decode_sid, msg.decode_generation)
 
-        info = self._info(msg.req_id, create=True)
+        with self._prefill_transfer_state_lock:
+            task = TaskPool.pool.get(msg.req_id)
+            if msg.req_id in self._completed_prefill_requests or (
+                task is not None and task.need_remove()
+            ):
+                return
+            info = self._info(msg.req_id, create=True)
+            if info.transfer_failed or (
+                info.decode_sid is not None
+                and (info.decode_sid, info.decode_generation)
+                != (msg.decode_sid, msg.decode_generation)
+            ):
+                return
+            info.decode_sid = msg.decode_sid
+            info.decode_generation = msg.decode_generation
+            info.decode_dp_rank = msg.dp_rank
 
-        info.decode_sid = msg.decode_sid
-        info.decode_generation = msg.decode_generation
-        info.decode_dp_rank = msg.dp_rank
+            info.recv_buffers[msg.session_id] = msg.buffers
+            info.decode_allocated_cnt += 1
+            info.cache_manager_hit_block_counts = msg.cache_manager_hit_block_counts
 
-        info.recv_buffers[msg.session_id] = msg.buffers
-        info.decode_allocated_cnt += 1
-        info.cache_manager_hit_block_counts = msg.cache_manager_hit_block_counts
-
-        if info.decode_allocated_cnt == msg.rank_num:
-            info.is_decode_allocated = True
+            if info.decode_allocated_cnt == msg.rank_num:
+                info.is_decode_allocated = True
 
         self._trace(
             "handle_decode_allocated",
@@ -984,6 +1000,18 @@ class KVManagerPrefill(KVManagerBase):
 
             event.synchronize()
 
+            # A cancellation may have removed this request while the worker
+            # waited for the GPU event. TP followers have TaskInfo and cache
+            # metadata but no local scheduling Task, so Task absence is valid.
+            with self._prefill_transfer_state_lock:
+                task = TaskPool.pool.get(req_id)
+                if (
+                    self._info(req_id) is not info
+                    or info.transfer_failed
+                    or (task is not None and task.need_remove())
+                ):
+                    return
+
             static_plan = self._get_transfer_plan(inst_id, decode_generation)
             if static_plan is None:
                 self._report_transfer_failure(
@@ -996,6 +1024,13 @@ class KVManagerPrefill(KVManagerBase):
             plan = create_transfer_plan(static_plan, send_buffers, recv_buffers)
 
             transfer_start = time.monotonic()
+            with self._prefill_transfer_state_lock:
+                if (
+                    self._info(req_id) is not info
+                    or info.transfer_failed
+                    or (task is not None and task.need_remove())
+                ):
+                    return
             plan.execute_send(self.transfer_engine.engine)
             transfer_duration = time.monotonic() - transfer_start
             rank_bytes = plan.total_bytes_per_session()
@@ -1036,9 +1071,24 @@ class KVManagerPrefill(KVManagerBase):
             )
             report_and_exit(f"KV transfer_worker crashed req_id={req_id}")
         finally:
-            # The transfer is over either way (sent, reported as failed, or the
-            # process is going down): stop counting it as in flight.
+            # Only the local Python worker is done. The control rank retains
+            # the aggregate hold until completion or bounded retirement.
             mark_kv_send_finished(req_id)
+
+    def _remove_request_locked(self, request_id: str) -> None:
+        """Retire transfer metadata while holding the transfer-state lock."""
+        task = TaskPool.pool.get(request_id)
+        if (
+            self.is_ctrl_rank
+            and task is not None
+            and self._has_unfinished_transfer(self._info(request_id))
+        ):
+            task.kv_transfer_pending = True
+        self._remove_info(request_id)
+
+    def remove_request(self, request_id: str):
+        with self._prefill_transfer_state_lock:
+            self._remove_request_locked(request_id)
 
     def remove_request_all_rank(self, request_id: str, *, block: bool = True):
         """Broadcast RemoveRequest to all Prefill ranks (including self).

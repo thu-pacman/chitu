@@ -7,14 +7,15 @@ import torch.nn.functional as F
 
 from chitu.device_type import has_accelerator, is_enflame, is_hygon
 from chitu.ops.utils import check_checkpoint_args, make_op_dispatcher
-from chitu.utils import try_import_platform_dep
+
 from typing import Optional
 
-triton, has_triton = try_import_platform_dep("triton")
-has_triton_impl = has_triton and has_accelerator()
-boltops_conv, has_boltops_causal_conv = try_import_platform_dep(
-    "boltops.generic.triton.causal_conv1d"
-)
+from chitu.optdep import triton
+
+has_triton_impl = bool(triton) and has_accelerator()
+from chitu.optdep import boltops_conv
+
+has_boltops_causal_conv = bool(boltops_conv)
 has_boltops_causal_conv = has_boltops_causal_conv and has_triton_impl and is_hygon()
 
 if has_triton_impl:

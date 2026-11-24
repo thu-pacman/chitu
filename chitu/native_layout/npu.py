@@ -10,9 +10,9 @@ import torch
 
 from chitu.native_layout.base import NativeLayoutTensor
 from chitu.native_layout.common import Packed4BitWeightAlongKContig
-from chitu.import_utils import try_import_and_setup_torch_npu
 
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+from chitu.optdep import torch_npu
 
 
 @dataclass

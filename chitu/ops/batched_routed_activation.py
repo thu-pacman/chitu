@@ -9,19 +9,12 @@ import torch
 from chitu.device_type import has_accelerator
 from chitu.utils import ceil_div
 from chitu.ops.utils import make_op_dispatcher
-from chitu.import_utils import (
-    try_import_platform_dep,
-    try_import_opt_dep,
-    try_import_and_setup_torch_npu,
-)
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-has_triton_impl = has_triton and has_accelerator()
-muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
-    "muxi_layout_kernels", "muxi_layout_kernels"
-)
+
+from chitu.optdep import chitu_backend, triton, torch_npu
+
+has_triton_impl = bool(triton) and has_accelerator()
+from chitu.optdep import muxi_layout_kernels
 
 if has_triton_impl:
     from chitu.ops.triton_ops import (
@@ -94,12 +87,12 @@ def _auto_batched_routed_activation_indexed_to_expert_block_indexed(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
 ):
     if (
-        has_muxi_layout_kernels
+        muxi_layout_kernels
         and num_experts in [8, 16, 32, 64, 128, 256]
         and block_size in [16]
     ):
         return "muxi"
-    if has_chitu_backend:
+    if chitu_backend:
         return "cuda"
     if has_triton_impl:
         return "triton"
@@ -124,7 +117,7 @@ if has_triton_impl:
 # (https://github.com/sgl-project/sglang/commit/ba5112ff691d791a9e38c6c71f59324a5fcb49d0),
 # licensed under Apache 2.0.
 @batched_routed_activation_indexed_to_expert_block_indexed.register(
-    "cuda", available=has_chitu_backend
+    "cuda", available=bool(chitu_backend)
 )
 def batched_routed_activation_indexed_to_expert_block_indexed_cuda(
     topk_ids: torch.Tensor,
@@ -181,7 +174,7 @@ def batched_routed_activation_indexed_to_expert_block_indexed_cuda(
 
 
 @batched_routed_activation_indexed_to_expert_block_indexed.register(
-    "muxi", available=has_muxi_layout_kernels
+    "muxi", available=bool(muxi_layout_kernels)
 )
 def batched_routed_activation_indexed_to_expert_block_indexed_muxi(
     topk_ids: torch.Tensor,
@@ -530,7 +523,7 @@ def batched_routed_activation_indexed_to_concat_permuted(
 
 @batched_routed_activation_indexed_to_concat_permuted.register_auto
 def _auto_batched_routed_activation_indexed_to_concat_permuted():
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     raise NotImplementedError(
         "No available implementation found for "
@@ -539,7 +532,7 @@ def _auto_batched_routed_activation_indexed_to_concat_permuted():
 
 
 @batched_routed_activation_indexed_to_concat_permuted.register(
-    "torch_npu", available=has_torch_npu
+    "torch_npu", available=bool(torch_npu)
 )
 def batched_routed_activation_indexed_to_concat_permuted_torch_npu(
     activation: torch.Tensor,

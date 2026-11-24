@@ -6,12 +6,12 @@ from chitu.ops import (
     causal_conv1d_update_qwen3_next,
     causal_conv1d_prefill,
 )
-from chitu.utils import try_import_platform_dep
+
 from chitu.testing import AssertOpCalled, assert_close
 from chitu.device_type import is_enflame
 from chitu.ops.causal_conv import has_boltops_causal_conv
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
 
 @pytest.mark.parametrize("batch_size", [0, 1, 4])
@@ -21,7 +21,7 @@ triton, has_triton = try_import_platform_dep("triton")
 def test_causal_conv1d_update(batch_size, hidden_size, state_len, impl):
     if impl == "boltops" and not has_boltops_causal_conv:
         pytest.skip("BoltOps conv is unavailable")
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     torch.set_default_dtype(torch.bfloat16)
     old_hidden_state = torch.randn(
@@ -69,7 +69,7 @@ def test_boltops_causal_conv1d_update_bf16_cancellation():
 def test_causal_conv1d_update_fp32_weight(impl):
     if impl == "boltops" and not has_boltops_causal_conv:
         pytest.skip("BoltOps conv is unavailable")
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     torch.set_default_dtype(torch.bfloat16)
     batch_size, hidden_size, state_len = 4, 2048, 4
@@ -146,7 +146,7 @@ def test_causal_conv1d_update_qwen3_next_b1_is_exact_and_inplace():
 def test_causal_conv1d_prefill(prefix_lens, hidden_size, state_len, impl):
     if impl == "boltops" and not has_boltops_causal_conv:
         pytest.skip("BoltOps conv is unavailable")
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     torch.set_default_dtype(torch.bfloat16)
     batch_size = prefix_lens.shape[0] - 1
@@ -169,7 +169,7 @@ def test_causal_conv1d_prefill(prefix_lens, hidden_size, state_len, impl):
 def test_causal_conv1d_prefill_fp32_weight(impl):
     if impl == "boltops" and not has_boltops_causal_conv:
         pytest.skip("BoltOps conv is unavailable")
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
     torch.set_default_dtype(torch.bfloat16)
     prefix_lens = torch.tensor([0, 2, 5], device="cuda")

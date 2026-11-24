@@ -10,10 +10,9 @@ import torch
 
 from chitu.device_type import is_hygon, is_ascend_950
 from chitu.models.registry import ModelType
-from chitu.utils import try_import_opt_dep
 
-_, has_flash_attn3 = try_import_opt_dep("flash_attn_interface", "flash_attn_interface")
-_, has_hunyuan_ops = try_import_opt_dep("hpc", "hpc_ops")
+
+from chitu.optdep import flash_attn_interface as flash_attn3, hpc as hunyuan_ops
 
 KVArgs = Dict[str, Any]
 KVKeys = List[str]
@@ -119,11 +118,11 @@ def should_use_hopper_mixed_backend(args) -> bool:
     quant_config = getattr(args.models, "quant_config", None)
     if kv_cache_quant_type_for_key(quant_config, "kv_lora") == "fp8_pertoken_dsa":
         return False
-    return has_flash_attn3
+    return bool(flash_attn3)
 
 
 def can_use_hunyuan_attn(args) -> bool:
-    if not has_hunyuan_ops:
+    if not hunyuan_ops:
         return False
 
     models = getattr(args, "models", args)

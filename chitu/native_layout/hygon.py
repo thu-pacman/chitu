@@ -10,14 +10,12 @@ import torch
 
 from chitu.native_layout.base import NativeLayoutTensor
 from chitu.native_layout.common import Packed4BitWeightAlongKContig
-from chitu.import_utils import try_import_opt_dep
+
 from chitu.utils import ceil_div
 
-hygon_mixq_kernels, has_hygon = try_import_opt_dep(
-    "sugon_mixQ4_kernels", "sugon_mixq4_kernels"
-)
-hygon_w4a8_kernels, has_hygon_w4a8 = try_import_opt_dep(
-    "sugon_w4a8_kernels", "sugon_w4a8_kernels"
+from chitu.optdep import (
+    sugon_mixQ4_kernels as hygon_mixq_kernels,
+    sugon_w4a8_kernels as hygon_w4a8_kernels,
 )
 
 
@@ -344,7 +342,7 @@ class HygonW4A8Int4TileTensor(NativeLayoutTensor):
         tensor = packed.layout_tensor.view(torch.int8)
         if tensor.device.type == "meta":
             return cls(plain_shape=packed.plain_shape, layout_tensor=tensor)
-        assert has_hygon_w4a8, "Hygon/Sugon w4a8 kernels are unavailable."
+        assert hygon_w4a8_kernels, "Hygon/Sugon w4a8 kernels are unavailable."
         assert hasattr(
             hygon_w4a8_kernels, "native_layout_of_weights_tile_int4_opt"
         ), "Kernel 'native_layout_of_weights_tile_int4_opt' not found."
@@ -376,7 +374,7 @@ class HygonW4A8Int8TileTensor(NativeLayoutTensor):
     def convert_from(cls, tensor: torch.Tensor):
         if tensor.device.type == "meta":
             return cls(plain_shape=tensor.shape, layout_tensor=tensor)
-        assert has_hygon_w4a8, "Hygon/Sugon w4a8 kernels are unavailable."
+        assert hygon_w4a8_kernels, "Hygon/Sugon w4a8 kernels are unavailable."
         assert hasattr(
             hygon_w4a8_kernels, "native_layout_of_scale_tile_i8"
         ), "Kernel 'native_layout_of_scale_tile_i8' not found."
@@ -417,7 +415,7 @@ class HygonMixQIntTileTensor(NativeLayoutTensor):
             plain_shape = tensor.shape
         if tensor.device.type == "meta":
             return cls(plain_shape=plain_shape, layout_tensor=tensor)
-        assert has_hygon, "Hygon/Sugon kernels are unavailable."
+        assert hygon_mixq_kernels, "Hygon/Sugon kernels are unavailable."
         assert hasattr(
             hygon_mixq_kernels, "native_layout_of_weights_tile_int"
         ), "Kernel 'native_layout_of_weights_tile_int' not found."
@@ -448,7 +446,7 @@ class HygonMixQFp16TileTensor(NativeLayoutTensor):
         *,
         perm_index=None,
     ):
-        assert has_hygon, "Hygon/Sugon kernels are unavailable."
+        assert hygon_mixq_kernels, "Hygon/Sugon kernels are unavailable."
         assert hasattr(
             hygon_mixq_kernels, "native_layout_of_weights_tile_fp16"
         ), "Kernel 'native_layout_of_weights_tile_fp16' not found."

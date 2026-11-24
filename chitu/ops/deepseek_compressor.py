@@ -16,10 +16,11 @@ from chitu.ops.deepseek_v4_decode_plan import (
     build_decode_compress_plan,
 )
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep
 
-_, _has_triton = try_import_platform_dep("triton")
-if _has_triton:
+
+from chitu.optdep import triton
+
+if triton:
     from chitu.ops.triton_ops.deepseek_compressor import (
         compress_csa_triton,
         compress_hca_triton,
@@ -182,13 +183,13 @@ def gather_pending_and_new(
 
 @gather_pending_and_new.register_auto
 def _auto_gather_pending_and_new():
-    if is_enflame() or not _has_triton:
+    if is_enflame() or not triton:
         return "torch"
     return "triton"
 
 
 gather_pending_and_new.register_candidate("triton")
-if _has_triton:
+if triton:
     gather_pending_and_new.register("triton")(gather_pending_and_new_triton)
 
 
@@ -268,13 +269,13 @@ def compress_hca(
 
 @compress_hca.register_auto
 def _auto_compress_hca():
-    if is_enflame() or not _has_triton:
+    if is_enflame() or not triton:
         return "torch"
     return "triton"
 
 
 compress_hca.register_candidate("triton")
-if _has_triton:
+if triton:
     compress_hca.register("triton")(compress_hca_triton)
 
 
@@ -344,13 +345,13 @@ def compress_csa(
 
 @compress_csa.register_auto
 def _auto_compress_csa():
-    if is_enflame() or not _has_triton:
+    if is_enflame() or not triton:
         return "torch"
     return "triton"
 
 
 compress_csa.register_candidate("triton")
-if _has_triton:
+if triton:
     compress_csa.register("triton")(compress_csa_triton)
 
 
@@ -457,13 +458,13 @@ def writeback_pending(
 
 @writeback_pending.register_auto
 def _auto_writeback_pending():
-    if is_enflame() or not _has_triton:
+    if is_enflame() or not triton:
         return "torch"
     return "triton"
 
 
 writeback_pending.register_candidate("triton")
-if _has_triton:
+if triton:
     writeback_pending.register("triton")(writeback_pending_triton)
 
 
@@ -540,13 +541,13 @@ def pack_prefill_kv(
 
 @pack_prefill_kv.register_auto
 def _auto_pack_prefill_kv():
-    if is_enflame() or not _has_triton:
+    if is_enflame() or not triton:
         return "torch"
     return "triton"
 
 
 pack_prefill_kv.register_candidate("triton")
-if _has_triton:
+if triton:
     pack_prefill_kv.register("triton")(pack_prefill_kv_triton)
 
 
@@ -622,13 +623,13 @@ def masked_write_kv_cache(
 
 @masked_write_kv_cache.register_auto
 def _auto_masked_write_kv_cache():
-    if is_enflame() or not _has_triton:
+    if is_enflame() or not triton:
         return "torch"
     return "triton"
 
 
 masked_write_kv_cache.register_candidate("triton")
-if _has_triton:
+if triton:
     masked_write_kv_cache.register("triton")(masked_write_kv_cache_triton)
 
 
@@ -703,7 +704,7 @@ def supports_decode_fastpath(
     q_len: int,
     ratio: int,
 ) -> bool:
-    return q_len <= ratio and _has_triton and kv.is_cuda
+    return q_len <= ratio and bool(triton) and kv.is_cuda
 
 
 @make_op_dispatcher
@@ -749,7 +750,7 @@ def _auto_decode_compressor(
     row_is_valid: Optional[torch.Tensor] = None,
 ):
     del plan, request_rows, row_is_valid
-    if _has_triton and kv.is_cuda:
+    if triton and kv.is_cuda:
         return "triton"
     if q_len == 1:
         return "torch"
@@ -758,7 +759,7 @@ def _auto_decode_compressor(
     )
 
 
-@decode_compressor.register("triton", available=_has_triton)
+@decode_compressor.register("triton", available=bool(triton))
 def _decode_compressor_triton(
     kv: torch.Tensor,
     score: torch.Tensor,
@@ -993,7 +994,7 @@ def _auto_try_fused_decode_postprocess_write_cache(
         return "skip"
 
     if (
-        _has_triton
+        triton
         and not use_hadamard
         and kv_cache_is_paged
         and block_table is not None
@@ -1002,7 +1003,7 @@ def _auto_try_fused_decode_postprocess_write_cache(
         return "flashmla"
 
     if (
-        _has_triton
+        triton
         and use_hadamard
         and kv_compress.shape[-1] == 128
         and kv_cache.ndim == 3
@@ -1013,7 +1014,7 @@ def _auto_try_fused_decode_postprocess_write_cache(
         return "kv_cache_hadamard"
 
     if (
-        _has_triton
+        triton
         and not use_hadamard
         and kv_cache.ndim == 3
         and not _is_flashmla_packed_cache(kv_cache)
@@ -1046,7 +1047,7 @@ def _try_fused_decode_postprocess_write_cache_skip(
     return False
 
 
-@try_fused_decode_postprocess_write_cache.register("flashmla", available=_has_triton)
+@try_fused_decode_postprocess_write_cache.register("flashmla", available=bool(triton))
 def _try_fused_decode_postprocess_write_cache_flashmla_impl(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -1116,7 +1117,7 @@ def _call_postprocess_kv_cache_writer(
     return True
 
 
-@try_fused_decode_postprocess_write_cache.register("kv_cache", available=_has_triton)
+@try_fused_decode_postprocess_write_cache.register("kv_cache", available=bool(triton))
 def _try_fused_decode_postprocess_write_cache_kv_impl(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -1154,7 +1155,7 @@ def _try_fused_decode_postprocess_write_cache_kv_impl(
 
 
 @try_fused_decode_postprocess_write_cache.register(
-    "kv_cache_hadamard", available=_has_triton
+    "kv_cache_hadamard", available=bool(triton)
 )
 def _try_fused_decode_postprocess_write_cache_kv_hadamard_impl(
     kv_compress: torch.Tensor,

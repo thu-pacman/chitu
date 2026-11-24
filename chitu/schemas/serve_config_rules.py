@@ -157,6 +157,7 @@ class ServeConfigRules(Callback):
         self._check_linear_checkpoint_interval(config)
         self._check_linear_attention_impl(config)
         self._check_pcp_layout(config)
+        self._check_dense_mla_cp_layout(config)
         self._check_pcp_with_linear_attention(config)
 
     def _check_linear_attention_impl(self, config: DictConfig) -> None:
@@ -190,6 +191,15 @@ class ServeConfigRules(Callback):
             self._exit_with_error(
                 "infer.pcp_layout must be one of "
                 f'["interleaved", "contiguous"], got {layout}'
+            )
+
+    def _check_dense_mla_cp_layout(self, config: DictConfig) -> None:
+        """Validate the MLA chunk layout selected for PCP."""
+        layout = config.infer.get("dense_mla_cp_layout", "contiguous")
+        if layout not in {"contiguous", "zigzag"}:
+            self._exit_with_error(
+                "infer.dense_mla_cp_layout must be one of "
+                f'["contiguous", "zigzag"], got {layout}'
             )
 
     def _check_linear_checkpoint_interval(self, config: DictConfig) -> None:
@@ -267,6 +277,13 @@ class ServeConfigRules(Callback):
         （``_ckpt_page_id`` / ``_upd_ckpt_write_pages`` 用绝对 position ids，chunk 起点由
         调度器对齐到 C 的网格），与 cp 怎么切无关。注意 ``infer.pcp_size > 1`` 还有并行度
         上的限制（``dp_size`` 必须为 1，见 chitu/boot/arg_utils.py），那是另一回事。
+        - ``kimi-k3``（chitu/models/model_kimi_k3.py）：支持 PCP prefill，但约束比
+        GLM-5.3 更严格：必须 ``mla_absorb=absorb-kv-only``、``pcp_layout=contiguous``、
+        ``attn_type=flash_attn``，且不支持带 scale 的 FP8 latent KV cache。KDA 层优先
+        走连续切分；短 chunk、prefix caching checkpoint 页等场景退回 replicate：
+        将投影后的 qkv/beta/f_a/g 全量 all-gather，在全局序列上跑短卷积和递归，再切回
+        本 rank 的行。MLA 层使用 contiguous/zigzag 的本地 chunk，再从 paged latent
+        cache 重建 full K/V。
         - ``hf-qwen3-next`` / ``hf-qwen3-5``：模型里还没有 cp 路径，层拿到本 rank 的
         token 后仍把全局的 ``seq_len_delta`` 当 cu_seqlens 传给算子（见
         Qwen3NextGatedDeltaNet.forward），算子的 grid/索引按全局长度算会直接越界
@@ -275,10 +292,14 @@ class ServeConfigRules(Callback):
         """
         # 有线性注意力层的模型类型，见 chitu/models/model_hf_qwen3_next.py、
         # chitu/models/model_hf_qwen3_5.py、chitu/models/model_glm5_next.py
-        linear_attn_model_types = {"hf-qwen3-next", "hf-qwen3-5", "glm-5-next"}
-        # 已经有 cp prefill 实现（连续切分 + replicate fallback）的模型类型，
-        # 其余一律不支持 cp。
-        cp_prefill_model_types = {"glm-5-next"}
+        linear_attn_model_types = {
+            "hf-qwen3-next",
+            "hf-qwen3-5",
+            "glm-5-next",
+            "kimi-k3",
+        }
+        # 已经有 cp prefill 实现的模型类型，其余一律不支持 cp。
+        cp_prefill_model_types = {"glm-5-next", "kimi-k3"}
         model_type = config.models.type
         if model_type not in linear_attn_model_types:
             return

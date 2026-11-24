@@ -4,13 +4,13 @@
 
 import torch
 
-from chitu.utils import try_import_platform_dep
+
 from chitu.native_layout import Packed4BitWeightAlongK
 from chitu.ops.utils import make_op_dispatcher
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
-if has_triton:
+if triton:
     from chitu.ops.triton_ops import w4a8_gemm_per_token_per_channel_asymm_triton
 
 
@@ -32,7 +32,7 @@ def _auto_w4a8_gemm_per_token_per_channel_asymm():
 
 
 w4a8_gemm_per_token_per_channel_asymm.register_candidate("triton")
-if has_triton:
+if triton:
     w4a8_gemm_per_token_per_channel_asymm.register("triton")(
         w4a8_gemm_per_token_per_channel_asymm_triton
     )

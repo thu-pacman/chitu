@@ -20,10 +20,9 @@ from chitu.ops.minimax_sparse.attn_runner import (
     run_minimax_sparse_flash_decode,
 )
 from chitu.testing import assert_close
-from chitu.utils import try_import_opt_dep, try_import_platform_dep
 
-_, has_flash_attn3 = try_import_opt_dep("flash_attn_interface", "flash_attn_interface")
-_, has_triton = try_import_platform_dep("triton")
+
+from chitu.optdep import flash_attn_interface as flash_attn3, triton
 
 
 def _setup_global_args() -> None:
@@ -512,9 +511,9 @@ def test_sparse_attention_matches_selected_blocks():
     assert_close(output, expected, atol=1e-6, rtol=1e-6)
 
 
-@pytest.mark.skipif(not has_triton, reason="requires triton")
+@pytest.mark.skipif(not triton, reason="requires triton")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(not has_flash_attn3, reason="requires flash_attn_interface")
+@pytest.mark.skipif(not flash_attn3, reason="requires flash_attn_interface")
 def test_sparse_prefill_triton_matches_ref():
     from chitu.ops.minimax_sparse.attn_runner_triton import (
         run_minimax_sparse_prefill_triton,
@@ -566,7 +565,7 @@ def test_sparse_prefill_triton_matches_ref():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(not has_flash_attn3, reason="requires flash_attn_interface")
+@pytest.mark.skipif(not flash_attn3, reason="requires flash_attn_interface")
 def test_sparse_decode_remap_fa_matches_ref():
     from chitu.attn_backend.flash_attn_backend import FlashAttnBackend
 

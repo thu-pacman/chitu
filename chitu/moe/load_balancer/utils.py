@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 import torch
-from chitu.utils import try_import_and_setup_torch_npu
 
 
 def argmax_exclude_negative(tensor, dim=None):

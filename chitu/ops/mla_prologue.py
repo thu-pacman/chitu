@@ -16,9 +16,9 @@ from chitu.native_layout import (
     PartialColumnOddEvenSeparatedTensor,
 )
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import ceil_div, try_import_and_setup_torch_npu
+from chitu.utils import ceil_div
 
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+from chitu.optdep import torch_npu
 
 
 @make_op_dispatcher
@@ -64,7 +64,7 @@ def _auto_mla_prologue(
     smooth_scales=None,
 ):
     if (
-        has_torch_npu
+        torch_npu
         and (x.dtype == torch.bfloat16 or x.dtype == torch.int8)
         and x.shape[-1] == 7168
         and q_a_layernorm_weight.shape[0] == 1536
@@ -175,7 +175,7 @@ def mla_prologue_torch(
     return q_nope, q_pe, kv
 
 
-@mla_prologue.register("torch_npu", available=has_torch_npu)
+@mla_prologue.register("torch_npu", available=bool(torch_npu))
 def mla_prologue_torch_npu(
     x: torch.Tensor,
     q_a_proj_weight: NpuFractalZnTensor,  # a.k.a. weight_dq

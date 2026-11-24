@@ -6,12 +6,9 @@ import functools
 import torch
 
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_opt_dep, is_power_of_two, next_power_of_two
+from chitu.utils import is_power_of_two, next_power_of_two
 
-scipy, has_scipy = try_import_opt_dep("scipy", "scipy")
-fast_hadamard_transform, has_fast_hadamard_transform = try_import_opt_dep(
-    "fast_hadamard_transform", "fast_hadamard_transform"
-)
+from chitu.optdep import scipy, fast_hadamard_transform
 
 
 @make_op_dispatcher
@@ -23,9 +20,9 @@ def hadamard_transform(
 
 @hadamard_transform.register_auto
 def _auto_hadamard_transform():
-    if has_fast_hadamard_transform:
+    if fast_hadamard_transform:
         return "fast_hadamard_transform"
-    if has_scipy:
+    if scipy:
         return "scipy"
     return "torch"
 
@@ -70,7 +67,7 @@ def get_hadamard_matrix_scipy(
     return torch.tensor(scipy.linalg.hadamard(dim), dtype=dtype, device=device)
 
 
-@hadamard_transform.register("scipy", available=has_scipy)
+@hadamard_transform.register("scipy", available=bool(scipy))
 def hadamard_transform_scipy(x: torch.Tensor, scale: float) -> torch.Tensor:
     dim = x.shape[-1]
     if not is_power_of_two(dim):
@@ -87,11 +84,11 @@ def hadamard_transform_scipy(x: torch.Tensor, scale: float) -> torch.Tensor:
 
 
 @hadamard_transform.register(
-    "fast_hadamard_transform", available=has_fast_hadamard_transform
+    "fast_hadamard_transform", available=bool(fast_hadamard_transform)
 )
 def hadamard_transform_fast_hadamard_transform(
     x: torch.Tensor, scale: float
 ) -> torch.Tensor:
     if x.numel() == 0:
         return x
-    return fast_hadamard_transform.hadamard_transform(x, scale=scale)
+    return fast_hadamard_transform.hadamard_transform(x, scale=scale)  # type: ignore

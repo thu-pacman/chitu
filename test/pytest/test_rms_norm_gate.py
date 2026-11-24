@@ -2,10 +2,10 @@ import torch
 import pytest
 
 from chitu.models.model_hf_qwen3_next import Qwen3NextRMSNormGated
-from chitu.utils import try_import_platform_dep
+
 from chitu.testing import assert_close
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
 
 @pytest.mark.parametrize(
@@ -25,7 +25,7 @@ triton, has_triton = try_import_platform_dep("triton")
 def test_rms_norm_gate(bsz, dim, impl, default_dtype, compute_dtype, weight_dtype):
     import torch.nn.functional as F
 
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     torch.set_default_dtype(default_dtype)
@@ -63,7 +63,7 @@ def test_rms_norm_gate_inplace(
 ):
     import torch.nn.functional as F
 
-    if impl == "triton" and not has_triton:
+    if impl == "triton" and not triton:
         pytest.skip("triton is missing")
 
     torch.set_default_dtype(default_dtype)

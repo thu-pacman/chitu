@@ -14,9 +14,9 @@ from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor, PagedKVCache
 from chitu.ops import append_to_paged_kv_cache
 from chitu.static_tensor import StaticTensor
-from chitu.utils import try_import_opt_dep
 
-flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
+
+from chitu.optdep import flash_attn
 
 
 class DLLMAttnBackend(FlashAttnBackend):
@@ -165,8 +165,8 @@ class DLLMAttnBackend(FlashAttnBackend):
     def decode_bidirectional_simple(self, q, k, v, *, softmax_scale=None):
         if softmax_scale is None:
             softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
-        if has_flash_attn:
-            return flash_attn.flash_attn_func(
+        if flash_attn:
+            return flash_attn.flash_attn_func(  # type: ignore
                 q.transpose(1, 2),
                 k.transpose(1, 2),
                 v.transpose(1, 2),

@@ -71,8 +71,6 @@ from chitu.moe.load_balancer import get_moe_load_planner
 
 from chitu.utils import (
     is_layer,
-    try_import_platform_dep,
-    try_import_opt_dep,
     ceil_div,
     proportion_split,
     prefetch_state_dict,
@@ -98,8 +96,9 @@ from chitu.ops.kv_cache import (
     update_singleton_paged_kv_cache,
 )
 
-triton, has_triton = try_import_platform_dep("triton")
-cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
+from chitu.optdep import triton, cinfer_ascendc
+
+_ = bool(cinfer_ascendc)
 
 
 logger = cast(ChituLogger, getLogger(__name__))
@@ -1025,8 +1024,9 @@ class Transformer(nn.Module):
     def process_state_dict_for_hygon_mixq_index_select(
         self, state_dict: dict[str, Any]
     ):
-        hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
-        if not has_hygon:
+        from chitu.optdep import sugon_mixQ4_kernels as hygon_mixq_kernels
+
+        if not hygon_mixq_kernels:
             return state_dict
 
         TILE = 512

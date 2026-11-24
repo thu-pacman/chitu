@@ -2,17 +2,9 @@ import torch
 import pytest
 
 from chitu.ops import moe_gate
-from chitu.utils import (
-    try_import_opt_dep,
-    try_import_platform_dep,
-    try_import_and_setup_torch_npu,
-)
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
-    "muxi_layout_kernels", "muxi_layout_kernels"
-)
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+from chitu.optdep import chitu_backend, muxi_layout_kernels, torch_npu
 
 
 @pytest.mark.parametrize(
@@ -59,10 +51,10 @@ def test_moe_fused_gate(
     if dtype == torch.float32 and not (impl == "cuda" and score_func == "sqrtsoftplus"):
         pytest.skip("float32 coverage is only needed for CUDA sqrtsoftplus gate")
 
-    if impl == "cuda" and not has_chitu_backend:
+    if impl == "cuda" and not chitu_backend:
         pytest.skip("chitu_backend is not available, skipping CUDA tests")
     if impl == "muxi":
-        if not has_muxi_layout_kernels:
+        if not muxi_layout_kernels:
             pytest.skip("muxi_layout_kernels is not available, skipping Muxi tests")
         if not (
             num_experts == 256
@@ -76,7 +68,7 @@ def test_moe_fused_gate(
                 "Muxi implementation is only supported for specific configurations"
             )
     if impl == "npu_moe_gating_top_k":
-        if not has_torch_npu:
+        if not torch_npu:
             pytest.skip("torch_npu is missing")
         if score_func not in ["softmax", "sigmoid"]:
             pytest.skip("npu_moe_gating_top_k does not support this score_func")
@@ -89,7 +81,7 @@ def test_moe_fused_gate(
                 "npu_moe_gating_top_k only supports num_expert_group == topk_group == topk"
             )
     if impl == "npu_moe_gating_top_k_softmax":
-        if not has_torch_npu:
+        if not torch_npu:
             pytest.skip("torch_npu is missing")
         if score_func != "softmax":
             pytest.skip("npu_moe_gating_top_k_softmax only supports softmax score_func")
@@ -207,7 +199,7 @@ def test_moe_fused_gate(
     [(torch.bfloat16, True, 256, 8), (torch.float32, False, 8, 6)],
 )
 def test_moe_gate_scaled_output_dtypes(dtype, norm_prob, num_experts, topk):
-    if not has_chitu_backend:
+    if not chitu_backend:
         pytest.skip("chitu_backend is not available")
 
     torch.manual_seed(7)

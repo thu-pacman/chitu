@@ -306,7 +306,11 @@ class PDInstanceRequestManager:
         decode_generation: int,
         error_message: str,
     ) -> None:
-        """Fail one request and withdraw an unreachable Decode generation."""
+        """End the failed request without withdrawing its Decode instance.
+
+        The paired Decode stops this request through its deferred KV teardown.
+        A transfer error does not establish that the whole instance is dead.
+        """
         message = (
             f"KV transfer to decode {decode_sid} generation "
             f"{decode_generation} failed: {error_message}"
@@ -315,8 +319,7 @@ class PDInstanceRequestManager:
             self.token_manager.token_sender.send_error(
                 request_id,
                 message,
-                failed_decode_scheduler_id=decode_sid,
-                failed_decode_generation=decode_generation,
+                prefill_failed=True,
             )
         self.stop_request(request_id, force_stop=True, timeout=0.0)
 
@@ -930,8 +933,9 @@ class DecodeOnlyManager(PDInstanceRequestManager):
     """Decode-only Scheduler"""
 
     def _fail_decode_wait_timeout(self, request_id: str) -> None:
-        """Message-loss fallback: PrefillDone timeout. Fail request-level with
-        decode_failed peer notify. Rely on update() for KV metadata finalization."""
+        """Fail the request while preserving its deferred KV teardown."""
+        if request_id in self._deferred_kv_teardown:
+            return
         task = TaskPool.pool.get(request_id)
         if task is not None:
             if self.token_manager is not None:
@@ -940,19 +944,10 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                     "prefill response timeout",
                     decode_failed=True,
                 )
-            # Release prealloc KV budget; mark stopped for update() to finalize metadata.
-            self.pending_decode_requests.pop(request_id, None)
-            if task.status == TaskStatus.PDDecodePrealloc:
-                self._release_decode_prealloc_budget(task)
-            task.set_stopped()
-        # Clean up KV transfer state (_task_infos, _transfer_done_states) that
-        # would normally be cleaned by recv_kv_cache_and_insert on successful
-        # PrefillDone delivery. Without this, every message-loss timeout leaks
-        # one entry in both dicts (slow leak).  Always clean up even when the
-        # task was already evicted from TaskPool — the KV transfer state is
-        # tracked independently and remove_request_all_rank is idempotent.
-        if self.kv_manager is not None:
-            self.kv_manager.remove_request_all_rank(request_id)
+        # stop_request releases the preallocation budget and lets the cache
+        # manager enforce transfer_grace_timeout. Removing transfer state here
+        # would erase the evidence needed to postpone the block release.
+        self.stop_request(request_id, force_stop=True, timeout=0.0)
 
     def __init__(
         self,
@@ -1054,11 +1049,16 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
         self.pending_decode_requests.pop(request_id, None)
         if task.status == TaskStatus.PDDecodeIncoming:
+            self.kv_manager.remove_request(request_id)
             task.set_stopped()
             TaskPool.mark_pending_remove(request_id)
             return True
 
         if task.status == TaskStatus.PDDecodePrealloc:
+            # The control rank may not own the DecodePrepare TaskInfo when DP
+            # assigns this request to another rank. Keep a task-scoped hold so
+            # that case still enters the cache manager's release grace.
+            task.kv_transfer_pending = True
             # waiting for prefill reply
             self._release_decode_prealloc_budget(task)
             start_time = time.time()
@@ -1091,12 +1091,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
         return super().stop_request(request_id, force_stop, timeout)
 
-    def _decode_check_and_promote(self):
-        from chitu.scheduler import KVCacheCapacityStatus
-
-        """Drive Decode status: incoming -> prealloc -> TaskPool."""
-        self.scheduling_ts = time.perf_counter_ns()
-
+    def _reap_deferred_kv_teardown(self) -> None:
+        """Remove transfer metadata after the final KV release removed its task."""
         if self.kv_manager is None:
             return
 
@@ -1126,6 +1122,16 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 # later round retries the same dead peer and pays SNDTIMEO
                 # again, while the request can never be cleaned up.
                 self._deferred_kv_teardown.discard(rid)
+
+    def _decode_check_and_promote(self):
+        from chitu.scheduler import KVCacheCapacityStatus
+
+        """Drive Decode status: incoming -> prealloc -> TaskPool."""
+        self.scheduling_ts = time.perf_counter_ns()
+
+        if self.kv_manager is None:
+            return
+        self._reap_deferred_kv_teardown()
 
         now = time.time()
 
@@ -1168,9 +1174,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             time_since_task_created = info.time_since_task_created(now)
             prefix_len = int(getattr(task, "prefix_tokens_len", 0))
 
-            hit_tokens = Backend.schedulers[target_dp_rank]._num_prefill_cached_tokens(
-                task
-            )
+            scheduler = Backend.schedulers[target_dp_rank]
+            hit_tokens = scheduler._num_prefill_cached_tokens(task)
             required_tokens = max(
                 0, prefix_len + int(self._decode_prealloc_reserved_tokens)
             )
@@ -1187,12 +1192,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             assert (
                 not task.new_cache_ids
             ), f"task.new_cache_ids should be empty before prealloc"
-            (
-                capacity_status,
-                num_cached_tokens,
-                hit_block_counts,
-            ) = Backend.schedulers[target_dp_rank]._prepare_pd_decode_kvcache(
-                rid, required_tokens
+            capacity_status, hit_block_counts = scheduler._prepare_pd_decode_kvcache(
+                task, required_tokens, hit_tokens
             )
 
             if capacity_status == KVCacheCapacityStatus.EXCEEDS_CAPACITY:
@@ -1217,7 +1218,6 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 cache_manager_hit_block_counts=hit_block_counts,
             )
             info.last_prepare_ts = now
-            prealloc_charge_tokens = max(0, required_tokens - num_cached_tokens)
             info.prealloc_tokens = prealloc_charge_tokens
 
             task.status = TaskStatus.PDDecodePrealloc

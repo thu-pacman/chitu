@@ -20,9 +20,9 @@ from chitu.kv_cache.registry import (
     kv_cache_quant_type_for_key,
 )
 from chitu.models.model_deepseek_v3 import AttentionDeepSeekV3
-from chitu.utils import try_import_opt_dep
 
-flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
+
+from chitu.optdep import flash_mla
 
 
 @pytest.mark.skipif(
@@ -94,9 +94,7 @@ def test_only_e5m2_one_token_prefill_uses_reconstruct_path(
     reason="requires a Hygon accelerator",
 )
 def test_dense_e5m2_decode_dispatch_runs_flashmla():
-    if not has_flash_mla or not hasattr(
-        flash_mla, "flash_mla_with_kvcache_fp8_e5m2_dense"
-    ):
+    if not flash_mla or not hasattr(flash_mla, "flash_mla_with_kvcache_fp8_e5m2_dense"):
         pytest.skip("FlashMLA E5M2 API is unavailable")
 
     set_global_args(

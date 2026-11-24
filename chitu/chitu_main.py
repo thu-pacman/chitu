@@ -50,7 +50,6 @@ from chitu.utils import (
     cap_max_new_tokens_for_instance,
     gen_req_id,
     max_alloc_seq_len,
-    try_import_and_setup_torch_npu,
     ceil_div,
     get_chitu_bool_env,
     should_pretty_log,
@@ -99,7 +98,7 @@ from chitu.kv_cache.utils import (
 )
 from chitu.dsa_indexer_backend import DSAIndexer
 
-try_import_and_setup_torch_npu()
+from chitu.optdep import torch_npu  # noqa: F401
 
 
 logger = getLogger(__name__)
@@ -1844,6 +1843,10 @@ def chitu_run_main_rank():
         dp_local_removed_task_ids = Backend.schedulers[i].update(task_ids_per_dp[i])
         removed_task_ids += dp_local_removed_task_ids
     Backend.executor.end_task_step(removed_task_ids)
+    if Backend.args.multi_inst.role == "decode":
+        # Reap after the final task is removed: an idle service may not run
+        # another scheduling step to finish its deferred transfer cleanup.
+        get_pd_scheduler_instance()._reap_deferred_kv_teardown()
     return backend_payload_type
 
 

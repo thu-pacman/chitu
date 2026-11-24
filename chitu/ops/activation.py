@@ -7,11 +7,7 @@ from logging import getLogger
 
 import torch
 
-from chitu.utils import (
-    try_import_platform_dep,
-    try_import_opt_dep,
-    try_import_and_setup_torch_npu,
-)
+
 from chitu.native_layout import Vector, MuxiNativeLayoutActivation
 from chitu.device_type import is_muxi, has_accelerator
 from chitu.cpuinfer_singleton import get_cpu_infer
@@ -20,10 +16,9 @@ from chitu.global_vars import get_global_args
 from chitu.lazy import make_lazy_op
 from chitu.ops.utils import make_op_dispatcher
 
-triton, has_triton = try_import_platform_dep("triton")
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-has_triton_impl = has_triton and has_accelerator()
+from chitu.optdep import triton, cpuinfer, torch_npu
+
+has_triton_impl = bool(triton) and has_accelerator()
 if has_triton_impl:
     from chitu.ops.triton_ops import (
         silu_and_mul_triton,
@@ -158,7 +153,7 @@ def _auto_silu_and_mul(
         return "triton" if has_triton_impl else "torch"
     if isinstance(x, MuxiNativeLayoutActivation):
         return "torch"
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     if (
         is_muxi()
@@ -199,7 +194,7 @@ def _silu_and_mul_triton(
     )
 
 
-@silu_and_mul.register("torch_npu", available=has_torch_npu)
+@silu_and_mul.register("torch_npu", available=bool(torch_npu))
 def _silu_and_mul_npu(
     x,
     expert_n_tokens=None,
@@ -226,7 +221,7 @@ def _silu_and_mul_npu(
     return torch_npu.npu_swiglu(x)
 
 
-@silu_and_mul.register("cpu", available=has_cpuinfer)
+@silu_and_mul.register("cpu", available=bool(cpuinfer))
 def _silu_and_mul_cpu_handler(
     x,
     expert_n_tokens=None,

@@ -15,7 +15,7 @@ from .hygon_backend import (
     HYGON_INDEXER_MAX_MTP_SIZE,
     support_indexer_hygon,
     has_hygon_compact_mqa_logits,
-    has_hygon_deepgemm,
+    hygon_deepgemm,
     _has_hygon_compact_mqa_logits,
     _validate_hygon_indexer_config,
 )

@@ -377,24 +377,9 @@ class TokenRouter:
             # so the paired peer is notified and does not wait/leak.
             request_router = get_request_router(check_exist=False)
             if request_router is not None:
-                failed_decode_scheduler_id = token_data.get(
-                    "failed_decode_scheduler_id"
-                )
-                if failed_decode_scheduler_id is not None:
-                    try:
-                        # Stop Decode instance
-                        await request_router.handle_decode_inst_failed(
-                            int(failed_decode_scheduler_id),
-                            int(token_data["failed_decode_generation"]),
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Token Router: failed to withdraw Decode instance "
-                            "for request %s",
-                            request_id,
-                        )
-                    handler = None
-                elif token_data.get("prefill_failed"):
+                # Legacy transfer errors name the Decode slot and generation.
+                # Only the independent stats channel establishes worker death.
+                if token_data.get("prefill_failed"):
                     handler = request_router.handle_prefill_failed
                 elif token_data.get("decode_failed"):
                     # request level error that don't require stopping decode instance

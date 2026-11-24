@@ -8,11 +8,7 @@ import torch
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.device_type import has_accelerator, is_enflame
-from chitu.utils import (
-    try_import_platform_dep,
-    try_import_and_setup_torch_npu,
-    try_import_opt_dep,
-)
+
 from chitu.global_vars import get_global_args
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
@@ -23,11 +19,9 @@ from chitu.native_layout import (
     PartialColumnOddEvenSeparatedTensor,
 )
 
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
-triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-has_triton_impl = has_triton and has_accelerator()
+from chitu.optdep import cpuinfer, triton, torch_npu, chitu_backend
+
+has_triton_impl = bool(triton) and has_accelerator()
 
 
 def _triton_rope_supported(rotary_type: str) -> bool:
@@ -91,9 +85,9 @@ def _auto_apply_rotary_pos_emb(
     k_out: Optional[torch.Tensor | NativeLayoutTensor] = None,
     rotary_type: str = "separated",
 ):
-    if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
+    if cpuinfer and get_global_args().infer.op_impl == "cpu":
         return "cpu"
-    if has_torch_npu:
+    if torch_npu:
         if (
             rotary_type == "interleaved"
             and q.shape[-1] == 64
@@ -116,7 +110,7 @@ def _auto_apply_rotary_pos_emb(
         )
     ):
         return "triton"
-    if has_chitu_backend:
+    if chitu_backend:
         return "cuda"
     return "torch"
 
@@ -170,7 +164,7 @@ if has_triton_impl:
     apply_rotary_pos_emb_single.register("triton")(apply_rotary_pos_emb_single_triton)
 
 
-@_dispatch_apply_rotary_pos_emb.register("cuda", available=has_chitu_backend)
+@_dispatch_apply_rotary_pos_emb.register("cuda", available=bool(chitu_backend))
 def apply_rotary_pos_emb_cuda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -226,7 +220,7 @@ def apply_rotary_pos_emb_cuda(
     return q_out.view(q_shape), k_out.view(k_shape)
 
 
-@_dispatch_apply_rotary_pos_emb.register("torch_npu", available=has_torch_npu)
+@_dispatch_apply_rotary_pos_emb.register("torch_npu", available=bool(torch_npu))
 def apply_rotary_pos_emb_torch_npu(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -295,7 +289,7 @@ def apply_rotary_pos_emb_torch_npu(
 
 
 @_dispatch_apply_rotary_pos_emb.register(
-    "torch_npu_with_output_layout", available=has_torch_npu
+    "torch_npu_with_output_layout", available=bool(torch_npu)
 )
 def apply_rotary_pos_emb_torch_npu_with_output_layout(
     q: torch.Tensor,
@@ -361,7 +355,7 @@ def apply_rotary_pos_emb_torch_npu_with_output_layout(
     return q_out, k_out
 
 
-@_dispatch_apply_rotary_pos_emb.register("cpu", available=has_cpuinfer)
+@_dispatch_apply_rotary_pos_emb.register("cpu", available=bool(cpuinfer))
 def apply_rotary_pos_emb_cpu(
     q: torch.Tensor,
     k: torch.Tensor,

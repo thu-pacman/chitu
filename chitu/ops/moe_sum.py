@@ -8,11 +8,10 @@ import torch
 from chitu.lazy import eval_lazy, make_lazy_op
 from chitu.device_type import has_accelerator, is_enflame
 from chitu.ops.utils import compatible_with_inplace, make_op_dispatcher
-from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 
-triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-has_triton_impl = has_triton and has_accelerator()
+from chitu.optdep import triton, torch_npu
+
+has_triton_impl = bool(triton) and has_accelerator()
 
 if has_triton_impl:
     from chitu.ops.triton_ops import (
@@ -278,7 +277,7 @@ def moe_sum_expert_concat_permuted(
 
 @moe_sum_expert_concat_permuted.register_auto
 def _auto_moe_sum_expert_concat_permuted():
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     return "torch"
 

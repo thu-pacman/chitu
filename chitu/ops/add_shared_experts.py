@@ -4,10 +4,10 @@
 
 import torch
 
-from chitu.import_utils import try_import_platform_dep
+
 from chitu.ops.utils import make_op_dispatcher
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+from chitu.optdep import chitu_backend
 
 
 @make_op_dispatcher
@@ -30,7 +30,7 @@ def add_shared_experts(
 
 @add_shared_experts.register_auto
 def _auto_add_shared_experts():
-    if has_chitu_backend:
+    if chitu_backend:
         return "cuda"
     return "torch"
 
@@ -63,7 +63,7 @@ def add_shared_experts_torch(
     return new_weights, new_indices
 
 
-@add_shared_experts.register("cuda", available=has_chitu_backend)
+@add_shared_experts.register("cuda", available=bool(chitu_backend))
 def _add_shared_experts_cuda(
     weights: torch.Tensor,
     indices: torch.Tensor,

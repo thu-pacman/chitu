@@ -21,15 +21,13 @@ import re
 
 from chitu.boot.arg_utils import apply_multi_inst_override, resolve_default_args
 from chitu.device_type import has_native_fp8
-from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
+
 from chitu.schemas.serve_config import ServeConfig, StaticConfig
 from chitu.schemas.utils import ModelConfigResolver
 
 logger = getLogger(__name__)
 
-triton, has_triton = try_import_platform_dep("triton")
-numa, has_numa = try_import_opt_dep("numa", "cpu")
-deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
+from chitu.optdep import triton, numa, deep_ep
 
 _RAW_GLOBAL_ARGS: Optional[ServeConfig] = None
 _GLOBAL_ARGS = None
@@ -271,7 +269,7 @@ def resolve_full_default_args(args):
     )
 
     if args.infer.bind_process_to_cpu != "none":
-        if not has_numa:
+        if not numa:
             logger.warning(
                 "Optional dependency '[numa]' is mising. Disabling NUMA binding."
             )
@@ -299,7 +297,7 @@ def resolve_full_default_args(args):
         elif (
             args.infer.ep_size > 1
             and args.infer.dp_size > 1
-            and (args.infer.tp_size > 1 or not has_deep_ep)
+            and (args.infer.tp_size > 1 or not deep_ep)
         ):
             args.infer.use_cuda_graph = False
         elif args.infer.attn_type == "ref":
@@ -330,7 +328,7 @@ def resolve_full_default_args(args):
                 if support_indexer_deepgemm and args.infer.cache_type == "paged":
                     # DeepGEMMIndexer expands query rows for mtp_size > 2.
                     args.infer.indexer_type = "deepgemm"
-                elif has_native_fp8() and has_triton:
+                elif has_native_fp8() and triton:
                     args.infer.indexer_type = "triton"
                 else:
                     args.infer.indexer_type = "torch"

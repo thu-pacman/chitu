@@ -5,19 +5,19 @@
 from typing import Optional
 from typing_extensions import override
 import math
+from logging import getLogger
 
 import torch
 
 from chitu.attn_backend.ref_attn_backend import RefAttnBackend
+from chitu.attn_backend.triton_attn_backend import TritonAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.device_type import is_enflame, is_muxi
-from chitu.utils import try_import_opt_dep
 
-flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
-flash_attn3, has_flash_attn3 = try_import_opt_dep(
-    "flash_attn_interface", "flash_attn_interface"
-)
+from chitu.optdep import flash_attn, flash_attn_interface as flash_attn3
+
+logger = getLogger(__name__)
 
 try:
     from flash_attn.vllm_flash_attn import flash_attn_varlen_func as _fa_varlen
@@ -44,10 +44,10 @@ class FlashAttnBackend(RefAttnBackend):
         # flash_attn_with_kvcache (the new token's KV is neither written into
         # the cache nor attended), which corrupts every decode-with-append
         # path. MACA's FA2 build implements append correctly, so pin to FA2.
-        if has_flash_attn3 and not is_muxi() and not is_enflame():
+        if flash_attn3 and not is_muxi() and not is_enflame():
             self._fa = flash_attn3
             self._use_fa3 = True
-        elif has_flash_attn:
+        elif flash_attn:
             self._fa = flash_attn
         else:
             raise ImportError(
@@ -56,6 +56,7 @@ class FlashAttnBackend(RefAttnBackend):
             )
 
         self.mtp_size = getattr(self.args.infer, "mtp_size", 1)
+        self._latent_decode_backend = None
 
     @override
     def decode_op_supports_mtp(self) -> bool:
@@ -101,7 +102,7 @@ class FlashAttnBackend(RefAttnBackend):
             # path. Keep the Ref implementation for attention features it
             # does not expose instead of silently dropping them.
             unsupported = (
-                not has_flash_attn
+                not flash_attn
                 or sinks is not None
                 or topk_indices is not None
                 or (window_size is not None and tuple(window_size) != (-1, -1))
@@ -620,6 +621,34 @@ class FlashAttnBackend(RefAttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
         topk_page_table: Optional[torch.Tensor] = None,
     ):
+        # FlashAttention cannot consume the 576-wide latent MQA layout used by
+        # absorb-kv-only decode. Keep the latent cache and delegate decode to
+        # the Triton MLA kernel; prefill still uses FlashAttention over full K/V.
+        if (
+            getattr(self.args.infer, "mla_absorb", "none") == "absorb-kv-only"
+            and q_nope.shape[-1] == self.args.models.kv_lora_rank
+        ):
+            if self._latent_decode_backend is None:
+                logger.info(
+                    "mla_absorb=absorb-kv-only: decode query width %d matches "
+                    "kv_lora_rank %d; FlashAttention cannot consume the latent "
+                    "MQA layout, falling back to TritonAttnBackend",
+                    q_nope.shape[-1],
+                    self.args.models.kv_lora_rank,
+                )
+                self._latent_decode_backend = TritonAttnBackend(
+                    qk_nope_head_dim=self.qk_nope_head_dim
+                )
+            return self._latent_decode_backend.mla_decode_paged_kv(
+                q_nope,
+                q_pe,
+                kv_cache,
+                kv,
+                seq_len_delta=seq_len_delta,
+                softmax_scale=softmax_scale,
+                topk_indices=topk_indices,
+                topk_page_table=topk_page_table,
+            )
         if topk_page_table is not None:
             raise NotImplementedError()
         if not self._use_fa3:

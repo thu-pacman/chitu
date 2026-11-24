@@ -221,7 +221,7 @@ class DPTokenSender:
         forwards ``pd_decode_fail`` to the paired Prefill so it stops waiting for a
         DecodeAllocated that will never come.
         ``failed_decode_scheduler_id`` identifies a Decode generation that rejected
-        an RDMA transfer; the Router removes that generation from routing.
+        an RDMA transfer on legacy frames. It is diagnostic context only.
         """
         # Clean up caches for this request
         self._remove_request(request_id)

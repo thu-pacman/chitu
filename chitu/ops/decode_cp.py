@@ -5,11 +5,11 @@
 import torch
 
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep
 
-triton, has_triton = try_import_platform_dep("triton")
 
-if has_triton:
+from chitu.optdep import triton
+
+if triton:
     from chitu.ops.triton_ops import merge_dcp_attention_partials_triton
     from chitu.ops.triton_ops.decode_cp import (
         compact_dcp_indices_triton,
@@ -36,7 +36,7 @@ def unpack_dcp_q(
 
 @unpack_dcp_q.register_auto
 def _auto_unpack_dcp_q(gathered, nope_width):
-    return "triton" if gathered.is_cuda and has_triton else "torch"
+    return "triton" if gathered.is_cuda and triton else "torch"
 
 
 @unpack_dcp_q.register("torch")
@@ -48,7 +48,7 @@ def unpack_dcp_q_torch(gathered, nope_width):
 
 
 unpack_dcp_q.register_candidate("triton")
-if has_triton:
+if triton:
     unpack_dcp_q.register("triton")(unpack_dcp_q_triton)
 
 
@@ -71,7 +71,7 @@ def pack_dcp_partials(
 
 @pack_dcp_partials.register_auto
 def _auto_pack_dcp_partials(partial_o, partial_lse, group_size):
-    return "triton" if partial_o.is_cuda and has_triton else "torch"
+    return "triton" if partial_o.is_cuda and triton else "torch"
 
 
 @pack_dcp_partials.register("torch")
@@ -89,7 +89,7 @@ def pack_dcp_partials_torch(partial_o, partial_lse, group_size):
 
 
 pack_dcp_partials.register_candidate("triton")
-if has_triton:
+if triton:
     pack_dcp_partials.register("triton")(pack_dcp_partials_triton)
 
 
@@ -113,7 +113,7 @@ def build_dcp_local_metadata(
 
 @build_dcp_local_metadata.register_auto
 def _auto_build_dcp_local_metadata(scores, *args, **kwargs):
-    return "triton" if scores.is_cuda and has_triton else "torch"
+    return "triton" if scores.is_cuda and triton else "torch"
 
 
 @build_dcp_local_metadata.register("torch")
@@ -133,7 +133,7 @@ def build_dcp_local_metadata_torch(
 
 
 build_dcp_local_metadata.register_candidate("triton")
-if has_triton:
+if triton:
     build_dcp_local_metadata.register("triton")(build_dcp_local_metadata_triton)
 
 
@@ -155,7 +155,7 @@ def dcp_global_topk(
 
 @dcp_global_topk.register_auto
 def _auto_dcp_global_topk(gathered_metadata, k):
-    return "triton" if gathered_metadata.is_cuda and has_triton else "torch"
+    return "triton" if gathered_metadata.is_cuda and triton else "torch"
 
 
 @dcp_global_topk.register("torch")
@@ -177,7 +177,7 @@ def dcp_global_topk_torch(gathered_metadata, k):
 
 
 dcp_global_topk.register_candidate("triton")
-if has_triton:
+if triton:
     dcp_global_topk.register("triton")(dcp_global_topk_triton)
 
 
@@ -203,7 +203,7 @@ def compact_dcp_indices(
 
 @compact_dcp_indices.register_auto
 def _auto_compact_dcp_indices(global_ids, *args, **kwargs):
-    return "triton" if global_ids.is_cuda and has_triton else "torch"
+    return "triton" if global_ids.is_cuda and triton else "torch"
 
 
 @compact_dcp_indices.register("torch")
@@ -258,7 +258,7 @@ def compact_dcp_indices_torch(
 
 
 compact_dcp_indices.register_candidate("triton")
-if has_triton:
+if triton:
     compact_dcp_indices.register("triton")(compact_dcp_indices_triton)
 
 
@@ -281,7 +281,7 @@ def merge_dcp_attention_partials(
 def _auto_merge_dcp_attention_partials(
     owner_wire: torch.Tensor,
 ):
-    return "triton" if owner_wire.is_cuda and has_triton else "torch"
+    return "triton" if owner_wire.is_cuda and triton else "torch"
 
 
 @merge_dcp_attention_partials.register("torch")
@@ -324,5 +324,5 @@ def merge_dcp_attention_partials_torch(
 
 
 merge_dcp_attention_partials.register_candidate("triton")
-if has_triton:
+if triton:
     merge_dcp_attention_partials.register("triton")(merge_dcp_attention_partials_triton)

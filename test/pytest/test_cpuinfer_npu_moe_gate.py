@@ -1,12 +1,11 @@
 import torch
 import pytest
 
-from chitu.utils import try_import_platform_dep, try_import_opt_dep
+
 from chitu.ops.moe_gate import moe_gate
 from chitu.testing import assert_close
 
-triton, has_triton = try_import_platform_dep("triton")
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+from chitu.optdep import triton, cpuinfer
 
 
 def cpuinfer_moe_gate(qlen, scores, correction_bias, CPUInfer, cpu_moe_gate, topk):
@@ -27,7 +26,7 @@ def cpuinfer_moe_gate(qlen, scores, correction_bias, CPUInfer, cpu_moe_gate, top
     return indices, weights
 
 
-@pytest.mark.skipif(not has_cpuinfer, reason="cpuinfer module not available")
+@pytest.mark.skipif(not cpuinfer, reason="cpuinfer module not available")
 @pytest.mark.parametrize("num_experts", [8, 16])
 @pytest.mark.parametrize("num_expert_groups", [1, 2])
 @pytest.mark.parametrize("topk_group", [1])

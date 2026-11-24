@@ -783,7 +783,7 @@ def test_deepgemm_decode_metadata_reuses_its_static_buffer(monkeypatch):
 
 @pytest.fixture
 def triton_prefill_indexer(monkeypatch, global_args):
-    if not triton_backend.has_triton:
+    if not triton_backend.triton:
         pytest.skip("requires the Triton BF16 backend")
     monkeypatch.setitem(global_args.models, "index_topk", 2)
     monkeypatch.setitem(global_args.infer, "cache_type", "paged")
@@ -909,7 +909,7 @@ def test_triton_prefill_length_update_invalidates_all_chunk_schedules(
 
 
 @pytest.mark.skipif(
-    not (torch.cuda.is_available() and triton_backend.has_triton),
+    not (torch.cuda.is_available() and triton_backend.triton),
     reason="requires a CUDA/HIP GPU and Triton",
 )
 @pytest.mark.parametrize(
@@ -1146,7 +1146,7 @@ def test_paged_score_reference():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not triton_backend.has_triton,
+    not torch.cuda.is_available() or not triton_backend.triton,
     reason="requires an accelerator and Triton",
 )
 @pytest.mark.parametrize("queries", [1, 3])

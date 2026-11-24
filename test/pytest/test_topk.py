@@ -1,10 +1,9 @@
 import pytest
 import torch
 
-from chitu.utils import try_import_platform_dep
 from chitu.ops import topk_indices, topk_page_table_decode_cuda
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+from chitu.optdep import chitu_backend
 
 
 def build_unique_topk_page_table_scores(bs, dim, dtype):
@@ -35,7 +34,7 @@ def test_topk_indices(
     bs, dim, k, with_lengths, dtype, out_dtype, impl, record_benchmark
 ):
     if impl == "cuda":
-        if not has_chitu_backend:
+        if not chitu_backend:
             pytest.skip("chitu_backend is not available, skipping impl=cuda tests")
         if k != dim and k != 2048:
             pytest.skip("impl=cuda only supports k=dim or k=2048")
@@ -97,7 +96,7 @@ def test_topk_indices(
 @pytest.mark.parametrize("dim", [3072, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_topk_page_table_decode_cuda(bs, dim, dtype):
-    if not has_chitu_backend:
+    if not chitu_backend:
         pytest.skip("chitu_backend is not available, skipping cuda transform test")
 
     score = build_unique_topk_page_table_scores(bs, dim, dtype)
@@ -133,7 +132,7 @@ def test_topk_page_table_decode_cuda(bs, dim, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_cuda_topk_ties_with_row_starts_and_short_lengths(dtype):
-    if not has_chitu_backend or not torch.cuda.is_available():
+    if not chitu_backend or not torch.cuda.is_available():
         pytest.skip("CUDA and chitu_backend are required")
 
     starts = [0, 17, 5]
@@ -162,7 +161,7 @@ def test_cuda_topk_ties_with_row_starts_and_short_lengths(dtype):
 
 @pytest.mark.parametrize("transform", ["page_table", "ragged"])
 def test_cuda_topk_transform_ties_and_padding(transform):
-    if not has_chitu_backend or not torch.cuda.is_available():
+    if not chitu_backend or not torch.cuda.is_available():
         pytest.skip("CUDA and chitu_backend are required")
 
     width = 8192

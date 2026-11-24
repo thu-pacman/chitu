@@ -10,11 +10,11 @@ from chitu.ops import (
     moe_sum_expert_concat_permuted,
     batched_routed_activation_indexed_to_per_expert_dense,
 )
-from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
+
 from chitu.testing import assert_close, gen_token_to_expert_indices, AssertOpCalled
 
-triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+from chitu.optdep import triton, torch_npu, chitu_backend
+
 
 _I32_MAX = 2**31 - 1
 
@@ -32,7 +32,7 @@ _MOE_SUM_PER_TOKEN_CASES = [
 @pytest.mark.parametrize(
     "M, topk, N, compute_dtype, expect_i64_offset", _MOE_SUM_PER_TOKEN_CASES
 )
-@pytest.mark.skipif(not has_triton, reason="triton is not available")
+@pytest.mark.skipif(not triton, reason="triton is not available")
 def test_moe_sum_per_token(
     M, topk, N, compute_dtype, expect_i64_offset, record_benchmark
 ):
@@ -81,12 +81,12 @@ def test_moe_sum_per_token(
 @pytest.mark.parametrize("M", [0, 32])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("N", [256])
-@pytest.mark.parametrize("compute_dtype", [torch.float16])
-@pytest.mark.skipif(not has_triton, reason="triton is not available")
-def test_moe_sum_per_token_add_shared_fusion(op, M, topk, N, compute_dtype):
-    input_tensor = torch.rand(M, topk, N, device="cuda", dtype=compute_dtype)
-    topk_weights = torch.rand(M, topk, device="cuda", dtype=compute_dtype)
-    shared_y = torch.rand(M, N, device="cuda", dtype=compute_dtype)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(not triton, reason="triton is not available")
+def test_moe_sum_per_token_add_shared_fusion(op, M, topk, N, dtype):
+    input_tensor = torch.rand(M, topk, N, device="cuda", dtype=dtype)
+    topk_weights = torch.rand(M, topk, device="cuda", dtype=dtype)
+    shared_y = torch.rand(M, N, device="cuda", dtype=dtype)
 
     ref_output = torch.add(
         eval_lazy(moe_sum_per_token(input_tensor, topk_weights, impl="torch")),
@@ -119,7 +119,7 @@ def test_moe_sum_per_token_add_shared_fusion(op, M, topk, N, compute_dtype):
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("invalid_rate", [0, 0.3])
 @pytest.mark.parametrize("compute_dtype", [torch.float16])
-@pytest.mark.skipif(not has_triton, reason="triton is not available")
+@pytest.mark.skipif(not triton, reason="triton is not available")
 def test_moe_sum_expert_block_permuted(
     M, topk, N, n_blocks, block_size, invalid_rate, compute_dtype, record_benchmark
 ):
@@ -174,7 +174,7 @@ def test_moe_sum_expert_block_permuted(
 @pytest.mark.parametrize("N", [256])
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
 @pytest.mark.parametrize("compute_dtype", [torch.float16])
-@pytest.mark.skipif(not has_triton, reason="triton is not available")
+@pytest.mark.skipif(not triton, reason="triton is not available")
 def test_moe_sum_per_expert_dense(
     E, M, topk, N, distribution, compute_dtype, record_benchmark
 ):
@@ -225,7 +225,7 @@ def test_moe_sum_per_expert_dense(
 @pytest.mark.parametrize("N", [256, 512, 1024])
 @pytest.mark.parametrize("invalid_rate", [0, 0.3])
 @pytest.mark.parametrize("compute_dtype", [torch.float16])
-@pytest.mark.skipif(not has_torch_npu, reason="torch_npu is not available")
+@pytest.mark.skipif(not torch_npu, reason="torch_npu is not available")
 def test_moe_sum_expert_concat_permuted(
     M, topk, N, invalid_rate, compute_dtype, record_benchmark
 ):

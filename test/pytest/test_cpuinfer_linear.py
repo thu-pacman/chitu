@@ -1,11 +1,10 @@
 import torch
 import pytest
 
-from chitu.utils import try_import_platform_dep, try_import_opt_dep
+
 from chitu.testing import assert_close
 
-triton, has_triton = try_import_platform_dep("triton")
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+from chitu.optdep import triton, cpuinfer
 
 
 def torch_linear(input_tensor, weight):
@@ -22,7 +21,7 @@ def cpuinfer_linear(input_tensor, weight, output_tensor, CPUInfer, linear):
     return output_tensor
 
 
-@pytest.mark.skipif(not has_cpuinfer, reason="cpuinfer module not available")
+@pytest.mark.skipif(not cpuinfer, reason="cpuinfer module not available")
 @pytest.mark.parametrize("input_size", [1024, 5120])
 @pytest.mark.parametrize("output_size", [4096, 25600])
 @pytest.mark.parametrize("qlen", [1, 8])

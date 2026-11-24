@@ -32,6 +32,8 @@ __all__ = [
     "contiguous_interval",
     "contiguous_rank_of_position",
     "contiguous_rank_indices",
+    "zigzag_rank_indices",
+    "build_zigzag_route",
     "build_layout_route",
     "build_reshuffle_route",
     "all_to_all_reshape",
@@ -213,6 +215,23 @@ def contiguous_rank_indices(
     return torch.arange(start, end, dtype=torch.long)
 
 
+def zigzag_rank_indices(rank: int, world_size: int, total_tokens: int) -> torch.Tensor:
+    """Global token indices owned by one 2-chunk zigzag CP rank.
+
+    The sequence is split into ``2 * world_size`` contiguous blocks. Rank ``r``
+    owns block ``r`` and its mirror block ``2 * world_size - 1 - r``.
+    """
+    n_blocks = 2 * world_size
+    first = contiguous_interval(rank, n_blocks, total_tokens)
+    second = contiguous_interval(n_blocks - 1 - rank, n_blocks, total_tokens)
+    return torch.cat(
+        [
+            torch.arange(first[0], first[1], dtype=torch.long),
+            torch.arange(second[0], second[1], dtype=torch.long),
+        ]
+    )
+
+
 def build_reshuffle_route(
     src_positions_by_rank: Sequence[torch.Tensor],
     dst_positions_by_rank: Sequence[torch.Tensor],
@@ -318,6 +337,23 @@ def build_layout_route(
     return src, dst, send_index, recv_index, send_counts, recv_counts
 
 
+def build_zigzag_route(
+    world_size: int, total_tokens: int, *, to_zigzag: bool = True
+) -> tuple[
+    List[torch.Tensor],
+    List[torch.Tensor],
+    List[List[int]],
+    List[List[int]],
+]:
+    """Build the contiguous <-> 2-chunk-zigzag all-to-all route."""
+    cont = [
+        contiguous_rank_indices(r, world_size, total_tokens) for r in range(world_size)
+    ]
+    zig = [zigzag_rank_indices(r, world_size, total_tokens) for r in range(world_size)]
+    src, dst = (cont, zig) if to_zigzag else (zig, cont)
+    return build_reshuffle_route(src, dst, total_tokens)
+
+
 def all_to_all_reshape(
     x: torch.Tensor,
     rank: int,
@@ -369,6 +405,7 @@ def segment_affine_transition(
     *,
     use_qk_l2norm_in_kernel: bool,
     impl: str = "auto",
+    state_v_first: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute each local sequence's affine transition ``S_out = M @ S_in + S_ext``.
 
@@ -379,13 +416,68 @@ def segment_affine_transition(
 
     Returns:
         ``(M, S_ext)`` with shapes ``[N, H, K, K]`` and ``[N, H, K, V]`` in fp32.
+        For V-first state, ``S_ext`` has shape ``[N, H, V, K]``.
+
+    BoltOps uses V-first states and does not transpose them automatically. In
+    that layout the affine map is ``S_out = S_in @ M^T + S_ext``; ``M`` and
+    ``S_ext`` are obtained with two calls (identity state with zero value, then
+    zero state with the real value). K-first keeps the single augmented call.
     """
     n_seqs = len(seq_len_list)
     n_heads = key.shape[-2]
     k_dim = key.shape[-1]
     v_dim = value.shape[-1]
 
-    # Augment v to [0 | v]; only the trailing V columns carry external input.
+    if state_v_first:
+        if v_dim != k_dim:
+            raise ValueError(
+                "V-first affine extraction requires v_dim == k_dim, got "
+                f"{v_dim} != {k_dim}"
+            )
+        identity = torch.eye(k_dim, dtype=torch.float32, device=query.device)
+        identity = (
+            identity.view(1, 1, k_dim, k_dim)
+            .expand(n_seqs, n_heads, k_dim, k_dim)
+            .contiguous()
+        )
+        zero_value = torch.zeros_like(value)
+        _, m = chunk_op(
+            query,
+            key,
+            zero_value,
+            g=g,
+            beta=beta,
+            initial_state=identity,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            seq_len_list=list(seq_len_list),
+            impl=impl,
+        )
+        zero_state = torch.zeros(
+            (n_seqs, n_heads, v_dim, k_dim),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        _, s_ext = chunk_op(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=zero_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            seq_len_list=list(seq_len_list),
+            impl=impl,
+        )
+        # The identity-state call returns M^T in the V-first layout. Expose M
+        # consistently with the K-first branch; merge applies the transpose.
+        return m.transpose(-1, -2).to(torch.float32), s_ext.to(torch.float32)
+
+    # K-first: augment v to [0 | v]; only the trailing V columns carry external
+    # input.
     zero_cols = value.new_zeros((*value.shape[:-1], k_dim))
     value_aug = torch.cat([zero_cols, value], dim=-1)
 
@@ -418,6 +510,8 @@ def merge_prefix_states(
     m_by_slot: torch.Tensor,
     ext_by_slot: torch.Tensor,
     initial_state: torch.Tensor,
+    *,
+    state_v_first: bool = False,
 ) -> torch.Tensor:
     """Merge ordered segment transitions into ``initial_state``.
 
@@ -432,5 +526,8 @@ def merge_prefix_states(
         raise ValueError("m_by_slot and ext_by_slot must have the same slot count")
     s = initial_state.to(torch.float32)
     for j in range(m_by_slot.shape[0]):
-        s = torch.matmul(m_by_slot[j], s) + ext_by_slot[j]
+        if state_v_first:
+            s = torch.matmul(s, m_by_slot[j].transpose(-1, -2)) + ext_by_slot[j]
+        else:
+            s = torch.matmul(m_by_slot[j], s) + ext_by_slot[j]
     return s

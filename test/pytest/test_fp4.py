@@ -15,10 +15,10 @@ from chitu.ops import (
     blockfp4_weight_dequant,
 )
 from chitu.device_type import has_native_fp8, is_hopper
-from chitu.utils import try_import_platform_dep
+
 from chitu.testing import assert_close
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
 
 def init_weight_and_scales(dim, block_size):
@@ -59,7 +59,7 @@ def do_dequant_a(a_fp8, a_s, dim, act_block_size):
     reason="This test requires the GPU to have native FP8 support",
 )
 @pytest.mark.skipif(
-    not has_triton
+    not triton
     or packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"),
     reason="This test requires Triton version >= 3.2.0",
 )
@@ -99,7 +99,7 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm(dim, record_benchmark
     reason="This test requires the GPU to be Hopper or newer",
 )
 @pytest.mark.skipif(
-    not has_triton
+    not triton
     or packaging.version.parse(triton.__version__) < packaging.version.parse("3.2.0"),
     reason="This test requires Triton version >= 3.2.0",
 )

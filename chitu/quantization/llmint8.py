@@ -6,9 +6,9 @@ import torch
 
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
-from chitu.utils import try_import_opt_dep
 
-bnb, has_bnb = try_import_opt_dep("bitsandbytes", "quant")
+
+from chitu.optdep import bitsandbytes as bnb
 
 
 @QuantizationRegistry.register_linear("llmint8")
@@ -58,9 +58,9 @@ class LLMInt8Linear(QuantizedLinearBase):
         if self.bias is not None and self.bias.dtype != x.dtype:
             self.bias.data = self.bias.data.to(x.dtype)
 
-        out = bnb.matmul(x, self.weight, bias=self.bias, state=self.state)
+        out = bnb.matmul(x, self.weight, bias=self.bias, state=self.state)  # type: ignore
 
         if not self.state.has_fp16_weights and self.state.CB is not None:
             self.weight.data = self.state.CB
 
-        return out
+        return out  # type: ignore

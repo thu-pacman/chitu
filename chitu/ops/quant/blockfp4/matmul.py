@@ -10,18 +10,11 @@ from chitu.native_layout import Packed4BitWeightAlongK, Packed4BitWeightNPUNativ
 from chitu.global_vars import get_global_args
 from chitu.ops.utils import make_op_dispatcher
 from chitu.ops.quant.blockfp4.convert import blockfp4_act_quant
-from chitu.utils import try_import_platform_dep, try_import_opt_dep
 
-triton, has_triton = try_import_platform_dep("triton")
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-hard_fp4_kernels, has_hard_fp4_kernels = try_import_opt_dep(
-    "hard_fp4_kernels", "hard_fp4_kernels"
-)
-cinfer_ascendc, has_cinfer_ascendc = try_import_opt_dep(
-    "cinfer_ascendc", "ascend_kernels"
-)
 
-if has_triton:
+from chitu.optdep import triton, chitu_backend, hard_fp4_kernels, cinfer_ascendc
+
+if triton:
     from chitu.ops.triton_ops import (
         soft_fp4_raise_to_fp8_blockfp4_gemm_triton,
         soft_fp4_raise_to_bf16_blockfp4_gemm_triton,
@@ -61,7 +54,7 @@ def _auto_soft_fp4_raise_to_fp8_blockfp4_gemm():
 
 
 soft_fp4_raise_to_fp8_blockfp4_gemm.register_candidate("triton")
-if has_triton:
+if triton:
     soft_fp4_raise_to_fp8_blockfp4_gemm.register("triton")(
         soft_fp4_raise_to_fp8_blockfp4_gemm_triton
     )
@@ -96,7 +89,7 @@ def _auto_soft_fp4_raise_to_bf16_blockfp4_gemm():
 
 
 soft_fp4_raise_to_bf16_blockfp4_gemm.register_candidate("triton")
-if has_triton:
+if triton:
     soft_fp4_raise_to_bf16_blockfp4_gemm.register("triton")(
         soft_fp4_raise_to_bf16_blockfp4_gemm_triton
     )
@@ -130,7 +123,7 @@ def _auto_soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm():
 
 
 @soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm.register(
-    "npu", available=has_cinfer_ascendc
+    "npu", available=bool(cinfer_ascendc)
 )
 @single_dispatch_lazy_tensor
 def soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm_npu(
@@ -256,7 +249,7 @@ def cutlass_scaled_fp4_mm(
             if m <= batch_size_threshold
             else hard_fp4_kernels.cuda_nvfp4_scaled_mm
         )
-        if has_hard_fp4_kernels
+        if hard_fp4_kernels
         else chitu_backend.cuda_nvfp4_scaled_mm
     )
     cuda_nvfp4_scaled_mm_kernel(out, x, weight, x_scale, weight_scale, alpha)
@@ -338,7 +331,7 @@ def blockfp4_gemm(
     batch_size_threshold: int = 128,
 ) -> torch.Tensor:
     assert is_blackwell()
-    if not has_hard_fp4_kernels:
+    if not hard_fp4_kernels:
         return blockfp4_gemm_chitu_backend(
             x, weight, weight_scale, weight_scale_2, alpha, out_dtype
         )

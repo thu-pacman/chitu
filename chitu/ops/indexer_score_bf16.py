@@ -6,12 +6,12 @@ from typing import Optional
 
 import torch
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep
+
 from chitu.batched_seq_len import BatchedSeqLenDelta
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
-if has_triton:
+if triton:
     from chitu.ops.triton_ops import (
         bf16_index_score_paged_kv_triton,
         bf16_index_score_ragged_qk_dsv32_triton,
@@ -38,7 +38,7 @@ def bf16_index_score_paged_kv(
 
 @bf16_index_score_paged_kv.register_auto
 def _auto_bf16_index_score_paged_kv(q, *args, **kwargs):
-    return "triton" if q.is_cuda and has_triton else "torch"
+    return "triton" if q.is_cuda and triton else "torch"
 
 
 @bf16_index_score_paged_kv.register("torch")
@@ -81,7 +81,7 @@ def bf16_index_score_paged_kv_torch(
 
 
 bf16_index_score_paged_kv.register_candidate("triton")
-if has_triton:
+if triton:
     bf16_index_score_paged_kv.register("triton")(bf16_index_score_paged_kv_triton)
 
 
@@ -103,7 +103,7 @@ def bf16_index_score_ragged_qk_dsv32(
 
 @bf16_index_score_ragged_qk_dsv32.register_auto
 def _auto_bf16_index_score_ragged_qk_dsv32():
-    if has_triton:
+    if triton:
         return "triton"
     return "torch"
 
@@ -166,7 +166,7 @@ def bf16_index_score_ragged_qk_dsv32_torch(
 
 
 bf16_index_score_ragged_qk_dsv32.register_candidate("triton")
-if has_triton:
+if triton:
     bf16_index_score_ragged_qk_dsv32.register("triton")(
         bf16_index_score_ragged_qk_dsv32_triton
     )

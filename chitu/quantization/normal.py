@@ -20,11 +20,7 @@ from chitu.hybrid_device import CPUParameter
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.global_vars import get_global_args
-from chitu.utils import (
-    try_import_platform_dep,
-    try_import_opt_dep,
-    try_import_and_setup_torch_npu,
-)
+
 from chitu.static_tensor import StaticTensor
 from chitu.native_layout import (
     NativeLayoutMixin,
@@ -43,15 +39,13 @@ from chitu.moe.batched_routed_activation import (
 )
 from chitu.ops.utils import make_op_dispatcher
 
-triton, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+from chitu.optdep import triton, torch_npu, cpuinfer
 
-if has_triton:
+if triton:
     from chitu.moe.experts.triton_batched_experts import triton_batched_experts
     from chitu.moe.experts import fused_experts
 
-if has_torch_npu:
+if torch_npu:
     from chitu.moe.experts import fused_experts_no_sum_npu, fused_experts_npu_for_ep
 
 
@@ -163,20 +157,20 @@ def fused_experts_no_sum_normal_indexed(
 
 @fused_experts_no_sum_normal_indexed.register_auto
 def _auto_fused_experts_no_sum_normal_indexed():
-    if has_triton:
+    if triton:
         return "triton"
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     raise NotImplementedError
 
 
 fused_experts_no_sum_normal_indexed.register_candidate("triton")
-if has_triton:
+if triton:
     fused_experts_no_sum_normal_indexed.register("triton")(fused_experts)
 
 
 fused_experts_no_sum_normal_indexed.register_candidate("torch_npu")
-if has_torch_npu:
+if torch_npu:
     fused_experts_no_sum_normal_indexed.register("torch_npu")(fused_experts_no_sum_npu)
 
 
@@ -200,15 +194,15 @@ def fused_experts_sum_normal_indexed(
 
 @fused_experts_sum_normal_indexed.register_auto
 def _auto_fused_experts_sum_normal_indexed():
-    if has_triton:
+    if triton:
         return "triton"
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     raise NotImplementedError
 
 
-@fused_experts_sum_normal_indexed.register("triton", available=has_triton)
-@fused_experts_sum_normal_indexed.register("torch_npu", available=has_torch_npu)
+@fused_experts_sum_normal_indexed.register("triton", available=bool(triton))
+@fused_experts_sum_normal_indexed.register("torch_npu", available=bool(torch_npu))
 def _fused_experts_sum_normal_indexed_any(
     hidden_states,
     w1,
@@ -249,12 +243,12 @@ def fused_experts_no_sum_normal_per_expert_dense(
 
 @fused_experts_no_sum_normal_per_expert_dense.register_auto
 def _auto_fused_experts_no_sum_normal_per_expert_dense():
-    if has_triton:
+    if triton:
         return "triton"
     raise NotImplementedError
 
 
-@fused_experts_no_sum_normal_per_expert_dense.register("triton", available=has_triton)
+@fused_experts_no_sum_normal_per_expert_dense.register("triton", available=bool(triton))
 def _fused_experts_no_sum_normal_per_expert_dense_triton(
     hidden_states, w1, w2, *, swiglu_limit: Optional[float] = None, impl: str = "triton"
 ):
@@ -278,12 +272,12 @@ def fused_experts_sum_normal_per_expert_dense(
 
 @fused_experts_sum_normal_per_expert_dense.register_auto
 def _auto_fused_experts_sum_normal_per_expert_dense():
-    if has_triton:
+    if triton:
         return "triton"
     raise NotImplementedError
 
 
-@fused_experts_sum_normal_per_expert_dense.register("triton", available=has_triton)
+@fused_experts_sum_normal_per_expert_dense.register("triton", available=bool(triton))
 def _fused_experts_sum_normal_per_expert_dense_triton(
     hidden_states,
     w1,
@@ -316,13 +310,13 @@ def fused_experts_no_sum_normal_concat_permuted(
 
 @fused_experts_no_sum_normal_concat_permuted.register_auto
 def _auto_fused_experts_no_sum_normal_concat_permuted():
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     raise NotImplementedError
 
 
 fused_experts_no_sum_normal_concat_permuted.register_candidate("torch_npu")
-if has_torch_npu:
+if torch_npu:
     fused_experts_no_sum_normal_concat_permuted.register("torch_npu")(
         fused_experts_npu_for_ep
     )
@@ -344,12 +338,14 @@ def fused_experts_sum_normal_concat_permuted(
 
 @fused_experts_sum_normal_concat_permuted.register_auto
 def _auto_fused_experts_sum_normal_concat_permuted():
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     raise NotImplementedError
 
 
-@fused_experts_sum_normal_concat_permuted.register("torch_npu", available=has_torch_npu)
+@fused_experts_sum_normal_concat_permuted.register(
+    "torch_npu", available=bool(torch_npu)
+)
 def _fused_experts_sum_normal_concat_permuted_torch_npu(
     hidden_states,
     w1,
@@ -497,7 +493,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
     def _(
         self, routed_x: IndexedBatchedRoutedActivation, impl="auto"
     ) -> BatchedExpertResult:
-        if has_triton or has_torch_npu:
+        if triton or torch_npu:
             return fused_experts_no_sum_normal_indexed(
                 hidden_states=routed_x,
                 w1=self.gate_up_proj_weight,
@@ -513,7 +509,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
     def _(
         self, routed_x: PerExpertDenseBatchedRoutedActivationMinimal, impl="auto"
     ) -> BatchedExpertResult:
-        if has_triton:
+        if triton:
             return fused_experts_no_sum_normal_per_expert_dense(
                 hidden_states=routed_x,
                 w1=self.gate_up_proj_weight,
@@ -527,7 +523,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
     def _(
         self, routed_x: ConcatPermutedBatchedRoutedActivationMinimal, impl="auto"
     ) -> BatchedExpertResult:
-        if has_torch_npu:
+        if torch_npu:
             impl = fused_experts_no_sum_normal_concat_permuted.resolve_impl(impl=impl)
             return fused_experts_no_sum_normal_concat_permuted(
                 hidden_states=routed_x,
@@ -558,7 +554,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
-        if has_triton or has_torch_npu:
+        if triton or torch_npu:
             return fused_experts_sum_normal_indexed(
                 hidden_states=routed_x,
                 topk_weights=weights,
@@ -580,7 +576,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
-        if has_triton:
+        if triton:
             return fused_experts_sum_normal_per_expert_dense(
                 hidden_states=routed_x,
                 topk_weights=weights,
@@ -600,7 +596,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
-        if has_torch_npu:
+        if torch_npu:
             return fused_experts_sum_normal_concat_permuted(
                 hidden_states=routed_x,
                 topk_weights=weights,

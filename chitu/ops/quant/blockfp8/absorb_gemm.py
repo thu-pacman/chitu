@@ -13,11 +13,11 @@ from chitu.ops.quant.blockfp8.convert import (
     blockfp8_weight_dequant_impl_for,
 )
 from chitu.ops.utils import make_op_dispatcher
-from chitu.utils import try_import_platform_dep
 
-triton, has_triton = try_import_platform_dep("triton")
 
-if has_triton:
+from chitu.optdep import triton
+
+if triton:
     from chitu.ops.triton_ops import blockfp8_einsum_shc_hdc_shd_triton
 
 
@@ -38,7 +38,7 @@ def blockfp8_einsum_shc_hdc_shd(
 
 @blockfp8_einsum_shc_hdc_shd.register_auto
 def _auto_blockfp8_einsum_shc_hdc_shd():
-    if has_triton:
+    if triton:
         return "triton"
     return "torch"
 
@@ -67,7 +67,7 @@ def _einsum_shc_hdc_shd_torch(
     return torch.einsum("shc,hdc->shd", group_A, group_B)
 
 
-@blockfp8_einsum_shc_hdc_shd.register("triton", available=has_triton)
+@blockfp8_einsum_shc_hdc_shd.register("triton", available=bool(triton))
 def _einsum_shc_hdc_shd_triton(
     group_A,
     group_B,

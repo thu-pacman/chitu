@@ -23,10 +23,10 @@ from chitu.ops import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant
 from chitu.ops.quant.blockfp8.matmul import blockfp8_gemm_wants_packed_ue8m0_scale
 from chitu.ops.triton_ops.quant_gemm import tma_align_input_scale
-from chitu.utils import try_import_opt_dep
+
 from chitu.lazy import eval_lazy
 
-deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+from chitu.optdep import deep_gemm
 
 
 @functools.singledispatch

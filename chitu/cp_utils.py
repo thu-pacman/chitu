@@ -14,14 +14,29 @@ implementation: CPContextInterleaved or CPContextContiguous.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import torch
 from typing import Optional, Sequence, Tuple
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
+from chitu.cp_linear_attention import (
+    all_to_all_reshape,
+    build_layout_route,
+    build_zigzag_route,
+    contiguous_interval,
+    zigzag_rank_indices,
+)
 from chitu.distributed.comm_group import CommGroup
 from chitu.utils import ceil_div
+
+LayoutRoute = Tuple[
+    Sequence[torch.Tensor],
+    Sequence[torch.Tensor],
+    Sequence[Sequence[int]],
+    Sequence[Sequence[int]],
+]
 
 # ---- Global singleton ----
 
@@ -178,18 +193,23 @@ def _build_layout_route(
     total_tokens: int,
     source_layout: str,
     target_layout: str,
-):
-    """Build the one-way all-to-all route between two CP layouts."""
+) -> LayoutRoute:
+    """Build the one-way all-to-all route between two layouts."""
     if {source_layout, target_layout} == {"interleaved", "contiguous"}:
-        from chitu.cp_linear_attention import build_layout_route
-
-        return build_layout_route(
+        _, _, send_index, recv_index, send_counts, recv_counts = build_layout_route(
             cp_ctx.pcp_size,
             int(total_tokens),
             to_contiguous=target_layout == "contiguous",
         )
+        return send_index, recv_index, send_counts, recv_counts
+    if {source_layout, target_layout} == {"contiguous", "zigzag"}:
+        return build_zigzag_route(
+            cp_ctx.pcp_size,
+            int(total_tokens),
+            to_zigzag=target_layout == "zigzag",
+        )
     raise NotImplementedError(
-        f"Unsupported CP layout transform {source_layout!r} -> {target_layout!r}"
+        f"Unsupported layout transform {source_layout!r} -> {target_layout!r}"
     )
 
 
@@ -198,7 +218,7 @@ def _get_layout_routes(
     total_tokens: int,
     source_layout: str,
     target_layout: str,
-):
+) -> tuple[LayoutRoute, LayoutRoute]:
     """Cached forward and reverse routes for one layout transform."""
     key = (cp_ctx.pcp_size, int(total_tokens), source_layout, target_layout)
     cached = getattr(cp_ctx, "_layout_route_cache", None)
@@ -207,10 +227,7 @@ def _get_layout_routes(
 
     fwd = _build_layout_route(cp_ctx, total_tokens, source_layout, target_layout)
     bwd = _build_layout_route(cp_ctx, total_tokens, target_layout, source_layout)
-    routes = (
-        (fwd[2], fwd[3], fwd[4], fwd[5]),
-        (bwd[2], bwd[3], bwd[4], bwd[5]),
-    )
+    routes = (fwd, bwd)
     cp_ctx._layout_route_cache = (key, routes)
     return routes
 
@@ -220,18 +237,18 @@ def to_layout(
     cp_ctx: "CPContext",
     total_tokens: int,
     target_layout: str,
-):
-    """Move a local residual chunk to ``target_layout``.
+) -> tuple[torch.Tensor, Optional[LayoutRoute]]:
+    """Move a local token chunk to ``target_layout``.
 
-    Returns ``(x_target, restore_route)``. If the context already uses the
-    target layout, this is a no-op and ``restore_route`` is ``None``. The
-    route is consumed by :func:`from_layout`.
+    Supported transforms are interleaved <-> contiguous residual layouts and
+    contiguous <-> zigzag MLA chunk layouts. Returns ``(x_target,
+    restore_route)``. If the context already uses the target layout, this is a
+    no-op and ``restore_route`` is ``None``. The route is consumed by
+    :func:`from_layout`.
     """
     source_layout = getattr(cp_ctx, "layout", "interleaved")
     if source_layout == target_layout:
         return x, None
-
-    from chitu.cp_linear_attention import all_to_all_reshape
 
     fwd_route, bwd_route = _get_layout_routes(
         cp_ctx, total_tokens, source_layout, target_layout
@@ -241,15 +258,114 @@ def to_layout(
     return x_target, bwd_route
 
 
-def from_layout(x: torch.Tensor, restore_route, cp_ctx: "CPContext") -> torch.Tensor:
+def from_layout(
+    x: torch.Tensor,
+    restore_route: Optional[LayoutRoute],
+    cp_ctx: "CPContext",
+) -> torch.Tensor:
     """Restore a transformed tensor to the context's residual layout."""
     if restore_route is None:
         return x
 
-    from chitu.cp_linear_attention import all_to_all_reshape
-
     group = cp_ctx.cp_group.gpu_group if cp_ctx.cp_group is not None else None
     return all_to_all_reshape(x, cp_ctx.cp_rank, *restore_route, group=group)
+
+
+@dataclass
+class CPChunkLayout:
+    """Per-step metadata for a contiguous MLA/KV chunk."""
+
+    start: int
+    end: int
+    chunk_lengths: list[int]
+    cache_positions: torch.Tensor
+    cache_seq_ids: torch.Tensor
+    seq_len_delta: BatchedSeqLenDelta
+
+    @property
+    def local_rows(self) -> int:
+        return self.end - self.start
+
+
+def _build_mla_interval_layout(
+    seq_len_delta: BatchedSeqLenDelta,
+    start: int,
+    end: int,
+    *,
+    chunk_lengths: Optional[Sequence[int]] = None,
+) -> CPChunkLayout:
+    """Build MLA chunk metadata for one global token interval.
+
+    ``chunk_lengths`` is the per-rank length list used by ordered allgather. It
+    defaults to this interval's local length for layer-local chunks.
+    """
+    total_tokens = int(seq_len_delta.delta_total_len)
+    old_lens = seq_len_delta.old.lens_list
+    delta_lens = seq_len_delta.delta_lens_list
+    if len(old_lens) != len(delta_lens):
+        raise RuntimeError("CP MLA chunk received inconsistent request lengths")
+    cu = [0]
+    for length in delta_lens:
+        cu.append(cu[-1] + int(length))
+    if cu[-1] != total_tokens:
+        raise RuntimeError(
+            "CP MLA chunk delta lengths do not sum to the global token count: "
+            f"got {cu[-1]}, expected {total_tokens}"
+        )
+
+    present_seq_ids = []
+    k_lens = []
+    chunk_old_lens = []
+    chunk_new_lens = []
+    for seq_id in range(len(delta_lens)):
+        seq_start, seq_end = cu[seq_id], cu[seq_id + 1]
+        a = max(start, seq_start)
+        b = min(end, seq_end)
+        if b <= a:
+            continue
+        present_seq_ids.append(seq_id)
+        old_for_q = int(old_lens[seq_id]) + (a - seq_start)
+        new_for_q = int(old_lens[seq_id]) + (b - seq_start)
+        chunk_old_lens.append(old_for_q)
+        chunk_new_lens.append(new_for_q)
+        k_lens.append(new_for_q)
+
+    device = seq_len_delta.device
+    cache_positions = []
+    cache_seq_ids = []
+    for seq_id, k_len in zip(present_seq_ids, k_lens):
+        cache_positions.append(torch.arange(k_len, device=device, dtype=torch.int32))
+        cache_seq_ids.append(
+            torch.full((k_len,), seq_id, device=device, dtype=torch.int32)
+        )
+    if cache_positions:
+        cache_positions_tensor = torch.cat(cache_positions, dim=0)
+        cache_seq_ids_tensor = torch.cat(cache_seq_ids, dim=0)
+    else:
+        cache_positions_tensor = torch.empty(0, device=device, dtype=torch.int32)
+        cache_seq_ids_tensor = torch.empty(0, device=device, dtype=torch.int32)
+
+    chunk_delta = BatchedSeqLenDelta(
+        chunk_old_lens,
+        chunk_new_lens,
+        device=device,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_prefix_lens_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
+    )
+    return CPChunkLayout(
+        start=start,
+        end=end,
+        chunk_lengths=(
+            list(chunk_lengths) if chunk_lengths is not None else [end - start]
+        ),
+        cache_positions=cache_positions_tensor,
+        cache_seq_ids=cache_seq_ids_tensor,
+        seq_len_delta=chunk_delta,
+    )
 
 
 def pad_rows_to_count(
@@ -318,6 +434,9 @@ class CPContext:
         # Per-step cached query view (set by prepare_local_lengths, read by layers)
         self._seq_len_delta_view: Optional[BatchedSeqLenDeltaView] = None
         self._interleaved_ctx: Optional["CPContextInterleaved"] = None
+        self._layout_route_cache: Optional[
+            tuple[tuple[int, int, str, str], tuple[LayoutRoute, LayoutRoute]]
+        ] = None
 
     def set_step_active(self, active: bool) -> None:
         self._step_active = bool(active)
@@ -536,9 +655,11 @@ class CPContextInterleaved(CPContext):
         self,
         tokens: Optional[torch.Tensor],
         hiddens: Optional[torch.Tensor],
-        freqs_cis: BatchedFreqsCis,
+        freqs_cis: Optional[BatchedFreqsCis],
         total_tokens: int,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], BatchedFreqsCis]:
+    ) -> Tuple[
+        Optional[torch.Tensor], Optional[torch.Tensor], Optional[BatchedFreqsCis]
+    ]:
         """Split CP prefill inputs to this rank's real interleaved local rows.
 
         Stage 0 provides token IDs and splits them here. Later PP stages receive
@@ -564,10 +685,11 @@ class CPContextInterleaved(CPContext):
             )
         if tokens is not None:
             tokens = tokens[local_indices]
-        freqs_cis = BatchedFreqsCis(
-            freqs_cis.cos[local_indices],
-            freqs_cis.sin[local_indices],
-        )
+        if freqs_cis is not None:
+            freqs_cis = BatchedFreqsCis(
+                freqs_cis.cos[local_indices],
+                freqs_cis.sin[local_indices],
+            )
         return tokens, hiddens, freqs_cis
 
     def prepare_local_lengths(
@@ -685,13 +807,133 @@ class CPContextContiguous(CPContext):
 
     layout = "contiguous"
 
+    def __init__(self, pcp_size: int, cp_group: CommGroup):
+        super().__init__(pcp_size, cp_group)
+        self._mla_chunk: Optional[CPChunkLayout] = None
+        self._mla_chunk_source: Optional[BatchedSeqLenDelta] = None
+        self._mla_zigzag_source = None
+        self._mla_zigzag_chunks = None
+        self._zigzag_indices_key = None
+        self._zigzag_indices = None
+
+    def clear_step_cache(self):
+        super().clear_step_cache()
+        self._mla_chunk = None
+        self._mla_chunk_source = None
+        self._mla_zigzag_source = None
+        self._mla_zigzag_chunks = None
+
+    def prepare_mla_chunk(self, seq_len_delta: BatchedSeqLenDelta) -> CPChunkLayout:
+        """Build this step's contiguous MLA chunk metadata."""
+        if not self.step_active:
+            raise RuntimeError("CP MLA chunk metadata requires an active CP step")
+
+        total_tokens = int(seq_len_delta.delta_total_len)
+        if total_tokens != self._orig_num_tokens:
+            raise RuntimeError(
+                "CP MLA chunk total does not match split_prefill: "
+                f"got {total_tokens}, expected {self._orig_num_tokens}"
+            )
+        if self._mla_chunk is not None and self._mla_chunk_source is seq_len_delta:
+            return self._mla_chunk
+
+        start, end = contiguous_interval(self.cp_rank, self.pcp_size, total_tokens)
+        layout = _build_mla_interval_layout(
+            seq_len_delta,
+            start,
+            end,
+            chunk_lengths=build_contiguous_chunk_lengths(total_tokens, self.pcp_size),
+        )
+        self._mla_chunk = layout
+        self._mla_chunk_source = seq_len_delta
+        return layout
+
+    def allgather_ordered_payload(self, local_tensor: torch.Tensor) -> torch.Tensor:
+        """Allgather a contiguous chunk into global token order."""
+        layout = self._mla_chunk
+        if layout is None:
+            raise RuntimeError("CP MLA chunk metadata has not been prepared")
+        if local_tensor.shape[0] != layout.local_rows:
+            raise AssertionError(
+                f"CP{self.cp_rank}: chunk rows {local_tensor.shape[0]} != "
+                f"{layout.local_rows}"
+            )
+
+        expected_n_local = max(layout.chunk_lengths)
+        gathered = self._allgather_padded_rows(local_tensor, expected_n_local)
+        reorder_idx = build_cp_contiguous_reorder_idx(
+            layout.chunk_lengths, expected_n_local, device=local_tensor.device
+        )
+        return gathered[reorder_idx]
+
+    def _zigzag_indices_for(self, total_tokens: int):
+        key = (self.pcp_size, int(total_tokens))
+        if self._zigzag_indices_key != key:
+            self._zigzag_indices = [
+                zigzag_rank_indices(r, self.pcp_size, int(total_tokens))
+                for r in range(self.pcp_size)
+            ]
+            self._zigzag_indices_key = key
+        return self._zigzag_indices
+
+    def prepare_mla_zigzag_chunks(
+        self, seq_len_delta: BatchedSeqLenDelta
+    ) -> list[CPChunkLayout]:
+        if not self.step_active:
+            raise RuntimeError("CP MLA zigzag metadata requires an active CP step")
+        total_tokens = int(seq_len_delta.delta_total_len)
+        if total_tokens != self._orig_num_tokens:
+            raise RuntimeError(
+                "CP MLA zigzag total does not match split_prefill: "
+                f"got {total_tokens}, expected {self._orig_num_tokens}"
+            )
+        if self._mla_zigzag_source is seq_len_delta:
+            assert self._mla_zigzag_chunks is not None
+            return self._mla_zigzag_chunks
+
+        n_blocks = 2 * self.pcp_size
+        intervals = [
+            contiguous_interval(self.cp_rank, n_blocks, total_tokens),
+            contiguous_interval(n_blocks - 1 - self.cp_rank, n_blocks, total_tokens),
+        ]
+        chunks = [
+            _build_mla_interval_layout(seq_len_delta, start, end)
+            for start, end in intervals
+        ]
+        self._mla_zigzag_source = seq_len_delta
+        self._mla_zigzag_chunks = chunks
+        return chunks
+
+    def allgather_zigzag_payload(self, local_tensor: torch.Tensor) -> torch.Tensor:
+        indices = self._zigzag_indices_for(self._orig_num_tokens)
+        local_len = len(indices[self.cp_rank])
+        if local_tensor.shape[0] != local_len:
+            raise AssertionError(
+                f"CP{self.cp_rank}: zigzag rows {local_tensor.shape[0]} != "
+                f"{local_len}"
+            )
+        expected = max(len(x) for x in indices)
+        gathered = self._allgather_padded_rows(local_tensor, expected)
+        slots = torch.full(
+            (self._orig_num_tokens,), -1, device=local_tensor.device, dtype=torch.long
+        )
+        for r, idx in enumerate(indices):
+            slots[idx.to(local_tensor.device)] = r * expected + torch.arange(
+                len(idx), device=local_tensor.device, dtype=torch.long
+            )
+        if bool((slots < 0).any()):
+            raise RuntimeError("zigzag allgather did not cover every global token")
+        return gathered[slots]
+
     def split_prefill(
         self,
         tokens: Optional[torch.Tensor],
         hiddens: Optional[torch.Tensor],
-        freqs_cis: BatchedFreqsCis,
+        freqs_cis: Optional[BatchedFreqsCis],
         total_tokens: int,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], BatchedFreqsCis]:
+    ) -> Tuple[
+        Optional[torch.Tensor], Optional[torch.Tensor], Optional[BatchedFreqsCis]
+    ]:
         """Split CP prefill inputs to this rank's contiguous local rows."""
         self.prepare_prefill(total_tokens)
         if not self.step_active:
@@ -710,10 +952,11 @@ class CPContextContiguous(CPContext):
             )
         if tokens is not None:
             tokens = tokens[local_indices]
-        freqs_cis = BatchedFreqsCis(
-            freqs_cis.cos[local_indices],
-            freqs_cis.sin[local_indices],
-        )
+        if freqs_cis is not None:
+            freqs_cis = BatchedFreqsCis(
+                freqs_cis.cos[local_indices],
+                freqs_cis.sin[local_indices],
+            )
         return tokens, hiddens, freqs_cis
 
     def prepare_local_lengths(

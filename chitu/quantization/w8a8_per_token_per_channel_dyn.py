@@ -12,11 +12,7 @@ import torch
 
 from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.device_type import get_device_name, is_hygon, is_ascend_950
-from chitu.import_utils import (
-    try_import_platform_dep,
-    try_import_opt_dep,
-    try_import_and_setup_torch_npu,
-)
+
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
     ExpertBlockPermutedBatchedExpertResult,
@@ -52,18 +48,18 @@ from chitu.lazy import LazyTensor, eval_lazy
 from chitu.global_vars import get_global_args
 from chitu.utils import parse_dtype
 
-_, has_triton = try_import_platform_dep("triton")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-lmslim_quant_ops, has_lmslim_quant_ops = try_import_platform_dep(
-    "lmslim.quantize.quant_ops"
+from chitu.optdep import (
+    triton,
+    torch_npu,
+    lmslim_quantize_quant_ops as lmslim_quant_ops,
+    aiter_moe as aiter,
+    deepgemm as hygon_deepgemm,
+    lightop,
 )
-aiter, has_aiter = try_import_platform_dep("aiter.moe")
-hygon_deepgemm, has_deepgemm = try_import_opt_dep("deepgemm", "deep_gemm")
-lightop, has_lightop = try_import_platform_dep("lightop")
 
-if has_triton:
+if triton:
     from chitu.moe.experts.triton_fused_experts import fused_experts_int8
-if has_torch_npu:
+if torch_npu:
     from chitu.moe.experts import fused_experts_no_sum_npu, fused_experts_npu_for_ep
 
 W8A8_PER_TOKEN_PER_CHANNEL_DYN = "w8a8_per_token_per_channel_dyn"
@@ -76,7 +72,7 @@ logger = logging.getLogger(__name__)
 def _hygon_backend_w8a8_per_token_per_channel_dyn_use_deepgemm_moe(
     _: dict[str, Any],
 ) -> bool:
-    if not (is_hygon() and has_deepgemm):
+    if not (is_hygon() and hygon_deepgemm):
         return False
     try:
         ep_size = int(getattr(get_global_args().infer, "ep_size", 1))
@@ -140,15 +136,15 @@ def _prepare_w8a8_per_token_per_channel_dyn_per_expert_activation(
 
 
 def _lightop_gemm_w8a8_smooth_available() -> bool:
-    return has_lightop and callable(getattr(lightop, "gemm_w8a8_smooth", None))
+    return bool(lightop) and callable(getattr(lightop, "gemm_w8a8_smooth", None))
 
 
 def _lightop_fuse_silu_mul_quant_ep_available() -> bool:
-    return has_lightop and callable(getattr(lightop, "fuse_silu_mul_quant_ep", None))
+    return bool(lightop) and callable(getattr(lightop, "fuse_silu_mul_quant_ep", None))
 
 
 def _lightop_moe_gemm_w8a8_available() -> bool:
-    return has_lightop and callable(getattr(lightop, "moe_gemm_w8a8", None))
+    return bool(lightop) and callable(getattr(lightop, "moe_gemm_w8a8", None))
 
 
 def _a8_per_token_act_quant_with_expert_mask(
@@ -386,7 +382,7 @@ class W8A8PerTokenPerChannelDynLinear(QuantizedLinearBase):
 
 
 @QuantizationRegistry.register_linear(
-    "w8a8_per_token_per_channel_dyn", when=lambda _: has_torch_npu, priority=1
+    "w8a8_per_token_per_channel_dyn", when=lambda _: bool(torch_npu), priority=1
 )
 class AscendW8A8PerTokenPerChannelDynLinear(
     NativeLayoutMixin, W8A8PerTokenPerChannelDynLinear
@@ -463,7 +459,7 @@ def fused_experts_no_sum_w8a8_per_token_per_channel_dyn_indexed(
 
 @fused_experts_no_sum_w8a8_per_token_per_channel_dyn_indexed.register_auto
 def _auto_fused_experts_no_sum_w8a8_per_token_per_channel_dyn_indexed():
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     raise NotImplementedError
 
@@ -471,7 +467,7 @@ def _auto_fused_experts_no_sum_w8a8_per_token_per_channel_dyn_indexed():
 fused_experts_no_sum_w8a8_per_token_per_channel_dyn_indexed.register_candidate(
     "torch_npu"
 )
-if has_torch_npu:
+if torch_npu:
     fused_experts_no_sum_w8a8_per_token_per_channel_dyn_indexed.register("torch_npu")(
         fused_experts_no_sum_npu
     )
@@ -494,7 +490,7 @@ def fused_experts_no_sum_w8a8_per_token_per_channel_dyn_concat_permuted(
 
 @fused_experts_no_sum_w8a8_per_token_per_channel_dyn_concat_permuted.register_auto
 def _auto_fused_experts_no_sum_w8a8_per_token_per_channel_dyn_concat_permuted():
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     raise NotImplementedError
 
@@ -502,7 +498,7 @@ def _auto_fused_experts_no_sum_w8a8_per_token_per_channel_dyn_concat_permuted():
 fused_experts_no_sum_w8a8_per_token_per_channel_dyn_concat_permuted.register_candidate(
     "torch_npu"
 )
-if has_torch_npu:
+if torch_npu:
     fused_experts_no_sum_w8a8_per_token_per_channel_dyn_concat_permuted.register(
         "torch_npu"
     )(fused_experts_npu_for_ep)
@@ -528,7 +524,7 @@ def fused_experts_sum_w8a8_per_token_per_channel_dyn_indexed(
 
 @fused_experts_sum_w8a8_per_token_per_channel_dyn_indexed.register_auto
 def _auto_fused_experts_sum_w8a8_per_token_per_channel_dyn_indexed():
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     raise NotImplementedError
 
@@ -585,7 +581,7 @@ def fused_experts_sum_w8a8_per_token_per_channel_dyn_concat_permuted(
 
 @fused_experts_sum_w8a8_per_token_per_channel_dyn_concat_permuted.register_auto
 def _auto_fused_experts_sum_w8a8_per_token_per_channel_dyn_concat_permuted():
-    if has_torch_npu:
+    if torch_npu:
         return "torch_npu"
     raise NotImplementedError
 
@@ -813,7 +809,7 @@ class AscendW8A8PerTokenPerChannelDynMoeExperts(
 @QuantizationRegistry.register_moe_experts(
     W8A8_PER_TOKEN_PER_CHANNEL_DYN,
     merge_gate_up=True,
-    when=lambda _: is_hygon() and has_aiter,
+    when=lambda _: is_hygon() and bool(aiter),
     priority=10,
 )
 class HygonAiterW8A8PerTokenPerChannelDynMoeExpertsMerged(
@@ -958,7 +954,7 @@ class HygonAiterW8A8PerTokenPerChannelDynMoeExpertsMerged(
 @QuantizationRegistry.register_moe_experts(
     W8A8_PER_TOKEN_PER_CHANNEL_DYN,
     merge_gate_up=True,
-    when=lambda _: has_triton,
+    when=lambda _: bool(triton),
 )
 class TritonW8A8PerTokenPerChannelDynMoeExpertsMerged(
     W8A8PerTokenPerChannelDynMoeExpertsMergedBase

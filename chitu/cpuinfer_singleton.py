@@ -5,9 +5,9 @@
 import threading
 from typing import Optional
 from chitu.global_vars import get_global_args
-from chitu.utils import try_import_opt_dep
 
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+
+from chitu.optdep import cpuinfer
 
 _cpu_infer_instance = None
 _lock = threading.Lock()

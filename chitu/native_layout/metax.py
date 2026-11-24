@@ -13,14 +13,9 @@ from chitu.native_layout.common import (
     BatchPaddedActivation,
     Packed4BitWeightAlongKContig,
 )
-from chitu.import_utils import try_import_opt_dep
 
-muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
-    "muxi_layout_kernels", "muxi_layout_kernels"
-)
-metax_soft_fp4_kernels, has_metax_soft_fp4 = try_import_opt_dep(
-    "metax_soft_fp4_kernels", "metax_soft_fp4_kernels"
-)
+
+from chitu.optdep import muxi_layout_kernels, metax_soft_fp4_kernels
 
 
 class MuxiNativeLayoutActivation(NativeLayoutTensor):

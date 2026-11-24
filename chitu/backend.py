@@ -78,7 +78,7 @@ from chitu.tokenizer import (
 )
 from chitu.tool_call import patch_chat_template
 from chitu.utils import max_alloc_seq_len, parse_dtype, should_pretty_log
-from chitu.import_utils import try_import_opt_dep
+
 from chitu.moe import init_moe_impl
 from chitu.boot.arg_utils import calculate_parallelism_sizes
 from chitu.global_vars import (
@@ -94,7 +94,7 @@ if TYPE_CHECKING:
     from chitu.executor import Executor
     from chitu.scheduler import Scheduler
 
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+from chitu.optdep import cpuinfer
 
 
 logger = getLogger(__name__)
@@ -360,6 +360,23 @@ class Backend:
 
         # Get rank from environment variable because we have not initialize torch.distributed yet
 
+        rank = int(os.environ.get("RANK", 0))
+
+        # Bind CPU/memory before the CUDA device is selected and before NCCL is
+        # initialized, so that the NCCL helper threads and the pinned host buffers are
+        # allocated on the NUMA node that owns this rank's GPU. The device is passed
+        # explicitly because `torch.cuda.current_device()` would initialize CUDA here.
+        bind_process_to_numa(
+            args.infer.bind_process_to_cpu,
+            device_id=(
+                args.infer.device_ids[rank]
+                if args.infer.op_impl != "cpu"
+                and args.infer.device_ids is not None
+                and rank < len(args.infer.device_ids)
+                else None
+            ),
+        )
+
         # Bind process to GPU. Please put it before init_process_group
         if args.infer.op_impl != "cpu":
             set_cuda_device()
@@ -372,8 +389,6 @@ class Backend:
 
         if Backend.use_gloo:
             Backend.group_gloo = torch.distributed.new_group(backend="gloo")
-
-        bind_process_to_numa(args.infer.bind_process_to_cpu)
 
         parallelism_sizes = calculate_parallelism_sizes(args)
         global_rank = torch.distributed.get_rank()

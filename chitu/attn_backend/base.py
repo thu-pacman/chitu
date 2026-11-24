@@ -27,7 +27,7 @@ from chitu.ops import (
     merge_dcp_attention_partials,
 )
 from chitu.ops.deepseek_compressor import pack_prefill_kv
-from chitu.utils import try_import_platform_dep
+
 from chitu.ops.decode_cp import (
     compact_dcp_indices,
     unpack_dcp_q,
@@ -36,7 +36,7 @@ from chitu.ops.decode_cp import (
 from chitu.distributed.parallel_state import get_dcp_group
 from chitu.distributed.comm_group import CommGroup
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
 
 logger = getLogger(__name__)
@@ -61,7 +61,7 @@ class AttnBackend(abc.ABC):
         super().__init__()
         self.qk_nope_head_dim = qk_nope_head_dim
         self.args = get_global_args()
-        self.triton_latest_enough = has_triton and packaging.version.parse(
+        self.triton_latest_enough = bool(triton) and packaging.version.parse(
             triton.__version__
         ) >= packaging.version.parse("3.2.0")
 

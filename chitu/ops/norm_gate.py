@@ -5,12 +5,12 @@
 import torch
 from typing import Optional
 import torch.nn.functional as F
-from chitu.utils import try_import_platform_dep
+
 from chitu.ops.utils import make_op_dispatcher
 
-triton, has_triton = try_import_platform_dep("triton")
+from chitu.optdep import triton
 
-if has_triton:
+if triton:
     from chitu.ops.triton_ops import rms_norm_gate_triton
 
 
@@ -30,13 +30,13 @@ def rms_norm_gate(
 
 @rms_norm_gate.register_auto
 def _auto_rms_norm_gate():
-    if has_triton:
+    if triton:
         return "triton"
     return "torch"
 
 
 rms_norm_gate.register_candidate("triton")
-if has_triton:
+if triton:
     rms_norm_gate.register("triton")(rms_norm_gate_triton)
 
 

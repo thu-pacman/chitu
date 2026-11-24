@@ -1,11 +1,10 @@
 import torch
 import pytest
 
-from chitu.utils import try_import_platform_dep, try_import_opt_dep
+
 from chitu.ops.norm import rms_norm_torch
 
-triton, has_triton = try_import_platform_dep("triton")
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
+from chitu.optdep import triton, cpuinfer
 
 
 def cpuinfer_rms_norm(input_tensor, output_tensor, CPUInfer, rmsnorm):
@@ -18,7 +17,7 @@ def cpuinfer_rms_norm(input_tensor, output_tensor, CPUInfer, rmsnorm):
     return output_tensor
 
 
-@pytest.mark.skipif(not has_cpuinfer, reason="cpuinfer module not available")
+@pytest.mark.skipif(not cpuinfer, reason="cpuinfer module not available")
 @pytest.mark.parametrize("input_size", [512, 1024, 4096])
 @pytest.mark.parametrize("qlen", [1, 10, 32])
 @pytest.mark.parametrize("compute_dtype", [torch.bfloat16])

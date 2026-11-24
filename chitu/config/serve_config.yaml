@@ -343,6 +343,9 @@ infer:
   #: See `docs/en/DEVELOPMENT.md#parallelism` for details.
   dcp_size: 1
 
+  #: Token layout used by MLA within PCP: "contiguous" or "zigzag".
+  dense_mla_cp_layout: contiguous
+
   #: Number of Tensor Parallel ranks for non-MoE models or non-MoE modules in MoE models.
   #: See `docs/en/DEVELOPMENT.md#parallelism` for details.
   tp_size: 1
