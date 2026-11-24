@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.cp_linear_attention import build_zigzag_route
 from chitu.cp_utils import (
     CPContext,
     CPContextContiguous,
@@ -178,6 +180,54 @@ def test_contiguous_context_exposes_interleaved_view():
     assert interleaved.n_local == 3
     indices, _ = interleaved.local_flat_indices(3, 10, torch.device("cpu"))
     assert indices.tolist() == [1, 5, 9]
+
+
+def _delta(old_lens, new_lens):
+    return BatchedSeqLenDelta(
+        list(old_lens),
+        list(new_lens),
+        device="cpu",
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_prefix_lens_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
+    )
+
+
+def test_contiguous_zigzag_chunks_and_route():
+    ctx = CPContextContiguous(4, _FakeCPGroup(1, torch.empty(0)))
+    ctx._step_active = True
+    ctx._orig_num_tokens = 16
+    delta = _delta([0], [16])
+
+    chunks = ctx.prepare_mla_zigzag_chunks(delta)
+    assert [(chunk.start, chunk.end) for chunk in chunks] == [(2, 4), (12, 14)]
+    assert [chunk.local_rows for chunk in chunks] == [2, 2]
+
+    fwd = build_zigzag_route(4, 16, to_zigzag=True)
+    bwd = build_zigzag_route(4, 16, to_zigzag=False)
+    assert sum(fwd[2][1]) == 4
+    assert sum(bwd[2][1]) == 4
+
+
+def test_contiguous_allgather_zigzag_payload_global_order():
+    values = torch.arange(16, dtype=torch.float32).view(16, 1)
+    gathered = torch.cat(
+        [
+            values[[0, 1, 14, 15]],
+            values[[2, 3, 12, 13]],
+            values[[4, 5, 10, 11]],
+            values[[6, 7, 8, 9]],
+        ],
+        dim=0,
+    )
+    ctx = CPContextContiguous(4, _FakeCPGroup(1, gathered))
+    ctx._orig_num_tokens = 16
+    local = values[[2, 3, 12, 13]]
+    out = ctx.allgather_zigzag_payload(local)
+    assert out.flatten().tolist() == list(range(16))
 
 
 def test_noop_context_is_identity():

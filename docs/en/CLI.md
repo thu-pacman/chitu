@@ -451,6 +451,12 @@ See `docs/en/DEVELOPMENT.md#parallelism` for details.
 
 *Default: `1`.*
 
+### Argument `infer.dense_mla_cp_layout`
+
+Token layout used by MLA within PCP: "contiguous" or "zigzag".
+
+*Default: `contiguous`.*
+
 ### Argument `infer.tp_size`
 
 Number of Tensor Parallel ranks for non-MoE models or non-MoE modules in MoE models.

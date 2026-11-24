@@ -5,14 +5,18 @@
 from typing import Optional
 from typing_extensions import override
 import math
+from logging import getLogger
 
 import torch
 
 from chitu.attn_backend.ref_attn_backend import RefAttnBackend
+from chitu.attn_backend.triton_attn_backend import TritonAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.device_type import is_enflame, is_muxi
 from chitu.utils import try_import_opt_dep
+
+logger = getLogger(__name__)
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flash_attn3, has_flash_attn3 = try_import_opt_dep(
@@ -56,6 +60,7 @@ class FlashAttnBackend(RefAttnBackend):
             )
 
         self.mtp_size = getattr(self.args.infer, "mtp_size", 1)
+        self._latent_decode_backend = None
 
     @override
     def decode_op_supports_mtp(self) -> bool:
@@ -620,6 +625,34 @@ class FlashAttnBackend(RefAttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
         topk_page_table: Optional[torch.Tensor] = None,
     ):
+        # FlashAttention cannot consume the 576-wide latent MQA layout used by
+        # absorb-kv-only decode. Keep the latent cache and delegate decode to
+        # the Triton MLA kernel; prefill still uses FlashAttention over full K/V.
+        if (
+            getattr(self.args.infer, "mla_absorb", "none") == "absorb-kv-only"
+            and q_nope.shape[-1] == self.args.models.kv_lora_rank
+        ):
+            if self._latent_decode_backend is None:
+                logger.info(
+                    "mla_absorb=absorb-kv-only: decode query width %d matches "
+                    "kv_lora_rank %d; FlashAttention cannot consume the latent "
+                    "MQA layout, falling back to TritonAttnBackend",
+                    q_nope.shape[-1],
+                    self.args.models.kv_lora_rank,
+                )
+                self._latent_decode_backend = TritonAttnBackend(
+                    qk_nope_head_dim=self.qk_nope_head_dim
+                )
+            return self._latent_decode_backend.mla_decode_paged_kv(
+                q_nope,
+                q_pe,
+                kv_cache,
+                kv,
+                seq_len_delta=seq_len_delta,
+                softmax_scale=softmax_scale,
+                topk_indices=topk_indices,
+                topk_page_table=topk_page_table,
+            )
         if topk_page_table is not None:
             raise NotImplementedError()
         if not self._use_fa3:

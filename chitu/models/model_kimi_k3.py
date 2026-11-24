@@ -36,7 +36,8 @@ from chitu.attn_backend import AttnBackend, FlashAttnBackend, RefAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
-from chitu.cp_utils import get_cp_context
+from chitu.cp_utils import from_layout, get_cp_context, to_layout
+from chitu.cp_linear_attention import segment_affine_transition
 from chitu.device_type import has_accelerator
 from chitu.dsa_indexer_backend import DSAIndexer
 from chitu.global_vars import get_global_args
@@ -46,7 +47,13 @@ from chitu.models.mm_cache_mixin_qwen_vl import QwenVLMmCacheCoreMixin
 from chitu.models.model import (
     RMSNorm,
     TransformerBlock,
+    all_gather_cp_last,
     get_linear_layout_contig_y,
+    merge_cp_initial_state,
+    patch_conv_state_with_prev_tail,
+    prepare_linear_attention_cp_chunk,
+    reduce_linear_attention_cp_state,
+    write_linear_attention_cp_state,
 )
 from chitu.models.model_deepseek_v3 import (
     AttentionDeepSeekV3,
@@ -66,10 +73,12 @@ from chitu.models.model_kimi_k25 import (
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import (
+    append_to_paged_kv_cache,
     attn_res_mix,
     causal_conv1d_prefill,
     causal_conv1d_update,
     chunk_kimi_delta_attention,
+    read_from_paged_kv_cache,
     read_from_singleton_paged_kv_cache,
     recurrent_kimi_delta_attention,
     update_singleton_paged_kv_cache,
@@ -498,6 +507,202 @@ class AttentionKimiK3(AttentionDeepSeekV3):
             out = out * torch.sigmoid(self.g_proj(attn_input))
         return self.o_proj(out).view(n_tokens, -1)
 
+    @override
+    def forward(self, x, freqs_cis, is_mtp=False):
+        cp = get_cp_context()
+        delta = self.cache.get_seq_len_delta(is_mtp)
+        cp_active_prefill = cp.step_active and not delta.is_decode_stage
+        if not cp_active_prefill:
+            return super().forward(x, freqs_cis, is_mtp=is_mtp)
+        if self.mla_absorb != "absorb-kv-only":
+            raise NotImplementedError(
+                "Kimi-K3 PCP currently supports only "
+                f"mla_absorb=absorb-kv-only, got {self.mla_absorb!r}"
+            )
+        return self._forward_cp_mla_absorb_kv_only(x, freqs_cis, is_mtp)
+
+    def _forward_cp_mla_absorb_kv_only(self, x, freqs_cis, is_mtp):
+        """PCP prefill with a latent KV cache and FlashAttention.
+
+        ``dense_mla_cp_layout`` selects how the local query rows are arranged:
+        contiguous uses one causal chunk, zigzag uses two mirror chunks. The
+        latent KV is all-gathered in the same order, written to the paged cache,
+        and expanded to full K/V locally for FlashAttention.
+        """
+        cp = get_cp_context()
+        if getattr(cp, "layout", "interleaved") != "contiguous":
+            raise NotImplementedError(
+                "K3 PCP absorb-kv-only currently supports contiguous PCP layout only"
+            )
+        mla_layout = getattr(
+            get_global_args().infer, "dense_mla_cp_layout", "contiguous"
+        )
+        if mla_layout not in ("contiguous", "zigzag"):
+            raise NotImplementedError(
+                "K3 PCP absorb-kv-only requires dense_mla_cp_layout=contiguous or zigzag"
+            )
+
+        delta = self.cache.get_seq_len_delta(is_mtp)
+        chunks = self._prepare_mla_chunks(cp, delta, mla_layout)
+        total_local = sum(chunk.local_rows for chunk in chunks)
+        if total_local == 0:
+            raise RuntimeError("K3 true-CP MLA chunk is empty")
+
+        x_local, restore_route = to_layout(x, cp, cp.orig_num_tokens, mla_layout)
+        if x_local.shape[0] != total_local:
+            raise RuntimeError("K3 CP MLA input rows do not match the CP chunks")
+
+        q, kv = self._project_cp_latent_kv(x_local, freqs_cis, total_local, delta)
+        kv_global = (
+            cp.allgather_zigzag_payload(kv)
+            if mla_layout == "zigzag"
+            else cp.allgather_ordered_payload(kv)
+        )
+        if kv_global.shape[0] != cp.orig_num_tokens:
+            raise RuntimeError(
+                "K3 true-CP latent K/V allgather did not restore global tokens"
+            )
+
+        kv_cache = self.cache.get_accessor(self.layer_id)
+        self._append_global_cp_latent_kv(kv_cache, kv_global, delta)
+        attn = self._run_mla_chunks(q, kv_cache, chunks)
+        attn = from_layout(attn, restore_route, cp)
+        return self._final_output(attn, x, x.shape[0])
+
+    def _prepare_mla_chunks(self, cp, delta, mla_layout):
+        if mla_layout == "zigzag":
+            chunks = cp.prepare_mla_zigzag_chunks(delta)
+        else:
+            chunks = [cp.prepare_mla_chunk(delta)]
+        return [chunk for chunk in chunks if chunk.local_rows]
+
+    def _project_cp_latent_kv(self, x, freqs_cis, n_tokens, delta):
+        (
+            q,
+            kv,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        ) = self._project_mla_q_latent_kv(
+            x,
+            freqs_cis,
+            n_tokens,
+            cp_active=False,
+            seq_len_delta=delta,
+        )
+        q = self._as_plain_tensor(q)
+        kv = self._as_plain_tensor(kv)
+        kv_lora = kv[..., : self.kv_lora_rank]
+        # The latent cache stores normalized kv_lora.
+        self.kv_a_layernorm(kv_lora, compute_dtype=kv_lora.dtype, out=kv_lora)
+        return q, kv
+
+    def _run_mla_chunks(self, q, kv_cache, chunks):
+        """Run local MLA attention for each contiguous or zigzag chunk.
+
+        ``q`` rows follow ``chunks`` order. Each chunk reads its own full KV
+        prefix from the paged latent cache and runs a separate causal ragged
+        attention, so early and late chunks can use different prefix lengths.
+        """
+        outputs = []
+        local_start = 0
+        for chunk in chunks:
+            k_attn, v_attn = self._expand_cached_latent_kv(kv_cache, chunk, q.dtype)
+            q_chunk = q[local_start : local_start + chunk.local_rows]
+            outputs.append(
+                self.attn_backend.prefill_ragged_qkvo(
+                    q_chunk,
+                    k_attn,
+                    v_attn,
+                    seq_len_delta=chunk.seq_len_delta,
+                    causal=True,
+                    softmax_scale=self.softmax_scale,
+                )
+            )
+            local_start += chunk.local_rows
+        return torch.cat(outputs, dim=0)
+
+    def _expand_cached_latent_kv(self, kv_cache, layout, dtype):
+        """Read a chunk's latent KV prefix and expand it to full K/V.
+
+        The paged cache stores normalized ``kv_lora`` plus ``k_pe``; expansion
+        must not normalize ``kv_lora`` again.
+        """
+        latent_full = self._read_cp_latent_prefix(kv_cache, layout)
+        if latent_full.dim() == 2:
+            latent_full = latent_full.unsqueeze(1)
+        total_len = latent_full.shape[0]
+        # The latent cache may be FP8; K/V must match the attention compute dtype.
+        kv_lora_full = latent_full[..., : self.kv_lora_rank].to(dtype).contiguous()
+        k_pe_full = latent_full[..., self.kv_lora_rank :].to(dtype).contiguous()
+        k_attn, v_attn = self._expand_latent_kv_to_full_kv(
+            kv_lora_full,
+            k_pe_full,
+            total_len,
+        )
+        return k_attn, v_attn
+
+    def _append_global_cp_latent_kv(self, kv_cache, global_kv, delta):
+        if "kv_lora_k_pe" in kv_cache.kv:
+            caches = [(kv_cache.kv["kv_lora_k_pe"], global_kv)]
+        elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
+            caches = [
+                (kv_cache.kv["kv_lora"], global_kv[..., : self.kv_lora_rank]),
+                (kv_cache.kv["k_pe"], global_kv[..., self.kv_lora_rank :]),
+            ]
+        else:
+            raise ValueError(
+                "K3 PCP absorb-kv-only requires MLA latent KV cache "
+                '("kv_lora_k_pe" or "kv_lora"+"k_pe"), got '
+                f"{list(kv_cache.kv.keys())}"
+            )
+        for cache, new_kv in caches:
+            append_to_paged_kv_cache(
+                cache,
+                kv_cache.block_table,
+                new_kv,
+                delta.delta_position_ids_tensor_device,
+                delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache.get_page_ids,
+                get_offs_in_page=kv_cache.get_offs_in_page,
+                use_i64_offsets=kv_cache.use_i64_offsets,
+            )
+
+    def _read_cp_latent_prefix(self, kv_cache, layout):
+        if "kv_lora_k_pe" in kv_cache.kv:
+            return read_from_paged_kv_cache(
+                kv_cache.kv["kv_lora_k_pe"],
+                kv_cache.block_table,
+                layout.cache_positions,
+                layout.cache_seq_ids,
+                use_i64_offsets=kv_cache.use_i64_offsets,
+            )
+        if "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
+            kv_lora = read_from_paged_kv_cache(
+                kv_cache.kv["kv_lora"],
+                kv_cache.block_table,
+                layout.cache_positions,
+                layout.cache_seq_ids,
+                use_i64_offsets=kv_cache.use_i64_offsets,
+            )
+            k_pe = read_from_paged_kv_cache(
+                kv_cache.kv["k_pe"],
+                kv_cache.block_table,
+                layout.cache_positions,
+                layout.cache_seq_ids,
+                use_i64_offsets=kv_cache.use_i64_offsets,
+            )
+            return torch.cat([kv_lora, k_pe], dim=-1)
+        raise ValueError(
+            "K3 PCP absorb-kv-only requires MLA latent KV cache "
+            '("kv_lora_k_pe" or "kv_lora"+"k_pe"), got '
+            f"{list(kv_cache.kv.keys())}"
+        )
+
 
 class KimiK3LinearAttention(nn.Module):
     """Kimi Delta Attention layer (adapted from GLM-5.3's linear attention).
@@ -638,6 +843,58 @@ class KimiK3LinearAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         seq_len_delta = self.cache.seq_len_delta
+        cp_ctx = get_cp_context()
+        if cp_ctx.step_active and not seq_len_delta.is_decode_stage:
+            out = self._forward_prefill_cp(
+                x,
+                seq_len_delta,
+                cp_ctx,
+                self.cache.get_accessor(self.layer_id),
+            )
+            if out is not None:
+                return out
+            # Unsupported CP shapes (short chunks, checkpoint pages, ...) use
+            # the replicated prefill path.
+            return self._forward_local(x, cp_active=True)
+
+        return self._forward_local(x)
+
+    def _project_qkv_gates(self, x):
+        """Project input tokens to QKV, output gate, f_a, and beta."""
+        if self.merge_qkv:
+            projected = self.in_proj_qkvgbf_a(x)
+            return torch.split(
+                projected,
+                [
+                    self.local_qkv_dim * 3,
+                    self.local_qkv_dim,
+                    self.head_dim,
+                    self.n_local_heads,
+                ],
+                dim=-1,
+            )
+        return (
+            torch.cat([self.q_proj(x), self.k_proj(x), self.v_proj(x)], dim=-1),
+            self.g_proj(x),
+            self.forget_gate.f_a_proj(x),
+            self.b_proj(x),
+        )
+
+    def _split_qkv_heads(self, qkv):
+        """Split projected QKV into per-head tensors."""
+        q, k, v = torch.split(qkv, [self.local_qkv_dim] * 3, dim=-1)
+        return tuple(h.reshape(h.shape[0], -1, self.head_dim) for h in (q, k, v))
+
+    def _final_output(self, out, g_out, n_tokens):
+        """Apply the output gate, gated norm, and output projection."""
+        gate = g_out.view(n_tokens, self.n_local_heads, self.head_dim)
+        out = self.o_norm(
+            out.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim)
+        ).view(n_tokens, -1)
+        return self.o_proj(out)
+
+    def _forward_local(self, x: torch.Tensor, cp_active: bool = False) -> torch.Tensor:
+        seq_len_delta = self.cache.seq_len_delta
         use_precomputed_states = seq_len_delta.is_classic_decoding
 
         cache_accessor = self.cache.get_accessor(self.layer_id)
@@ -671,23 +928,18 @@ class KimiK3LinearAttention(nn.Module):
                 device=recurrent_state.device,
             )
 
-        if self.merge_qkv:
-            projected = self.in_proj_qkvgbf_a(x)
-            qkv, g_out, f_a, beta_raw = torch.split(
-                projected,
-                [
-                    self.local_qkv_dim * 3,
-                    self.local_qkv_dim,
-                    self.head_dim,
-                    self.n_local_heads,
-                ],
+        qkv, g_out, f_a, beta_raw = self._project_qkv_gates(x)
+
+        if cp_active:
+            n_local = x.shape[0]
+            total_tokens = int(seq_len_delta.delta_total_len)
+            qkv, beta_raw, f_a, g_out = torch.split(
+                get_cp_context().allgather_hidden_states(
+                    torch.cat([qkv, beta_raw, f_a, g_out], dim=-1), None, None
+                ),
+                [qkv.shape[-1], beta_raw.shape[-1], f_a.shape[-1], g_out.shape[-1]],
                 dim=-1,
             )
-        else:
-            qkv = torch.cat([self.q_proj(x), self.k_proj(x), self.v_proj(x)], dim=-1)
-            g_out = self.g_proj(x)
-            beta_raw = self.b_proj(x)
-            f_a = self.forget_gate.f_a_proj(x)
 
         if use_precomputed_states:
             qkv, conv_state = causal_conv1d_update(
@@ -705,10 +957,7 @@ class KimiK3LinearAttention(nn.Module):
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
                 seq_len_list=seq_len_delta.delta_lens_list,
             )
-        q, k, v = torch.split(qkv, [self.local_qkv_dim] * 3, dim=-1)
-        q, k, v = map(
-            lambda h: h.reshape(h.size(0), -1, self.head_dim), (q, k, v)
-        )  # (total_len, n_heads, head_dim)
+        q, k, v = self._split_qkv_heads(qkv)
 
         if use_precomputed_states:
             gate_shape = (q.shape[0], 1)
@@ -749,6 +998,17 @@ class KimiK3LinearAttention(nn.Module):
                 impl=self.prefill_impl,
             )
 
+        if cp_active:
+            assert out.shape[:2] == (1, total_tokens), (
+                f"unexpected replicated CP output shape {tuple(out.shape)} "
+                f"for {total_tokens} global tokens"
+            )
+            local_rows, _ = get_cp_context().local_flat_indices(
+                n_local, total_tokens, out.device
+            )
+            out = out.index_select(1, local_rows)
+            g_out = g_out.index_select(0, local_rows)
+
         # mtp_size == 1: one state per request, written to the first in-place block.
         state_page_ids = write_page_ids[:, 0]
         update_singleton_paged_kv_cache(
@@ -777,12 +1037,113 @@ class KimiK3LinearAttention(nn.Module):
                 state_checkpoints,
             )
 
-        # Full-rank output gate + gated RMSNorm, then o_proj.
-        gate = g_out.view(x.shape[0], self.n_local_heads, self.head_dim)
-        out = self.o_norm(
-            out.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim)
-        ).view(x.shape[0], -1)
-        return self.o_proj(out)
+        return self._final_output(out, g_out, x.shape[0])
+
+    def _forward_prefill_cp(self, x, seq_len_delta, cp_ctx, cache_accessor):
+        """CP prefill for KDA, with layout handled by the shared CP helpers."""
+        prepared = prepare_linear_attention_cp_chunk(
+            x, seq_len_delta, cp_ctx, cache_accessor, self.conv_kernel_size
+        )
+        if prepared is None:
+            return None
+        (
+            plan,
+            x_local,
+            restore_route,
+            local_cu,
+            conv_state,
+            recurrent_state,
+            conv_state_local,
+            seq_lens,
+            cu,
+        ) = prepared
+        conv_kernel_size = int(self.conv_kernel_size)
+
+        qkv, g_out, f_a, beta_raw = self._project_qkv_gates(x_local)
+
+        # K3 and GLM share the linear-cache layout:
+        #   conv_state [seq, 3 * local_heads * head_dim, conv_kernel_size]
+        # Keep a shape guard so a future conv layout change fails explicitly.
+        if (
+            conv_state.shape[1] != qkv.shape[1]
+            or conv_state.shape[-1] != conv_kernel_size
+        ):
+            return None
+        conv_state_local = patch_conv_state_with_prev_tail(
+            qkv, conv_state_local, plan, cp_ctx, conv_kernel_size
+        )
+        qkv, new_conv_state_local = causal_conv1d_prefill(
+            qkv,
+            conv_state_local,
+            self.conv1d.weight,
+            local_cu,
+            impl=self.conv_impl,
+        )
+        q, k, v = self._split_qkv_heads(qkv)
+
+        g, beta = self.forget_gate(
+            x_local,
+            beta_raw.view(1, x_local.shape[0], self.n_local_heads),
+            f_a=f_a,
+        )
+        # Keep g/beta lazy: BoltOps KDA resolves the raw gate/beta producers to
+        # select its fused kernel. Materializing here would silently force the
+        # generic implementation.
+
+        m_local, ext_local = segment_affine_transition(
+            chunk_kimi_delta_attention,
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            g,
+            beta,
+            local_cu,
+            plan.local_lens,
+            use_qk_l2norm_in_kernel=True,
+            impl=self.prefill_impl,
+            state_v_first=self.kda_state_v_first,
+        )
+
+        m_all = all_gather_cp_last(m_local, cp_ctx)
+        ext_all = all_gather_cp_last(ext_local, cp_ctx)
+        initial_state = merge_cp_initial_state(
+            recurrent_state,
+            plan,
+            m_all,
+            ext_all,
+            cp_ctx.cp_rank,
+            state_v_first=self.kda_state_v_first,
+        )
+
+        out, last_state_local = chunk_kimi_delta_attention(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=local_cu,
+            seq_len_list=plan.local_lens,
+            impl=self.prefill_impl,
+        )
+        out = out[0]
+        out = self._final_output(out, g_out, x_local.shape[0])
+        out = from_layout(out, restore_route, cp_ctx)
+
+        conv_full, rec_full = reduce_linear_attention_cp_state(
+            conv_state,
+            new_conv_state_local,
+            recurrent_state,
+            last_state_local,
+            seq_lens,
+            cu,
+            plan,
+            cp_ctx,
+        )
+        write_linear_attention_cp_state(cache_accessor, conv_full, rec_full)
+        return out
 
 
 class ParallelMoeBlockKimiK3(ParallelMoeBlockDeepSeekV3):
@@ -1010,7 +1371,7 @@ class TransformerBlockKimiK3(TransformerBlock):
 
 @register_model(ModelType.KIMI_K3)
 class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
-    """Kimi-K3 text backbone with TP/DP/EP/PP (no CP/MTP), plus the optional
+    """Kimi-K3 text backbone with TP/DP/EP/CP/PP (no MTP), plus the optional
     MoonViT-V2 vision tower + PatchMergerMLPV2 projector for multimodal runs.
 
     Kimi-K3.1 is the same backbone with DeepSeek-style sparse attention (DSA)
@@ -1023,7 +1384,9 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
     PP carries the running stream and only the AttnRes blocks produced before
     the next stage. The vision modules live on PP stage 0 (same stage as
     embed_tokens); the multimodal cache stages per-request image features so
-    chunked prefill can consume them across chunk boundaries.
+    chunked prefill can consume them across chunk boundaries. PCP currently
+    supports contiguous layout with FlashAttention and
+    ``mla_absorb=absorb-kv-only``.
     """
 
     _CKPT_TEXT_PREFIX = "language_model."
@@ -1062,7 +1425,34 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
             and not get_global_args().infer.language_model_only
         )
         if get_cp_context().pcp_size > 1:
-            raise NotImplementedError("Kimi-K3 v1 does not support context parallelism")
+            infer = get_global_args().infer
+            if mla_absorb != "absorb-kv-only":
+                raise NotImplementedError(
+                    "Kimi-K3 PCP currently supports only "
+                    f"mla_absorb=absorb-kv-only, got {mla_absorb!r}"
+                )
+            if (
+                getattr(infer, "pcp_layout", "interleaved") != "contiguous"
+                or getattr(infer, "dense_mla_cp_layout", "contiguous")
+                not in ("contiguous", "zigzag")
+                or infer.attn_type != "flash_attn"
+            ):
+                raise NotImplementedError(
+                    "Kimi-K3 PCP currently requires "
+                    "infer.pcp_layout=contiguous, "
+                    "infer.dense_mla_cp_layout=contiguous|zigzag and "
+                    "infer.attn_type=flash_attn"
+                )
+            from chitu.kv_cache.registry import kv_cache_quant_type_for_key
+
+            kv_cache_quant_type = kv_cache_quant_type_for_key(
+                getattr(params, "quant_config", None), "kv_lora"
+            )
+            if kv_cache_quant_type not in (None, "fp8_e5m2"):
+                raise NotImplementedError(
+                    "Kimi-K3 PCP does not support scaled FP8 latent KV cache: "
+                    f"{kv_cache_quant_type}"
+                )
         if int(get_global_args().infer.mtp_size) > 1:
             raise NotImplementedError("Kimi-K3 has no MTP layers")
         if get_global_args().infer.fuse_shared_experts:
@@ -1248,6 +1638,19 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
         self, tokens: torch.Tensor, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
+        delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
+        tokens, _, freqs_cis = self.cp_context.split_prefill(
+            tokens=tokens,
+            hiddens=None,
+            freqs_cis=freqs_cis,
+            total_tokens=delta_total,
+        )
+        if self.cp_context.step_active:
+            self.cp_context.prepare_local_lengths(
+                self.cache_dict["main"].seq_len_delta,
+                int(tokens.shape[0]),
+                is_decode_stage=False,
+            )
         h = self._pre_layers(tokens, **args)
         h, block_residual = self._run_layers(h, freqs_cis)
         h = self._final_attn_res(h, block_residual)
@@ -1260,6 +1663,7 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
     @override
     @torch.inference_mode()
     def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
+        self.cp_context.set_step_active(False)
         h = self._pre_layers(tokens)
         h, block_residual = self._run_layers(h, freqs_cis)
         h = self._final_attn_res(h, block_residual)
@@ -1275,9 +1679,16 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
         **args,
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
+        delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
         if self.pp_stage == 0:
             if tokens is None or hiddens is not None:
                 raise ValueError("Kimi-K3 first PP stage requires tokens only")
+            tokens, _, freqs_cis = self.cp_context.split_prefill(
+                tokens=tokens,
+                hiddens=None,
+                freqs_cis=freqs_cis,
+                total_tokens=delta_total,
+            )
             h = self._pre_layers(tokens, **args)
             block_residual = None
         else:
@@ -1285,7 +1696,19 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
                 raise ValueError(
                     "Kimi-K3 later PP stages require an AttnRes payload only"
                 )
+            _, hiddens, freqs_cis = self.cp_context.split_prefill(
+                tokens=None,
+                hiddens=hiddens,
+                freqs_cis=freqs_cis,
+                total_tokens=delta_total,
+            )
             h, block_residual = self._unpack_pipeline(hiddens)
+        if self.cp_context.step_active:
+            self.cp_context.prepare_local_lengths(
+                self.cache_dict["main"].seq_len_delta,
+                int(h.shape[0]),
+                is_decode_stage=False,
+            )
         h, block_residual = self._run_layers(h, freqs_cis, block_residual)
         if self.pp_stage != self.pp_end_stage:
             return self._pack_pipeline(h, block_residual)
@@ -1297,6 +1720,7 @@ class TransformerKimiK3(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
     @override
     @torch.inference_mode()
     def decode_pipeline(self, middle_state, freqs_cis: BatchedFreqsCis):
+        self.cp_context.set_step_active(False)
         if self.pp_stage == 0:
             h = self._pre_layers(middle_state)
             block_residual = None

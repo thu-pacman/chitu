@@ -989,12 +989,17 @@ class AttentionDeepSeekV3(Attention):
         )
 
     def _expand_latent_kv_to_full_kv(
-        self, latent: torch.Tensor, n_tokens: int
+        self,
+        kv_lora: torch.Tensor,
+        k_pe: torch.Tensor,
+        n_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """K [n, heads, nope + rope] and V [n, heads, v] from the normalized latent
-        [kv_lora | k_pe] of n tokens (any row stride)."""
-        latent = latent.reshape(n_tokens, self.kv_lora_rank + self.qk_rope_head_dim)
-        kv_lora, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        """K [n, heads, nope + rope] and V [n, heads, v] from kv_lora and k_pe.
+
+        The latent KV cache already stores normalized ``kv_lora``.
+        """
+        kv_lora = self._as_plain_tensor(kv_lora)
+        k_pe = self._as_plain_tensor(k_pe).reshape(n_tokens, self.qk_rope_head_dim)
         kv_full = self.kv_b_proj(kv_lora.contiguous()).view(
             n_tokens, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
         )
@@ -1110,7 +1115,15 @@ class AttentionDeepSeekV3(Attention):
                     ],
                     dim=-1,
                 )
-        k_attn, v_attn = self._expand_latent_kv_to_full_kv(latent_full, total_len)
+        latent_full = latent_full.reshape(
+            total_len, self.kv_lora_rank + self.qk_rope_head_dim
+        )
+        kv_lora_full, k_pe_full = latent_full.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        k_attn, v_attn = self._expand_latent_kv_to_full_kv(
+            kv_lora_full, k_pe_full, total_len
+        )
         x = self.attn_backend.prefill_ragged_qkvo(
             q,
             k_attn,
@@ -1247,9 +1260,7 @@ class AttentionDeepSeekV3(Attention):
                 q = self._as_plain_tensor(q)
                 # KV layernorm
                 self.kv_a_layernorm(kv_lora, compute_dtype=kv_lora.dtype, out=kv_lora)
-                k, v = self._expand_latent_kv_to_full_kv(
-                    self._as_plain_tensor(kv), n_tokens
-                )
+                k, v = self._expand_latent_kv_to_full_kv(kv_lora, k_pe, n_tokens)
 
                 if has_indexer_weights:
                     assert self.indexer_cache is not None
