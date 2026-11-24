@@ -754,6 +754,10 @@ class Task:
 
         # PD related
         self.pd_prefill_engine_rank: Optional[int] = None
+        # Preserve the bounded KV release grace after transfer bookkeeping is
+        # removed. Cleared on known completion; otherwise it lives with the
+        # task until cache finalization permits removal.
+        self.kv_transfer_pending = False
 
         # PD scheduler runtime information
         self.pd_scheduler_info: PDSchedulerInfo = PDSchedulerInfo()

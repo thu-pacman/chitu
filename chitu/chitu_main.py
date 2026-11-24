@@ -1844,6 +1844,10 @@ def chitu_run_main_rank():
         dp_local_removed_task_ids = Backend.schedulers[i].update(task_ids_per_dp[i])
         removed_task_ids += dp_local_removed_task_ids
     Backend.executor.end_task_step(removed_task_ids)
+    if Backend.args.multi_inst.role == "decode":
+        # Reap after the final task is removed: an idle service may not run
+        # another scheduling step to finish its deferred transfer cleanup.
+        get_pd_scheduler_instance()._reap_deferred_kv_teardown()
     return backend_payload_type
 
 
