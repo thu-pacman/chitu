@@ -1569,11 +1569,13 @@ class Executor:
             for cache in Backend.cache_dict.values():
                 cache.finalize_cache_all_decode(tasks)
             PrometheusMetricsCollector.update_GPU_usage()
-            PrometheusMetricsCollector.update_task_counts()
             if self.rank > 0:
                 for task_id in tasks.task_ids:
                     if task_id in TaskPool.pool:
                         TaskPool.remove(task_id)
+            # Non-main ranks remove the ended tasks right here, so count only after
+            # that removal. Counting first would keep their gauge one batch high.
+            PrometheusMetricsCollector.update_task_counts()
             return payload_type
 
         TaskCollector.step(tasks)

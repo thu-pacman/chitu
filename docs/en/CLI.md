@@ -1159,6 +1159,15 @@ Prometheus server scrapes PrometheusMetricsCollectors every ${prometheus_scrape_
 
 *Default: `1`.*
 
+### Argument `metrics.gpu_memory_refresh_interval_s`
+
+Minimum interval between rebuilds of the GPU memory gauges, in seconds. These gauges
+ask NVML for the device's process list, which is expensive. `prometheus_scrape_interval`
+still controls the scrape cadence; this setting only controls the expensive GPU memory
+rebuild. Defaults to the scrape interval; set 0 to rebuild on every request.
+
+*Default: `${metrics.prometheus_scrape_interval}`.*
+
 ### Argument `metrics.log_interval`
 
 Print metrics every this seconds to terminal

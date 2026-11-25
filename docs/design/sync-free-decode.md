@@ -345,7 +345,7 @@ harness 上的分辨率下限（配对的 Δ 的标准误可到 0.2 pp 量级）
 |---|---|
 | `kv_cache.py::_upd_gpu_block_table()` | 行内容与上一步相同（这一步没有请求跨 block 边界）就整段短路：跳过后面的 `set_shape()` 与逐行 diff + 拷贝 |
 | `sampler.py::prepare_draft_sample_params()` | 逐行 `(temperature, top_k, top_p)` 签名不变就复用上一步的 device 张量，跳过 H2D 与 pin 分配 |
-| `prometheus_collector.py` | 「有请求结束」的步都要重建的 gauge（`update_GPU_usage()` 要问一次 NVML 设备进程表）改成按抓取周期重建一次；`CHITU_METRICS_REFRESH_INTERVAL_S = 0` 恢复旧行为 |
+| `prometheus_collector.py` | 「有请求结束」的步都要重建的 gauge 里，只有 GPU 显存的 NVML 查询（`update_GPU_usage()` 要问一次设备进程表）按 `metrics.gpu_memory_refresh_interval_s` 节流（默认等于抓取周期）；KV cache 和请求数 gauge 是事件驱动的 setter，每次请求事件都要更新，否则最后一次请求结束时的那次更新会被永久丢掉。把这个配置设成 0 可以关闭节流 |
 | `kv_cache.py::_upd_read_page_ids()` / `_update_write_page_ids()` | 页表上传从 pageable `torch.tensor()` 改成 pinned + `non_blocking` 的 `create_tensor()` |
 
 前三处的判据都是**行为等价**（相等则跳过），不是策略选择；只有 gauge 那条改变了 `/metrics` 的刷新语义，
