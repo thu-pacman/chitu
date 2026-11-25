@@ -72,6 +72,37 @@ Bad comment:
 
 Use the same name for the same thing. Use different names for different things.
 
+## Abbreviations should not sacrifice clarity
+
+It's generally preferred NOT to use abbreviations. If you really need to use abbreviations, for example in a variable name or in a table cell, define it explicitly.
+
+Good example 1:
+
+> Experiment result:
+>
+> | Case | Latency (ms) |
+> |------|--------------|
+> | A    | 100          |
+> | B    | 200          |
+
+Good example 2:
+
+> Experiment result (latency denoted as L):
+>
+> | Case | L (ms) |
+> |------|--------|
+> | A    | 100    |
+> | B    | 200    |
+
+Bad example:
+
+> Experiment result:
+>
+> | Case | L (ms) |
+> |------|--------|
+> | A    | 100    |
+> | B    | 200    |
+
 ## User-facing configs should be worth tuning by users
 
 When you want to add a new item in a config file, or a new environment variable, or a new command-line option, please consider the following.
