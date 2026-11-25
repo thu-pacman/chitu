@@ -31,8 +31,17 @@ fi
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
+# NOTE: Every pip step below that reaches the network mounts only pip's downloaded files
+#       (`http-v2`), never the whole `~/.cache/pip`. The whole cache would also keep the wheels pip
+#       builds itself, and those carry no record of the environment they were built in. Reusing
+#       such a wheel after a base image change would put binaries compiled against the old torch
+#       and MACA into the new image. Caching the downloads alone still saves the network: a
+#       rebuilt layer fetches only the packages that changed.
+# NOTE: Don't add `--no-cache-dir` (or `PIP_NO_CACHE_DIR`) as a layer-size hygiene habit: it tells
+#       pip to skip the cache altogether, so this mount would stay empty and every rebuild would
+#       download everything again.
 # Upgrade pip and set mirror. The mirror should be set AFTER upgrading pip
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
     if [ "${pypi_mirror}" != "" ]; then \
         pip install -U "pip<25.3" -i "${pypi_mirror}"; \
     else \
@@ -153,9 +162,10 @@ fi
 # NOTE: Test dependencies include:
 # - pytest is for test/pytest (for all platforms).
 # - matplotlib is for op benchmarks in test/pytest, and benchmarks/visualize_response.py (for all platforms).
-RUN if [ "${enable_test}" = "true" ]; then \
-    pip install pytest matplotlib; \
-fi
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
+    if [ "${enable_test}" = "true" ]; then \
+        pip install pytest matplotlib; \
+    fi
 
 # Build-only dependencies (Cython, pybind11, ninja, ...) are needed by the
 # local kernel packages and by the wheel stage. Install them in the base so
@@ -163,7 +173,7 @@ fi
 # at the end of the base stage so a change here does not rerun the heavy base
 # setup above.
 COPY ./requirements-build.txt /tmp/requirements-build.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
     pip install -r /tmp/requirements-build.txt
 
 WORKDIR /workspace/chitu
@@ -235,11 +245,18 @@ FROM base AS dependency_installer
 WORKDIR /workspace/chitu
 COPY --from=dependency_resolver /tmp/requirements-pypi.txt /tmp/requirements-pypi.txt
 COPY ./script/pip-multi-indices.sh ./script/pip-multi-indices.sh
-RUN ./script/pip-multi-indices.sh install --no-build-isolation -r /tmp/requirements-pypi.txt \
+# NOTE: This stage may compile, and only the downloads are cached (see the pip cache note at the
+#       `pip install -U` step), so everything it compiles is rebuilt instead of taken from a stale
+#       wheel.
+# NOTE: The wheels this stage builds are only needed during the install, and this stage is the base
+#       of the final image, so delete them instead of shipping them inside the image.
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
+    ./script/pip-multi-indices.sh install --no-build-isolation -r /tmp/requirements-pypi.txt \
     -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "tokenizers" -e "xgrammar" -e "pytest" -e "build" -e "click") \
     -i "${pypi_mirror}" \
     -i https://pypi.org/simple \
-    --timeout 60 --retries 10
+    --timeout 60 --retries 10 && \
+    rm -rf /root/.cache/pip/wheels
 
 #####################################
 # Local kernel stage
