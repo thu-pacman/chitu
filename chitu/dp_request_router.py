@@ -534,9 +534,9 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         block_size = self.instances_block_size.get(local_instance_id)
         if not block_size or block_size <= 0:
             return []
-        prompt_tokens = list(getattr(request, "prompt_tokens", []) or [])
+        prompt_tokens = request.prompt_tokens
         if include_generated_tokens:
-            prompt_tokens.extend(request.generated_tokens)
+            prompt_tokens = [*prompt_tokens, *request.generated_tokens]
         if not prompt_tokens:
             return []
 
@@ -568,20 +568,6 @@ class PrefixCacheAwarePolicy(LoadBalancer):
                 break
             num_hits += 1
         return num_hits
-
-    def _estimate_pending_tokens(
-        self, request: UserRequest, local_instance_id: int
-    ) -> int:
-        prompt_tokens = list(request.prompt_tokens)
-        block_size = self.instances_block_size.get(local_instance_id)
-        if not block_size:
-            return len(prompt_tokens)
-        req_block_hashes = self.build_req_block_hashes(request, local_instance_id)
-        return max(
-            0,
-            len(prompt_tokens)
-            - self.num_hit_blocks(local_instance_id, req_block_hashes) * block_size,
-        )
 
     def select_scheduler(
         self,
@@ -630,11 +616,25 @@ class PrefixCacheAwarePolicy(LoadBalancer):
 
         # --- Layer 2: prefix-cache gate ---
         best_scheduler = eligible_ids[0]
-        best_num_hits = -1
+        best_num_hits = 0
         best_total = 0
         hashes_by_block_size: dict[Optional[int], list[Optional[str]]] = {}
+        first_hashes: dict[int, str] = {}
+        prompt = request.prompt_tokens
         for sid in eligible_ids:
             block_size = self.instances_block_size.get(sid)
+            cache = self.cached_blocks.get(sid)
+            if not cache or not block_size or block_size <= 0:
+                continue
+            if len(prompt) < block_size:
+                continue
+            if block_size not in first_hashes:
+                first_hashes[block_size] = hash_fn_cached(
+                    (NONE_BLK_HASH, tuple(prompt[:block_size]))
+                )
+            # A cache miss on the first block rules out the entire chain.
+            if first_hashes[block_size] not in cache:
+                continue
             if block_size not in hashes_by_block_size:
                 hashes_by_block_size[block_size] = self.build_req_block_hashes(
                     request, sid
@@ -666,12 +666,15 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         local_instance_id: int,
         pending_tokens: Optional[int] = None,
     ) -> None:
+        hashes = self.build_req_block_hashes(request, local_instance_id)
+        if pending_tokens is None:
+            block_size = self.instances_block_size.get(local_instance_id, 0)
+            hit_tokens = self.num_hit_blocks(local_instance_id, hashes) * block_size
+            pending_tokens = max(0, len(request.prompt_tokens) - hit_tokens)
         super().remember_request(request, local_instance_id, pending_tokens)
         self.req_to_scheduler[request.request_id] = local_instance_id
         self.req_to_request[request.request_id] = request
-        # Populate the shadow cache at SELECT time, the first-token hook
-        # re-inserts (recency refresh) .
-        self.insert_req_blocks(request.request_id)
+        self._insert_block_hashes(local_instance_id, hashes)
 
     def insert_req_blocks(
         self, request_id: str, *, include_generated_tokens: bool = False
@@ -689,6 +692,11 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             local_instance_id,
             include_generated_tokens=include_generated_tokens,
         )
+        self._insert_block_hashes(local_instance_id, req_block_hashes)
+
+    def _insert_block_hashes(
+        self, local_instance_id: int, req_block_hashes: list[Optional[str]]
+    ) -> None:
         lru = self.cached_blocks.setdefault(local_instance_id, OrderedDict())
         cap = self.instances_num_total_blocks.get(local_instance_id, 0)
         if cap <= 0:
