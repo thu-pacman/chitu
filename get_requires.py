@@ -99,7 +99,7 @@ install_requires = [
     "msgpack",
     "plum-dispatch",
     "netifaces",
-    "prometheus-client>=0.19.0",
+    "prometheus-client>=0.20.0",
     "prometheus-api-client>=0.7.0",
     "xgrammar>=0.2",
     "openai",
