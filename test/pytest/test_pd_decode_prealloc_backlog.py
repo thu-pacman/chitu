@@ -60,9 +60,12 @@ def manager(monkeypatch, incoming, preallocated, limit):
         pd, "test_inject_exception_prefill_done_missing", lambda *args: False
     )
 
-    def allocate(rid, tokens):
-        tasks[rid].new_cache_ids = {"main": [int(rid)]}
-        return KVCacheCapacityStatus.OK, 0, {"main": 0}
+    # Test double for `Scheduler._prepare_pd_decode_kvcache(task, pd_prealloc_tokens,
+    # num_cached_tokens)`: it fills `task.new_cache_ids` and returns the capacity status together
+    # with the per-cache-manager hit block counts.
+    def allocate(task, pd_prealloc_tokens, num_cached_tokens):
+        task.new_cache_ids = {"main": [int(task.task_id)]}
+        return KVCacheCapacityStatus.OK, {"main": 0}
 
     monkeypatch.setattr(
         Backend,
