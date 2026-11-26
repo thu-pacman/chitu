@@ -289,6 +289,7 @@ class MetricsConfig:
     prometheus_config_file: str = MISSING
     prometheus_data_dir: str = MISSING
     prometheus_scrape_interval: int = MISSING
+    gpu_memory_refresh_interval_s: float = MISSING
     log_interval: int = MISSING
     grafana_enabled: bool = MISSING
     grafana_host: str = MISSING

@@ -158,8 +158,17 @@ RUN --mount=type=secret,id=tos_id \
     rm -rf /workspace/grafana && \
     grafana-server -v
 
+# NOTE: Every pip step below that reaches the network mounts only pip's downloaded files
+#       (`http-v2`), never the whole `~/.cache/pip`. The whole cache would also keep the wheels pip
+#       builds itself, and those carry no record of the environment they were built in. Reusing
+#       such a wheel after a base image change would put binaries compiled against the old torch
+#       and CUDA into the new image. Caching the downloads alone still saves the network: a
+#       rebuilt layer fetches only the packages that changed.
+# NOTE: Don't add `--no-cache-dir` (or `PIP_NO_CACHE_DIR`) as a layer-size hygiene habit: it tells
+#       pip to skip the cache altogether, so this mount would stay empty and every rebuild would
+#       download everything again.
 # Upgrade pip and set mirror. The mirror should be set AFTER upgrading pip
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
     if [ "${pypi_mirror}" != "" ]; then \
         pip install -U "pip<25.3" -i "${pypi_mirror}"; \
     else \
@@ -173,10 +182,11 @@ fi
 # NOTE: Test dependencies include:
 # - pytest is for test/pytest (for all platforms).
 # - matplotlib is for op benchmarks in test/pytest, and benchmarks/visualize_response.py (for all platforms).
-RUN if [ "${enable_test}" = "true" ]; then \
-    apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping && \
-    pip install pytest lark-oapi matplotlib; \
-fi
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
+    if [ "${enable_test}" = "true" ]; then \
+        apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping && \
+        pip install pytest lark-oapi matplotlib; \
+    fi
 
 # Forcefully remove torch's constraint on nvidia-nvshmem-cu.*, because it is
 # too strict, and conflict with our requirements.
@@ -203,7 +213,7 @@ RUN if [[ "${optional_deps}" == *"deep_ep"* ]]; then \
         exit 1; \
     fi \
 fi
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
     pip install -r /tmp/requirements-build.txt \
         -c <(pip list --format freeze | grep -v -e "setuptools" -e "nvidia-nvshmem-cu.*")
 
@@ -244,8 +254,11 @@ COPY --from=dependency_resolver /tmp/requirements-pypi.txt /tmp/requirements-pyp
 
 COPY ./script/pip-multi-indices.sh ./script/pip-multi-indices.sh
 
-# NOTE: Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
-#       compile at install time, and the compile results are environment dependent.
+# NOTE: This stage may compile, and only the downloads are cached (see the pip cache note at the
+#       `pip install -U` step), so everything it compiles is rebuilt instead of taken from a stale
+#       wheel.
+# NOTE: The wheels this stage builds are only needed during the install, and this stage is the base
+#       of the final image, so delete them instead of shipping them inside the image.
 # NOTE: Always set `--no-build-isolation` for packages dependent on `torch`, because: 1) `torch`
 #       is a build-time dependency. 2) We must use the specific `torch` version already installed
 #       in the image, which matches the hardware. If not, `pip` will download arbitrary `torch`
@@ -253,13 +266,18 @@ COPY ./script/pip-multi-indices.sh ./script/pip-multi-indices.sh
 # NOTE: We use `./script/pip-multi-indices.sh` to set `https://pypi.org/simple` as a fallback,
 #       because some optional dependencies (e.g. `mooncake-transfer-engine-cuda13`) is not avaiable
 #       in some PyPI mirrors.
-RUN ./script/pip-multi-indices.sh install --no-build-isolation -r /tmp/requirements-pypi.txt \
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
+    ./script/pip-multi-indices.sh install --no-build-isolation -r /tmp/requirements-pypi.txt \
     -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest" -e "build" -e "click") \
     -i "${pypi_mirror}" \
     -i https://pypi.org/simple \
-    --timeout 60 --retries 10
+    --timeout 60 --retries 10 && \
+    rm -rf /root/.cache/pip/wheels
 
-RUN set -eux; \
+# The jit cache wheel is large and comes from a bare URL, so its download is cached like the
+# step above.
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
+    set -eux; \
     VER="$(python -c "import importlib.metadata as m; \
 print(next((d.version for d in m.distributions() if (d.metadata.get('Name') or '').lower()=='flashinfer-python'), ''))")"; \
     if [ -n "${VER}" ]; then \

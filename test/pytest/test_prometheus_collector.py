@@ -13,7 +13,12 @@ from chitu.global_vars import set_global_args
 def set_default_global_args():
     # global_args here is useless, but it must exists
     set_global_args(
-        OmegaConf.create({"infer": {"mtp_size": 1}}),
+        OmegaConf.create(
+            {
+                "infer": {"mtp_size": 1},
+                "metrics": {"gpu_memory_refresh_interval_s": 1.0},
+            }
+        ),
         need_ensure=False,
         need_preprocess=False,
     )
@@ -160,21 +165,125 @@ def test_gauge_refresh_is_throttled(monkeypatch):
     """
     from chitu.metrics import prometheus_collector as pc
 
-    # Pin the interval through the override, so the case does not depend on whatever
-    # `metrics.prometheus_scrape_interval` the global args (or a caller's environment)
-    # happen to carry -- with an interval of 0 the first assertion would flip.
-    monkeypatch.setenv("CHITU_METRICS_REFRESH_INTERVAL_S", "1.0")
+    # Pin the interval, so the case does not depend on whatever global config a
+    # previous test left behind -- with an interval of 0 the first assertion would flip.
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {"mtp_size": 1},
+                "metrics": {"gpu_memory_refresh_interval_s": 1.0},
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
     monkeypatch.setattr(pc, "_gauge_refreshed_at", {})
-    assert pc._gauge_refresh_due("gpu_usage") is True
-    assert pc._gauge_refresh_due("gpu_usage") is False
-    assert pc._gauge_refresh_due("task_counts") is True  # per gauge, not global
-    assert pc._gauge_refresh_due("task_counts") is False
+    assert pc._gauge_refresh_due("gpu_memory") is True
+    assert pc._gauge_refresh_due("gpu_memory") is False
+    assert pc._gauge_refresh_due("another_gauge") is True  # per gauge, not global
+    assert pc._gauge_refresh_due("another_gauge") is False
 
-    pc._gauge_refreshed_at["gpu_usage"] -= pc._gauge_refresh_interval_s()
-    assert pc._gauge_refresh_due("gpu_usage") is True
-    # The override takes precedence over the configured scrape period.
+    pc._gauge_refreshed_at["gpu_memory"] -= pc._gauge_refresh_interval_s()
+    assert pc._gauge_refresh_due("gpu_memory") is True
     # Zero disables throttling, allowing every call to rebuild the gauge.
-    monkeypatch.setenv("CHITU_METRICS_REFRESH_INTERVAL_S", "0")
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {"mtp_size": 1},
+                "metrics": {"gpu_memory_refresh_interval_s": 0.0},
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
     assert pc._gauge_refresh_interval_s() == 0.0
-    assert pc._gauge_refresh_due("gpu_usage") is True
-    assert pc._gauge_refresh_due("gpu_usage") is True
+    assert pc._gauge_refresh_due("gpu_memory") is True
+    assert pc._gauge_refresh_due("gpu_memory") is True
+    set_default_global_args()
+
+
+def _gauge_value(gauge, rank: int, dp_id: int, instance_id: int) -> float:
+    for sample in gauge.collect()[0].samples:
+        labels = sample.labels
+        if (
+            labels.get("rank") == str(rank)
+            and labels.get("dp_id") == str(dp_id)
+            and labels.get("instance_id") == str(instance_id)
+        ):
+            return sample.value
+    raise AssertionError(
+        f"no sample for rank={rank} dp_id={dp_id} instance_id={instance_id}"
+    )
+
+
+def test_update_task_counts_is_not_throttled(monkeypatch):
+    """Every request event must reach the task count gauges.
+
+    `update_task_counts` is not periodic: callers run it when a request starts or
+    ends, and nothing refreshes the gauges in between. If a call is skipped because
+    a timer says "too soon", the count stays stale until the next request event --
+    and an idle server never produces one, so `Running: N reqs` stays wrong.
+    """
+    from chitu.metrics import prometheus_collector as pc
+
+    set_default_global_args()
+    monkeypatch.setattr(
+        "chitu.metrics.prometheus_collector.get_dp_group",
+        lambda: MockGroup(0, 0),
+    )
+    # A very long interval makes the point sharp: even then, the second event must
+    # land. The fix is that task counts do not consult the interval at all.
+    monkeypatch.setattr(pc, "_gauge_refresh_interval_s", lambda: 3600.0)
+    monkeypatch.setattr(pc, "_gauge_refreshed_at", {})
+    counts = iter([(3, 2), (0, 0)])
+    monkeypatch.setattr(pc, "count_tasks_for_dp_rank", lambda dp_id: next(counts))
+
+    with metrics_runtime_context(
+        MetricContext(rank=0, rank_in_dp=0, dp_rank=0, inst_id=0),
+        start_http_server=False,
+    ):
+        collector = PrometheusMetricsCollector.get_instance(is_create=True)
+        PrometheusMetricsCollector.update_task_counts()
+        assert _gauge_value(collector.running_requests, 0, 0, 0) == 3
+        assert _gauge_value(collector.waiting_requests, 0, 0, 0) == 2
+
+        # No sleep: this call is inside the refresh interval, and it must still win.
+        PrometheusMetricsCollector.update_task_counts()
+        assert _gauge_value(collector.running_requests, 0, 0, 0) == 0
+        assert _gauge_value(collector.waiting_requests, 0, 0, 0) == 0
+
+
+def test_update_GPU_usage_keeps_kvcache_unthrottled(monkeypatch):
+    """The GPU refresh interval must not also freeze the KV cache gauges.
+
+    `update_GPU_usage` used to return as soon as the NVML throttle said "not yet",
+    which skipped the KV cache gauges too. Only the NVML memory query is expensive
+    enough to throttle; the KV counters are plain reads and must follow every
+    request event, or the last update before an idle period is lost.
+    """
+    from chitu.metrics import prometheus_collector as pc
+
+    set_default_global_args()
+    monkeypatch.setattr(
+        "chitu.metrics.prometheus_collector.get_dp_group",
+        lambda: MockGroup(0, 0),
+    )
+    monkeypatch.setattr(pc, "_gauge_refresh_interval_s", lambda: 3600.0)
+    monkeypatch.setattr(pc, "_gauge_refreshed_at", {})
+    cache = Monkcachemanager(num_blocks=100, num_free_blocks=50)
+    monkeypatch.setattr(Backend, "cache_dict", {"main": cache})
+
+    with metrics_runtime_context(
+        MetricContext(rank=0, rank_in_dp=0, dp_rank=0, inst_id=0),
+        start_http_server=False,
+    ):
+        collector = PrometheusMetricsCollector.get_instance(is_create=True)
+        PrometheusMetricsCollector.update_GPU_usage()
+        assert _gauge_value(collector.kv_cache_usage, 0, 0, 0) == 0.5
+        assert _gauge_value(collector.used_blocks, 0, 0, 0) == 50
+
+        # The NVML gate is closed now (3600 s), but the KV counters changed.
+        cache.num_free_blocks = 100
+        PrometheusMetricsCollector.update_GPU_usage()
+        assert _gauge_value(collector.kv_cache_usage, 0, 0, 0) == 0.0
+        assert _gauge_value(collector.used_blocks, 0, 0, 0) == 0

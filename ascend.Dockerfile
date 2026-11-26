@@ -24,8 +24,17 @@ fi
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
+# NOTE: Every pip step below that reaches the network mounts only pip's downloaded files
+#       (`http-v2`), never the whole `~/.cache/pip`. The whole cache would also keep the wheels pip
+#       builds itself, and those carry no record of the environment they were built in. Reusing
+#       such a wheel after a base image change would put binaries compiled against the old torch
+#       into the new image. Caching the downloads alone still saves the network: a rebuilt layer
+#       fetches only the packages that changed.
+# NOTE: Don't add `--no-cache-dir` (or `PIP_NO_CACHE_DIR`) as a layer-size hygiene habit: it tells
+#       pip to skip the cache altogether, so this mount would stay empty and every rebuild would
+#       download everything again.
 # Upgrade pip and set mirror. The mirror should be set AFTER upgrading pip
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
     if [ "${pypi_mirror}" != "" ]; then \
         pip install -U "pip<25.3" -i "${pypi_mirror}"; \
     else \
@@ -39,10 +48,11 @@ fi
 # NOTE: Test dependencies include:
 # - pytest is for test/pytest (for all platforms).
 # - matplotlib is for op benchmarks in test/pytest, and benchmarks/visualize_response.py (for all platforms).
-RUN if [ "${enable_test}" = "true" ]; then \
-    apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping && \
-    pip install pytest matplotlib; \
-fi
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
+    if [ "${enable_test}" = "true" ]; then \
+        apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping && \
+        pip install pytest matplotlib; \
+    fi
 RUN apt update -y && apt install -y infiniband-diags curl
 
 # Download prometheus
@@ -129,19 +139,19 @@ RUN --mount=type=secret,id=tos_id \
     rm -rf /workspace/grafana && \
     grafana-server -v
 
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
     if [ "$(lscpu | grep x86)" ]; then \
         pip install -U torch==2.9.0+cpu -i https://download.pytorch.org/whl/cpu; \
     else \
         pip install -U torch==2.9.0; \
     fi
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
     pip install pyyaml setuptools
 
 # Build dependencies are needed by the wheel stage and by the local AscendC
 # kernel package installed in the dependency installer.
 COPY ./requirements-build.txt /tmp/requirements-build.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
     pip install -r /tmp/requirements-build.txt
 
 WORKDIR /workspace/chitu
@@ -184,8 +194,15 @@ FROM base AS dependency_installer
 WORKDIR /workspace/chitu
 ENV TORCH_DEVICE_BACKEND_AUTOLOAD=0
 COPY --from=dependency_resolver /tmp/requirements-pypi.txt /tmp/requirements-pypi.txt
-RUN pip install torch-npu==2.9.0.post9
-RUN if [ -n "${pypi_mirror}" ]; then \
+# NOTE: This stage may compile, and only the downloads are cached (see the pip cache note at the
+#       `pip install -U` step), so everything it compiles is rebuilt instead of taken from a stale
+#       wheel.
+# NOTE: The wheels this stage builds are only needed during the install, and this stage is the base
+#       of the final image, so delete them instead of shipping them inside the image.
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
+    pip install torch-npu==2.9.0.post9
+RUN --mount=type=cache,target=/root/.cache/pip/http-v2 \
+    if [ -n "${pypi_mirror}" ]; then \
         pip install --no-build-isolation -r /tmp/requirements-pypi.txt \
             -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "tokenizers" -e "xgrammar" -e "pytest" -e "build" -e "click") \
             -i "${pypi_mirror}" \
@@ -196,7 +213,8 @@ RUN if [ -n "${pypi_mirror}" ]; then \
             -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "tokenizers" -e "xgrammar" -e "pytest" -e "build" -e "click") \
             -i https://pypi.org/simple \
             --timeout 60 --retries 10; \
-    fi
+    fi && \
+    rm -rf /root/.cache/pip/wheels
 
 #####################################
 # Local kernel stage

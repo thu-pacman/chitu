@@ -33,34 +33,34 @@ from chitu.metrics.definitions import MetricContext, MetricType, raw_metrics_for
 
 logger = logging.getLogger(__name__)
 
-# How long a gauge reading below may be reused, in seconds. Rebuilding faster than
+# How long the GPU memory gauges may reuse a reading, in seconds. Rebuilding faster than
 # Prometheus scrapes is invisible -- and not free (`update_GPU_usage` asks NVML for the
 # device's process list, ~14 ms on a loaded node, and decode asks for a rebuild on every
-# step that retires a request) -- so the interval follows the configured scrape period
-# rather than a second, independent constant. `CHITU_METRICS_REFRESH_INTERVAL_S` overrides
-# it (`=0` disables refresh throttling).
-_GAUGE_REFRESH_INTERVAL_FALLBACK_S = 1.0
+# step that retires a request) -- so the default follows the configured scrape period.
+# Set `metrics.gpu_memory_refresh_interval_s=0` to rebuild on every request.
+#
+# The task count and KV cache gauges are NOT throttled by this interval. Their rebuild is
+# a TaskPool scan (tens of microseconds for a few hundred tasks) or a few counter reads,
+# and callers set them on request events only: a skipped call would lose that change
+# until the next request event, which may never arrive.
+#
+# The GPU memory gauges still have that loss: if no further request arrives, nothing
+# calls them again, so they keep their pre-idle values. That is the accepted cost of not
+# asking NVML on every retiring request.
+_GPU_MEMORY_REFRESH_INTERVAL_FALLBACK_S = 1.0
 
 
 def _gauge_refresh_interval_s() -> float:
-    """Return the minimum gauge refresh interval in seconds.
+    """Return the minimum interval between GPU memory gauge rebuilds, in seconds.
 
-    Read the environment override and configured scrape interval on each call,
-    rather than caching them at import time. Fall back to the default interval
-    when global configuration is unavailable, including in unit tests.
+    Read `metrics.gpu_memory_refresh_interval_s` on each call rather than caching it at
+    import time, so a caller that replaces the global config sees the change. Fall back
+    to the default when global configuration is unavailable, including in unit tests.
     """
-    override = os.environ.get("CHITU_METRICS_REFRESH_INTERVAL_S")
-    if override is not None:
-        try:
-            return float(override)
-        except ValueError:
-            logger.warning(
-                "ignoring CHITU_METRICS_REFRESH_INTERVAL_S=%r: not a number", override
-            )
     try:
-        return float(get_global_args().metrics.prometheus_scrape_interval)
+        return float(get_global_args().metrics.gpu_memory_refresh_interval_s)
     except Exception:
-        return _GAUGE_REFRESH_INTERVAL_FALLBACK_S
+        return _GPU_MEMORY_REFRESH_INTERVAL_FALLBACK_S
 
 
 _gauge_refreshed_at: dict[str, float] = {}
@@ -662,9 +662,13 @@ class PrometheusMetricsCollector:
 
     @classmethod
     def update_task_counts(cls):
-        """Update running/waiting request count metrics."""
-        if not _gauge_refresh_due("task_counts"):
-            return
+        """Update running/waiting request count metrics.
+
+        This is an event-driven setter: callers run it when a request starts or ends, and
+        nothing refreshes these gauges periodically. So it must not be throttled. A
+        skipped call would leave the gauges at their previous value until the next
+        request event, and a server that just went idle may never get one.
+        """
         collector, running_metric = cls._metric_attr_or_none(
             "chitu_running_requests", "running_requests"
         )
@@ -743,14 +747,18 @@ class PrometheusMetricsCollector:
 
     @classmethod
     def update_GPU_usage(cls):
-        if not _gauge_refresh_due("gpu_usage"):
-            return
         if get_active_metrics_runtime() is None:
             return
         if Backend.cache_dict is None:
             return
 
+        # KV cache usage is a few counter reads, and callers only run this on request
+        # events, so update it every time. Only the GPU memory block below is expensive
+        # enough to throttle.
         cls.update_kvcache_usage()
+
+        if not _gauge_refresh_due("gpu_memory"):
+            return
 
         collector = cls.get_instance()
         if not collector:
