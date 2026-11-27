@@ -14,9 +14,11 @@ RDMA transfers, and signals RankTransferDone.
 from enum import Enum
 from typing import Optional
 import logging
+import os
 
 import torch
 from chitu.backend import Backend
+from chitu.device_type import is_ascend
 from chitu.global_vars import (
     get_global_args,
     get_multi_inst_ids_by_role,
@@ -30,7 +32,7 @@ from chitu.distributed.parallel_state import (
     get_tp_group,
     get_world_group,
 )
-from chitu.distributed.infiniband import detect_ib_devices
+from chitu.distributed.infiniband import detect_ib_devices, detect_mooncake_ib_devices
 from chitu.distributed.pd_disaggregation.pd_log_utils import pd_trace_enabled
 from chitu.distributed.coordinator import set_value, get_value
 from chitu.kv_cache.kv_cache import PagedKVCache
@@ -100,8 +102,15 @@ class KVManagerBase:
             getattr(self._kv_cfg, "transfer_grace_timeout", 0.0) or 60.0
         )
 
-        # transfer engine
-        ib_device = detect_ib_devices()
+        # Only real RDMA transfers need an active device matching the HCA filter.
+        if (
+            not is_ascend()
+            and os.environ.get("MOONCAKE_PROTOCOL", "rdma") == "rdma"
+            and os.environ.get("MOONCAKE_MOCK_MODE", "0") != "1"
+        ):
+            ib_device = detect_mooncake_ib_devices()
+        else:
+            ib_device = detect_ib_devices()
         self.transfer_engine = MooncakeTransferEngine(
             hostname=get_local_ip(),
             ib_device=ib_device,

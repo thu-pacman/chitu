@@ -71,6 +71,7 @@ def docker_run(
     for var in (
         "NCCL_IB_HCA",
         "NVSHMEM_HCA_LIST",
+        "MC_IB_PORT",
         "GLOO_SOCKET_IFNAME",
         "NCCL_SOCKET_IFNAME",
         "HCCL_SOCKET_IFNAME",
