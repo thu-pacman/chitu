@@ -1140,6 +1140,10 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             for tid in TaskPool.id_list
             if TaskPool.pool[tid].status == TaskStatus.PDDecodeIncoming
         ]
+        prealloc_count = sum(
+            TaskPool.pool[tid].status == TaskStatus.PDDecodePrealloc
+            for tid in TaskPool.id_list
+        )
 
         incoming_task_ids.sort(
             key=lambda x: self.scorer(TaskPool.pool[x]), reverse=True
@@ -1152,7 +1156,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
             if (
                 self._decode_prealloc_max_pending > 0
-                and len(incoming_task_ids) >= self._decode_prealloc_max_pending
+                and prealloc_count >= self._decode_prealloc_max_pending
             ):
                 # 在block 数量有余量的情况下，应该让尽可能多的请求 prealloc block，
                 # 越早 prealloc，就越早开始 Prefill（当然 Prefill 开始与否也取决于 Prefill 的调度和排队，但是早点发 DecodeAllocated 给 Prefill，总是没错的）
@@ -1221,6 +1225,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             info.prealloc_tokens = prealloc_charge_tokens
 
             task.status = TaskStatus.PDDecodePrealloc
+            prealloc_count += 1
 
             self._decode_prealloc_tokens_inflight += prealloc_charge_tokens
             if 0 <= target_dp_rank < len(self._decode_prealloc_tokens_inflight_by_dp):

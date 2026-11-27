@@ -814,7 +814,7 @@ for _x in "${DECODE_SPECS[@]}"; do PD_DECODE_SPECS_STR+="${_x}"$'\n'; done
 export PD_COMMON_OVERRIDES_STR PD_PREFILL_SPECS_STR PD_DECODE_SPECS_STR
 export PD_PREFILL_DEFAULT_SPEC="${PREFILL_DEFAULT_SPEC}" PD_DECODE_DEFAULT_SPEC="${DECODE_DEFAULT_SPEC}"
 
-PD_CPUS_PER_TASK="$(slurm_cpus_per_task "${PD_GPUS_PER_NODE}" "${PD_CPUS_PER_GPU}" "${PD_PARTITION}")"
+PD_CPUS_PER_TASK="${PD_CPUS_PER_TASK:-$(slurm_cpus_per_task "${PD_GPUS_PER_NODE}" "${PD_CPUS_PER_GPU}" "${PD_PARTITION}")}"
 
 # ── 打印摘要 ──
 echo "=== PD Disagg (nodes=${PD_NODES} gpus=${PD_GPUS_PER_NODE}) ==="
@@ -853,11 +853,12 @@ if [ -n "${PD_SLURM_JOB_ID}" ]; then
   SRUN_CMD+=(--jobid="${PD_SLURM_JOB_ID}")
 else
   SRUN_CMD+=(--gres="gpu:${PD_GPUS_PER_NODE}")
+  [ -n "${PD_MEM_PER_NODE:-}" ] && SRUN_CMD+=(--mem="${PD_MEM_PER_NODE}")
   [ "${PD_GPUS_PER_NODE}" -ne 8 ] && SRUN_CMD+=(--gres-flags=enforce-binding)
   [ -n "${PD_PARTITION}" ] && SRUN_CMD+=(--partition="${PD_PARTITION}")
   [ -n "${PD_EXCLUDE}" ] && SRUN_CMD+=(--exclude="${PD_EXCLUDE}")
   [ -n "${PD_NODELIST}" ] && SRUN_CMD+=(--nodelist="${PD_NODELIST}")
-  SRUN_CMD+=(--job-name="${JOB_NAME:-pd_disagg_multi_apptainer}" --time=1:00:00)
+  SRUN_CMD+=(--job-name="${JOB_NAME:-pd_disagg_multi_apptainer}" --time="${PD_TIME_LIMIT:-1:00:00}")
 fi
 
 SRUN_CMD+=(bash "${THIS_SCRIPT}" --node)

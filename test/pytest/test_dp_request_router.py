@@ -154,6 +154,21 @@ def test_select_scheduler_falls_back_to_lb_when_all_hit_zero():
     assert selected == 1
 
 
+def test_prefix_routing_checks_first_block_at_each_cache_block_size():
+    policy = _build_router().policy
+    req = MonkReq("mixed-block-sizes", list(range(65)))
+    policy.instances_block_size.update({0: 4, 1: 8, 2: 4})
+    for sid in (0, 1, 2):
+        policy.cached_blocks[sid] = OrderedDict.fromkeys(["unrelated"])
+    hashes = policy.build_req_block_hashes(req, 1)
+    policy.cached_blocks[1].update(OrderedDict.fromkeys(hashes[:-1]))
+    with patch.object(
+        policy, "build_req_block_hashes", wraps=policy.build_req_block_hashes
+    ) as build:
+        assert policy.select_scheduler(req, eligible_ids=[0, 1, 2]) == 1
+        build.assert_called_once_with(req, 1)
+
+
 def test_remember_req_and_insert_req_blocks_and_forget_req():
     router = _build_router(algorithm="prefix_cache_aware")
     router.policy.instances_num_total_blocks[0] = 2

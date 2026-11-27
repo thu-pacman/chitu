@@ -8,7 +8,7 @@ import time
 import threading
 from contextlib import contextmanager
 from typing import Optional
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
+from prometheus_client import Counter, Gauge, start_http_server
 import atexit
 import torch
 
@@ -20,7 +20,7 @@ from chitu.distributed.parallel_state import (
     get_pcp_group,
     get_dp_size,
 )
-from chitu.boot.tcp_ip import get_local_ip, get_free_port
+from chitu.boot.tcp_ip import get_local_ip
 from chitu.global_vars import get_global_args
 from chitu.metrics.cache_stats import kvcache_stats, get_prealloc_blocks
 from chitu.metrics.task_stats import count_tasks_for_dp_rank, count_tasks_non_dp
@@ -485,12 +485,15 @@ class PrometheusMetricsCollector:
                         f"Failed to get local IP: {e}, use 127.0.0.1 as default"
                     )
                     ip = "127.0.0.1"
-                port = get_free_port()
-                self.collector_server, self.collector_thread = start_http_server(
-                    port
-                )  # Prometheus serve pull data from this server
+                # 端口 0 表示由内核分配一个空闲端口，避免先用 get_free_port()
+                # 探测、再绑定之间被其他进程抢占。实际端口从 server_port 读取，
+                # 后面通过 self.port 暴露给监控端。
+                # Prometheus 从这个地址主动拉取指标。
+                # 需要 prometheus-client >= 0.20：更早版本的 start_http_server
+                # 返回 None，无法拿到 server_port。
+                self.collector_server, self.collector_thread = start_http_server(0)
                 self.ip = ip
-                self.port = port
+                self.port = self.collector_server.server_port
                 logger.info(f"Prometheus metrics server started on addr {self.addr}")
             else:
                 self.ip = "127.0.0.1"
