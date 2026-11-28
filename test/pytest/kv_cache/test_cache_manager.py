@@ -14,7 +14,7 @@ from collections import deque
 from chitu.task import UserRequest, Task
 from chitu.task_type import TaskType
 from omegaconf import OmegaConf
-from chitu.global_vars import set_global_args
+from chitu.global_vars import get_global_args, set_global_args
 from chitu.backend import Backend
 from chitu.utils import ceil_div
 from chitu.scheduler import Scheduler, KVCacheCapacityStatus
@@ -639,8 +639,183 @@ class TestPagedKVCacheManagerWithPrefixCaching:
             1,
         }
         assert len(main_manager.active_blocks) == 3  # [0,1,2]
+        shared_runtime = main_manager.task_to_token_blocks[task_1.task_id][0].runtime
+        assert (
+            main_manager.task_to_token_blocks[task_2.task_id][0].runtime
+            is shared_runtime
+        )
+        assert shared_runtime.active_cnt == 2
         main_manager.finalize_metadata_all_decode(task_1)
+        assert shared_runtime.active_cnt == 1
+        assert main_manager.active_blocks[0] is shared_runtime
+        assert 0 not in main_manager.cached_idle_blocks
         main_manager.finalize_metadata_all_decode(task_2)
+        assert shared_runtime.active_cnt == 0
+        assert 0 not in main_manager.active_blocks
+        assert main_manager.cached_idle_blocks[0] is shared_runtime
+
+    @pytest.mark.parametrize("canonical_idle", [False, True])
+    def test_duplicate_hash_pages_are_evicted_before_canonical_pages(
+        self, monkeypatch, canonical_idle
+    ):
+        monkeypatch.setattr(Backend, "kv_manager", None)
+        manager = PagedKVCacheManager(
+            num_blocks=6,
+            num_hot_req=2,
+            max_seq_len=64,
+            dp_rank=0,
+            block_size=4,
+            enable_prefix_caching=True,
+        )
+        canonical = _build_mock_task("canonical", 9, 9)
+        duplicate = _build_mock_task("duplicate", 9, 9)
+        canonical_ids = manager.prepare_metadata_before_prefill(
+            canonical, eager_prefix_cache_insert=False
+        )
+        duplicate_ids = manager.prepare_metadata_before_prefill(
+            duplicate, eager_prefix_cache_insert=False
+        )
+        assert not manager.identity_runtime_pool
+
+        # Concurrent PD arrivals own different pages before either KV is ready.
+        for task in (canonical, duplicate):
+            task.consume_req_tokens()
+            task.prefix_tokens.append(2)
+            assert manager.prepare_metadata_before_decode(task) == []
+        canonical_pool = dict(manager.identity_runtime_pool)
+        assert len(canonical_pool) == 2
+        if canonical_idle:
+            assert manager.finalize_metadata_all_decode(canonical)
+            assert list(manager.cached_idle_blocks) == canonical_ids[::-1]
+
+        assert manager.finalize_metadata_all_decode(duplicate)
+        if canonical_idle:
+            expected_order = [
+                *duplicate_ids[:2],
+                canonical_ids[2],
+                duplicate_ids[2],
+                canonical_ids[1],
+                canonical_ids[0],
+            ]
+        else:
+            expected_order = duplicate_ids
+            assert set(manager.active_blocks) == set(canonical_ids)
+        assert list(manager.cached_idle_blocks) == expected_order
+        # Evict the redundant copies without invalidating the canonical hashes.
+        for cache_idx in duplicate_ids[:2]:
+            assert manager.get_free_cache_idx() == cache_idx
+            for block_hash, runtime in canonical_pool.items():
+                assert manager.identity_runtime_pool[block_hash] is runtime
+
+    def test_empty_deferred_allocation_does_not_wait_for_kv_release(self, monkeypatch):
+        manager = DeepSeekV4CompressedKVCacheManager(
+            num_blocks=4,
+            num_hot_req=1,
+            max_seq_len=64,
+            dp_rank=0,
+            block_size=4,
+            compress_ratio=4,
+            enable_prefix_caching=False,
+        )
+        # A nonempty prompt shorter than one compression group needs no pages.
+        task = _build_mock_task("empty-deferred", 3, 3)
+        assert task.alloc_seq_len == 3
+        assert (
+            manager.prepare_metadata_before_prefill(
+                task, eager_prefix_cache_insert=False
+            )
+            == []
+        )
+        assert task.task_id not in manager.task_to_token_blocks
+        monkeypatch.setattr(
+            manager,
+            "_should_postpone_release",
+            lambda _: pytest.fail("An empty allocation has no KV transfer to wait for"),
+        )
+        assert manager.finalize_metadata_all_decode(task)
+        assert not manager._release_defer_since
+        assert not manager.active_blocks
+        assert len(manager.free_cache_ids) == 4
+
+    @pytest.mark.parametrize("dcp_size", [1, 4])
+    @pytest.mark.parametrize(
+        "cached_offset, expected_blocks", [(-1, 0), (0, 1), (1, 1)]
+    )
+    def test_retire_publishes_only_complete_ready_blocks_with_mtp_reservations(
+        self, monkeypatch, dcp_size, cached_offset, expected_blocks
+    ):
+        monkeypatch.setattr(Backend, "kv_manager", None)
+        logical_block_size = 4 * dcp_size
+        mtp_size = 2 * logical_block_size + 1
+        monkeypatch.setitem(get_global_args().infer, "mtp_size", mtp_size)
+        manager = PagedKVCacheManager(
+            num_blocks=8,
+            num_hot_req=1,
+            max_seq_len=64,
+            dp_rank=0,
+            block_size=4,
+            dcp_size=dcp_size,
+            mtp_size=mtp_size,
+            enable_prefix_caching=True,
+        )
+        task = _build_mock_task("mtp-retire", 1, 1)
+        cache_ids = manager.prepare_metadata_before_prefill(
+            task, eager_prefix_cache_insert=False
+        )
+        assert len(cache_ids) == 3
+        assert not manager.identity_runtime_pool
+        task.consume_req_tokens()
+        task.prefix_tokens.append(2)  # First token returned by Prefill.
+        cache_ids.extend(manager.prepare_metadata_before_decode(task))
+        assert len(cache_ids) > 3
+        assert task.task_id not in manager._deferred_prefix_publish
+        # Accept one Decode step's tokens after reserving its full MTP window.
+        task.prefix_tokens.extend(range(logical_block_size + cached_offset - 1))
+        assert task.cached_seq_len == logical_block_size + cached_offset
+
+        assert manager.finalize_metadata_all_decode(task)
+        expected_ids = cache_ids[:expected_blocks]
+        assert set(manager.cache_idx_to_hash) == set(expected_ids)
+        assert {
+            runtime.cache_idx for runtime in manager.identity_runtime_pool.values()
+        } == set(expected_ids)
+        assert list(manager.cached_idle_blocks) == cache_ids[::-1]
+        assert not manager.active_blocks
+        assert task.task_id not in manager.task_to_cache_ids
+        assert task.task_id not in manager.task_to_token_blocks
+
+    @pytest.mark.parametrize("dcp_size", [1, 4])
+    def test_retire_before_first_decode_does_not_publish_pending_kv(
+        self, monkeypatch, dcp_size
+    ):
+        monkeypatch.setattr(Backend, "kv_manager", None)
+        logical_block_size = 4 * dcp_size
+        manager = PagedKVCacheManager(
+            num_blocks=4,
+            num_hot_req=1,
+            max_seq_len=64,
+            dp_rank=0,
+            block_size=4,
+            dcp_size=dcp_size,
+            enable_prefix_caching=True,
+        )
+        prompt_len = 2 * logical_block_size + 1
+        task = _build_mock_task("cancel-before-decode", prompt_len, prompt_len)
+        cache_ids = manager.prepare_metadata_before_prefill(
+            task, eager_prefix_cache_insert=False
+        )
+        # PD admission advances the watermark before KV reception completes.
+        task.consume_req_tokens()
+        assert task.cached_seq_len == 2 * logical_block_size
+        assert task.prefix_tokens_len == prompt_len
+        assert task.task_id in manager._deferred_prefix_publish
+
+        assert manager.finalize_metadata_all_decode(task)
+        assert not manager.identity_runtime_pool
+        assert not manager.cache_idx_to_hash
+        assert not manager.active_blocks
+        assert list(manager.cached_idle_blocks) == cache_ids[::-1]
+        assert task.task_id not in manager._deferred_prefix_publish
 
 
 def _build_singleton_manager(checkpoint_interval=None, mtp_size=1, num_blocks=256):

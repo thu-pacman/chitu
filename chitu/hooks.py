@@ -9,6 +9,7 @@ import time
 
 from chitu.finish_reason import FinishReason
 from chitu.global_vars import get_global_args
+from chitu.log_categories import LogCategory, PD_STAGE_LOG, get_category_logger
 from chitu.task import (
     Task,
     TaskType,
@@ -23,7 +24,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from chitu.task import PackedTasksBase
-from chitu.distributed.pd_disaggregation.pd_log_utils import pd_trace_enabled
 from chitu.distributed.pd_disaggregation.pd_scheduler import get_pd_scheduler_instance
 from chitu.distributed.parallel_state import get_dp_group
 from typing import TYPE_CHECKING
@@ -35,6 +35,8 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+pd_stage_logger = get_category_logger(LogCategory.PD_STAGE)
+pd_trace_logger = get_category_logger(LogCategory.PD_TRACE)
 
 
 class TokenSink(Protocol):
@@ -169,14 +171,18 @@ class MooncakeKVTransferHook:
                 )
 
             _kv_send_start = time.monotonic()
-            if logger.isEnabledFor(logging.DEBUG):
+            if pd_stage_logger.isEnabledFor(logging.DEBUG):
                 for rid in req_ids_output:
-                    logger.debug("[PD_STAGE][prefill.kv_send.start] req_id=%s", rid)
+                    pd_stage_logger.debug(
+                        PD_STAGE_LOG,
+                        "prefill.kv_send.start",
+                        rid,
+                    )
 
-            if pd_trace_enabled():
-                logger.debug(
+            if pd_trace_logger.isEnabledFor(logging.DEBUG):
+                pd_trace_logger.debug(
                     f"[PD_TRACE][prefill.kv_send] req_ids={req_ids_output} batch={len(req_ids_output)} "
-                    f"cache_type={get_global_args().infer.cache_type}"
+                    f"cache_type={get_global_args().infer.cache_type}",
                 )
 
             self.kv_manager.send_kv_cache(

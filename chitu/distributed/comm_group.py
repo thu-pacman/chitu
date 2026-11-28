@@ -395,6 +395,21 @@ class CommGroup:
             return
         torch.distributed.all_gather_into_tensor(output, input, group=self.gpu_group)
 
+    def all_gather_coalesced(
+        self, inputs: Sequence[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        """Gather each tensor in rank order, grouping mixed dtypes as byte views."""
+        if self.group_size == 1:
+            return [x.contiguous() for x in inputs]
+        outputs = [
+            x.new_empty((self.group_size * x.shape[0], *x.shape[1:])) for x in inputs
+        ]
+        self.gpu_group.allgather_into_tensor_coalesced(
+            [x.view(torch.uint8) for x in outputs],
+            [x.contiguous().view(torch.uint8) for x in inputs],
+        ).wait()
+        return outputs
+
     def all_to_all_single(
         self, output: torch.Tensor, input: torch.Tensor
     ) -> torch.Tensor:

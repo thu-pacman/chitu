@@ -164,8 +164,11 @@ def init_dp_router(args):
     # Basic initialization
     from chitu.chitu_main import init_logger
 
+    # 配置加载前先建立默认日志级别，保证 Router 早期日志可输出。
     init_logger()
     set_global_args(args)
+    # 配置已加载，再应用 logging.level 和 logging.loggers。Router 不走 chitu_init。
+    init_logger()
     args = get_global_args()  # Get the pre-processed global args
 
     Backend.args = args

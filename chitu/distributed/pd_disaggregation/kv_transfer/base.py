@@ -31,7 +31,7 @@ from chitu.distributed.parallel_state import (
     get_world_group,
 )
 from chitu.distributed.infiniband import detect_ib_devices
-from chitu.distributed.pd_disaggregation.pd_log_utils import pd_trace_enabled
+from chitu.log_categories import LogCategory, get_category_logger
 from chitu.distributed.coordinator import set_value, get_value
 from chitu.kv_cache.kv_cache import PagedKVCache
 from .cache_info import CacheInfo, RankCacheInfos, InstanceCacheInfos
@@ -44,6 +44,7 @@ from .task_info import TaskInfo
 from .protocol import ProtocolSerializer
 
 logger = logging.getLogger(__name__)
+pd_trace_logger = get_category_logger(LogCategory.PD_TRACE)
 
 
 class DisaggregationMode(Enum):
@@ -191,9 +192,12 @@ class KVManagerBase:
     ) -> None:
         """Per-request trace logging for PP + PD debugging.
 
-        Enable with CHITU_PD_TRACE=1.
+        Enable it by setting ``chitu.categories.pd_trace`` to DEBUG in
+        ``logging.loggers``, or by setting ``logging.level=DEBUG`` to enable
+        DEBUG output for every ``chitu`` logger. The record keeps its normal
+        DEBUG level.
         """
-        if not pd_trace_enabled():
+        if not pd_trace_logger.isEnabledFor(logging.DEBUG):
             return
 
         role = (
@@ -226,7 +230,7 @@ class KVManagerBase:
             items[k] = v
 
         parts = ["[PD_TRACE]"] + [f"{k}={v}" for k, v in items.items()]
-        logger.debug(" ".join(parts))
+        pd_trace_logger.debug(" ".join(parts), stacklevel=2)
 
     def remove_request(self, request_id: str):
         self._remove_info(request_id)

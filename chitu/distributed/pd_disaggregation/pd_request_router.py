@@ -18,6 +18,13 @@ from typing_extensions import override
 import msgpack
 import zmq
 
+from chitu.log_categories import (
+    LogCategory,
+    PD_STAGE_LOG,
+    PD_STAGE_LOG_EXTRA,
+    get_category_logger,
+)
+
 from chitu.distributed.pd_disaggregation.pd_scheduler import PDSchedulerMode
 from chitu.finish_reason import FinishReason
 from chitu.dp_request_router import (
@@ -68,6 +75,8 @@ from chitu.task import UserRequest
 from chitu.testing.pd_utils import PDTestRunner
 
 logger = logging.getLogger(__name__)
+pd_stage_logger = get_category_logger(LogCategory.PD_STAGE)
+pd_trace_logger = get_category_logger(LogCategory.PD_TRACE)
 
 
 def _policy_name(policy) -> str:
@@ -1235,7 +1244,7 @@ class PDRequestRouter(RequestRouter):
     async def _add_pd_request(self, request: UserRequest) -> bool:
         """Bind one request to an available P/D pair."""
         request_id = request.request_id
-        logger.debug("[PD_STAGE][router.recv.start] req_id=%s", request_id)
+        pd_stage_logger.debug(PD_STAGE_LOG, "router.recv.start", request_id)
 
         with observe_pd_stage("router", "recv"):
             prefill_eligible_ids = (
@@ -1269,9 +1278,9 @@ class PDRequestRouter(RequestRouter):
             # PD trace: Router selected a P/D pair for this request.
             prompt_len = request.prompt_len
             max_new_tokens = request.max_new_tokens
-            logger.debug(
+            pd_trace_logger.debug(
                 f"[PD_TRACE][router.select_pair] req_id={request_id} prefill_sid={prefill_scheduler_id} "
-                f"decode_sid={decode_scheduler_id} {prompt_len=} {max_new_tokens=}"
+                f"decode_sid={decode_scheduler_id} {prompt_len=} {max_new_tokens=}",
             )
 
             # Create PD request record
@@ -1306,7 +1315,7 @@ class PDRequestRouter(RequestRouter):
 
         # Update router pending requests gauge
         set_router_pending_requests(len(self.pending_pd_requests))
-        logger.debug("[PD_STAGE][router.recv.end] req_id=%s", request_id)
+        pd_stage_logger.debug(PD_STAGE_LOG, "router.recv.end", request_id)
         return True
 
     def _discover_prometheus_collectors(self) -> None:
@@ -1462,16 +1471,18 @@ class PDRequestRouter(RequestRouter):
             is_evict = True
 
         # Dual dispatch: send to both Prefill and Decode simultaneously
-        logger.debug(
-            "[PD_STAGE][router.dispatch.start] req_id=%s prefill_sid=%s decode_sid=%s",
-            pd_request.request_id,
-            pd_request.prefill_scheduler_id,
-            pd_request.decode_scheduler_id,
-        )
-        logger.debug(
+        if pd_stage_logger.isEnabledFor(logging.DEBUG):
+            pd_stage_logger.debug(
+                PD_STAGE_LOG_EXTRA,
+                "router.dispatch.start",
+                pd_request.request_id,
+                f" prefill_sid={pd_request.prefill_scheduler_id}"
+                f" decode_sid={pd_request.decode_scheduler_id}",
+            )
+        pd_trace_logger.debug(
             f"[PD_TRACE][router.dispatch_start] req_id={pd_request.request_id} "
             f"prefill_sid={pd_request.prefill_scheduler_id} decode_sid={pd_request.decode_scheduler_id} "
-            f"keys={sorted(list(request_data.keys()))}"
+            f"keys={sorted(list(request_data.keys()))}",
         )
         with observe_pd_stage("router", "dispatch"):
             try:
@@ -1496,7 +1507,11 @@ class PDRequestRouter(RequestRouter):
                 self.pending_requests.appendleft(pd_request)
                 await asyncio.sleep(0.05)
                 return
-        logger.debug("[PD_STAGE][router.dispatch.end] req_id=%s", pd_request.request_id)
+        pd_stage_logger.debug(
+            PD_STAGE_LOG,
+            "router.dispatch.end",
+            pd_request.request_id,
+        )
 
         # arrival -> both peers have the request: the Router's own contribution to
         # TTFT (HTTP + params + tokenize + route select + queue + ZMQ dual send).
@@ -1533,10 +1548,10 @@ class PDRequestRouter(RequestRouter):
         prefill_data["local_instance_id"] = local_instance_id
 
         packed_data = msgpack.packb(prefill_data)
-        logger.debug(
+        pd_trace_logger.debug(
             f"[PD_TRACE][router.send_prefill] req_id={prefill_data.get('request_id')} sid={local_instance_id} "
             f"addr={self.prefill_schedulers.get(local_instance_id, {}).get('address')} packed_bytes={len(packed_data)} "
-            f"fields={sorted(list(prefill_data.keys()))}"
+            f"fields={sorted(list(prefill_data.keys()))}",
         )
         await self._send_with_retry(
             self.prefill_sockets[local_instance_id],
@@ -1560,10 +1575,10 @@ class PDRequestRouter(RequestRouter):
         decode_data["prefill_scheduler_id"] = prefill_scheduler_id
 
         packed_data = msgpack.packb(decode_data)
-        logger.debug(
+        pd_trace_logger.debug(
             f"[PD_TRACE][router.send_decode] req_id={decode_data.get('request_id')} sid={local_instance_id} "
             f"addr={self.decode_schedulers.get(local_instance_id, {}).get('address')} prefill_sid={prefill_scheduler_id} "
-            f"packed_bytes={len(packed_data)} fields={sorted(list(decode_data.keys()))}"
+            f"packed_bytes={len(packed_data)} fields={sorted(list(decode_data.keys()))}",
         )
         await self._send_with_retry(
             self.decode_sockets[local_instance_id],

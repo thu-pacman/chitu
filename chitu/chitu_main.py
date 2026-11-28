@@ -59,6 +59,7 @@ from chitu.distributed.parallel_state import (
     get_embed_tokens_lm_head_tp_group,
 )
 from chitu.distributed.partition import compute_prefill_chunk_size_dist_in_dp
+from chitu.log_categories import LogCategory, PD_STAGE_LOG, get_category_logger
 from chitu.logging_utils import setup_chitu_logging
 from chitu.metrics import (
     PrometheusMetricsCollector,
@@ -102,6 +103,7 @@ from chitu.optdep import torch_npu  # noqa: F401
 
 
 logger = getLogger(__name__)
+pd_stage_logger = get_category_logger(LogCategory.PD_STAGE)
 
 
 _last_step_task_type: Optional[TaskType] = None
@@ -1446,6 +1448,8 @@ def chitu_init(args):
     init_logger()
 
     set_global_variables(args, debug=debug)
+    # 配置已就绪，应用 logging.level 和 logging.loggers。
+    setup_chitu_logging()
     args = get_global_args()  # Get the pre-processed global args
 
     ###################################################################
@@ -1739,8 +1743,10 @@ def chitu_run_main_rank():
                         req_id = getattr(
                             getattr(task, "req", None), "request_id", task_id
                         )
-                        logger.debug(
-                            "[PD_STAGE][decode.sched_wait.end] req_id=%s", req_id
+                        pd_stage_logger.debug(
+                            PD_STAGE_LOG,
+                            "decode.sched_wait.end",
+                            req_id,
                         )
                 break
         if all(len(task_ids) == 0 for task_ids in task_ids_list):
@@ -1782,7 +1788,11 @@ def chitu_run_main_rank():
                     continue
                 task.pd_sched_wait_end_logged = True
                 req_id = getattr(getattr(task, "req", None), "request_id", task_id)
-                logger.debug("[PD_STAGE][decode.sched_wait.end] req_id=%s", req_id)
+                pd_stage_logger.debug(
+                    PD_STAGE_LOG,
+                    "decode.sched_wait.end",
+                    req_id,
+                )
         tasks = PackedTasks(task_ids)
     else:
         tasks = PackedTasksBase(

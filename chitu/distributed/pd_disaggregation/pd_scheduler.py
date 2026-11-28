@@ -10,6 +10,7 @@ PD disaggregation Scheduler
 - Decode-only：只做 decode 计算；KV pull 与首 token 处理由 KV hook 触发。
 """
 
+import logging
 import time
 import math
 from enum import Enum
@@ -34,7 +35,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer import (
     KVManagerDecode,
     KVManagerPrefill,
 )
-from chitu.distributed.pd_disaggregation.pd_log_utils import pd_trace_enabled
+from chitu.log_categories import LogCategory, PD_STAGE_LOG, get_category_logger
 from chitu.kv_cache.cache_manager import SingletonPagedKVCacheManager
 from chitu.backend import Backend
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
@@ -58,6 +59,8 @@ if TYPE_CHECKING:
     from chitu.kv_cache import PagedKVCacheManager
 
 logger = getLogger(__name__)
+pd_stage_logger = get_category_logger(LogCategory.PD_STAGE)
+pd_trace_logger = get_category_logger(LogCategory.PD_TRACE)
 
 _PD_SCHEDULER_INSTANCE: Optional["PDInstanceRequestManager"] = None
 
@@ -471,11 +474,11 @@ class PDInstanceRequestManager:
         scheduler_type: str = request_data.get("scheduler_type")
         target_role = request_data.get("target_role")
 
-        if pd_trace_enabled():
-            logger.debug(
+        if pd_trace_logger.isEnabledFor(logging.DEBUG):
+            pd_trace_logger.debug(
                 f"[PD_TRACE][sched.recv] mode={self.pd_mode.value} "
                 f"local_instance_id={self.local_instance_id} req_id={request_id} type={request_type} "
-                f"target_role={target_role} keys={sorted(list(request_data.keys()))}"
+                f"target_role={target_role} keys={sorted(list(request_data.keys()))}",
             )
 
         if request_type == "pd_request":
@@ -544,7 +547,11 @@ class PDInstanceRequestManager:
         original_request = request_data["request"]
 
         logger.debug(f"processing prefill request: {request_id}")
-        logger.debug("[PD_STAGE][prefill.queue.start] req_id=%s", request_id)
+        pd_stage_logger.debug(
+            PD_STAGE_LOG,
+            "prefill.queue.start",
+            request_id,
+        )
 
         # Create task from request (request-build boundary). Actual batched prefill
         # compute is driven by the background compute loop (start_worker -> chitu_run()).
@@ -553,16 +560,20 @@ class PDInstanceRequestManager:
             return
         # Enqueue OUTSIDE whitelist boundary: a failure here crashes via unified protocol.
         TaskPool.enqueue(task)
-        if pd_trace_enabled():
-            logger.debug(
+        if pd_trace_logger.isEnabledFor(logging.DEBUG):
+            pd_trace_logger.debug(
                 f"[PD_TRACE][prefill.task] req_id={request_id} task_id={task.task_id} "
                 f"prefix_tokens_len={int(task.prefix_tokens_len)} "
-                f"max_new_tokens={int(task.req.max_new_tokens)}"
+                f"max_new_tokens={int(task.req.max_new_tokens)}",
             )
         logger.debug(
             f"prefill task enqueued for request: {request_id}; compute will be handled by worker loop"
         )
-        logger.debug("[PD_STAGE][prefill.queue.end] req_id=%s", request_id)
+        pd_stage_logger.debug(
+            PD_STAGE_LOG,
+            "prefill.queue.end",
+            request_id,
+        )
 
     async def _process_decode_request(self, request_data: dict[str, Any]):
         """Process Decode-only request"""
@@ -598,11 +609,11 @@ class PDInstanceRequestManager:
         self.pending_decode_requests[request_id] = decode_info
 
         args = get_global_args()
-        if pd_trace_enabled():
-            logger.debug(
+        if pd_trace_logger.isEnabledFor(logging.DEBUG):
+            pd_trace_logger.debug(
                 f"[PD_TRACE][decode.dispatch] req_id={request_id} prefill_sid={prefill_scheduler_id} "
                 f"infer_dp_size={int(self.dp_size)} "
-                f"infer_ep_size={int(args.infer.ep_size)}"
+                f"infer_ep_size={int(args.infer.ep_size)}",
             )
 
         # Create task but not enqueue to TaskPool
@@ -625,7 +636,11 @@ class PDInstanceRequestManager:
         logger.debug(
             f"[PD_QUEUE][decode.enqueue] req_id={request_id} cache_owner=pending"
         )
-        logger.debug("[PD_STAGE][decode.enqueue.start] req_id=%s", request_id)
+        pd_stage_logger.debug(
+            PD_STAGE_LOG,
+            "decode.enqueue.start",
+            request_id,
+        )
 
     def _create_task_from_request(self, request_data: dict) -> Task:
         """Create Task from serialized request. Whitelist boundary: only
@@ -843,7 +858,11 @@ class PrefillOnlyManager(PDInstanceRequestManager):
         # 该日志表示 Prefill scheduler 已接收该请求，但尚未进入 prefill executor.step 流程
         # 在等待 Decode schedule 该请求并发送 DecodeAllocated
         logger.debug(f"[PD_QUEUE][prefill.enqueue] request queued: req_id={request_id}")
-        logger.debug("[PD_STAGE][prefill.queue.start] req_id=%s", request_id)
+        pd_stage_logger.debug(
+            PD_STAGE_LOG,
+            "prefill.queue.start",
+            request_id,
+        )
 
     def _bootstrap_check_and_promote(self):
         """Drive Prefill status: incoming -> TaskPool."""
@@ -889,7 +908,11 @@ class PrefillOnlyManager(PDInstanceRequestManager):
             # un-attributed block of PD TTFT — was invisible. Start the clock
             # once, on the first poll that sees the task.
             if info.begin_observe_stage_once("transfer_info"):
-                logger.debug("[PD_STAGE][prefill.transfer_info.start] req_id=%s", rid)
+                pd_stage_logger.debug(
+                    PD_STAGE_LOG,
+                    "prefill.transfer_info.start",
+                    rid,
+                )
                 logger.debug(
                     f"[PD_QUEUE][prefill.move] incoming->bootstrap_wait req_id={rid}"
                 )
@@ -923,7 +946,11 @@ class PrefillOnlyManager(PDInstanceRequestManager):
             logger.debug(
                 f"[PD_QUEUE][prefill.ready] req_id={rid} DecodeAllocated ready waited={time_since_task_created:.1f}s"
             )
-            logger.debug("[PD_STAGE][prefill.transfer_info.end] req_id=%s", rid)
+            pd_stage_logger.debug(
+                PD_STAGE_LOG,
+                "prefill.transfer_info.end",
+                rid,
+            )
 
         # Update prefill queue size gauges
         set_queue_size("prefill", "incoming", len(incoming_task_ids))
@@ -1237,8 +1264,16 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             info.begin_observe_stage("prealloc")
             # Record enqueue stage duration
             observe_stage_duration("decode", "enqueue", time_since_task_created)
-            logger.debug("[PD_STAGE][decode.enqueue.end] req_id=%s", rid)
-            logger.debug("[PD_STAGE][decode.prealloc.start] req_id=%s", rid)
+            pd_stage_logger.debug(
+                PD_STAGE_LOG,
+                "decode.enqueue.end",
+                rid,
+            )
+            pd_stage_logger.debug(
+                PD_STAGE_LOG,
+                "decode.prealloc.start",
+                rid,
+            )
             logger.debug(
                 f"[PD_QUEUE][decode.prealloc] req_id={rid} cache_owner={target_dp_rank} waited={time_since_task_created:.1f}s"
             )
@@ -1323,8 +1358,16 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 logger.warning(
                     f"[PD_SLOW] decode.prealloc req_id={rid} waited={time_since_task_created:.1f}s"
                 )
-            logger.debug("[PD_STAGE][decode.prealloc.end] req_id=%s", rid)
-            logger.debug("[PD_STAGE][decode.ready.start] req_id=%s", rid)
+            pd_stage_logger.debug(
+                PD_STAGE_LOG,
+                "decode.prealloc.end",
+                rid,
+            )
+            pd_stage_logger.debug(
+                PD_STAGE_LOG,
+                "decode.ready.start",
+                rid,
+            )
             logger.debug(
                 f"[PD_QUEUE][decode.ready] req_id={rid} KV ready waited={time_since_task_created:.1f}s"
             )

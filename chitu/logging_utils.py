@@ -4,6 +4,7 @@
 
 import inspect
 import logging
+import sys
 import traceback
 from typing import Any, Dict, Set, Tuple, Callable
 from contextvars import ContextVar
@@ -11,7 +12,7 @@ from contextlib import contextmanager
 from logging import getLogger
 
 from chitu.global_vars import get_global_args
-from chitu.utils import get_chitu_env, get_chitu_bool_env, should_pretty_log
+from chitu.utils import get_chitu_bool_env, should_pretty_log
 
 try:
     import torch.distributed as dist
@@ -31,7 +32,7 @@ _log_stack_trace = get_chitu_bool_env("CHITU_LOG_STACK_TRACE", False)
 
 
 class ChituLogger(logging.Logger):
-    """Custom logger with *_once methods that log a message only the first time."""
+    """Custom logger with *_once methods."""
 
     def _any_once(self, log_fn: Callable, msg: str, *args, **kwargs):
         f = inspect.currentframe().f_back.f_back
@@ -153,19 +154,32 @@ def log_context(**kwargs):
         _log_context.set(old_context)
 
 
+_configured_loggers: Set[str] = set()
+
+
 def setup_chitu_logging():
-    # Format: `<level>` or `<module1>:<level1>;<module2>:<level2>;...`
-    level_str = get_chitu_env("CHITU_LOGGING_LEVEL", "INFO")
-    try:
-        base_name = __name__.split(".")[0]
-        for substr in level_str.split(";"):
-            if ":" in substr:
-                module, level = substr.split(":")
-                logging.getLogger(module).setLevel(level)
-            else:
-                logging.getLogger(base_name).setLevel(substr)
-    except Exception as e:
-        raise ValueError(
-            f"Invalid CHITU_LOGGING_LEVEL: {level_str}. Acceptable format: "
-            f"`<level>` or `<module1>:<level1>;<module2>:<level2>;..."
-        ) from e
+    """Apply the ``logging`` section of serve_config.yaml.
+
+    The ``chitu`` logger gets ``logging.level``. Each entry in
+    ``logging.loggers`` sets one logger's level. Overrides that disappear from
+    a later call are reset to NOTSET.
+    """
+    args = get_global_args(need_ensure=False)
+    logging_cfg = getattr(args, "logging", None) if args is not None else None
+    base_level = (
+        getattr(logging_cfg, "level", "INFO") if logging_cfg is not None else "INFO"
+    )
+    logging.getLogger("chitu").setLevel(str(base_level).upper())
+
+    overrides = (
+        getattr(logging_cfg, "loggers", None) if logging_cfg is not None else None
+    )
+    configured: Set[str] = set()
+    if overrides:
+        for name, level in overrides.items():
+            logging.getLogger(str(name)).setLevel(str(level).upper())
+            configured.add(str(name))
+    for name in _configured_loggers - configured:
+        logging.getLogger(name).setLevel(logging.NOTSET)
+    _configured_loggers.clear()
+    _configured_loggers.update(configured)

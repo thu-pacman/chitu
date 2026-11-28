@@ -271,7 +271,7 @@ class KVManagerPrefill(KVManagerBase):
                 )
                 continue
             need = ceil_div(cached_len, cache.block_size)
-            block_indices = block_indices[:need]
+            page_end = slice(None, need).indices(len(block_indices))[1]
             skip = 0
             if info is not None:
                 skip = min(
@@ -279,10 +279,10 @@ class KVManagerPrefill(KVManagerBase):
                         0,
                         info.cache_manager_hit_block_counts.get(cache.manager_name, 0),
                     ),
-                    len(block_indices),
+                    page_end,
                 )
-            ids = np.array(block_indices[skip:], dtype=np.int32)
-            sequence_page_indices = np.arange(skip, len(block_indices), dtype=np.int32)
+            ids = np.array(block_indices[skip:page_end], dtype=np.int32)
+            sequence_page_indices = np.arange(skip, page_end, dtype=np.int32)
             for key in cache.paged_kv_cache:
                 send_buffers.cache_block_ids[key] = ids
                 send_buffers.sequence_page_indices[key] = sequence_page_indices

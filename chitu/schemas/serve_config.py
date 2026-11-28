@@ -304,6 +304,12 @@ class DebugConfig:
     disable_inter_op_auto_tune: bool = MISSING
 
 
+@dataclass
+class LoggingConfig:
+    level: str = MISSING
+    loggers: dict[str, str] = field(default_factory=dict)
+
+
 class StaticConfig:
     def __init__(self, config_obj):
         if hasattr(config_obj, "__dataclass_fields__"):
@@ -400,6 +406,7 @@ class ServeConfig(ServeConfigLegacy):
     test: TestConfig = field(default_factory=TestConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     quant: Optional[str] = MISSING
     gpu_preprocess: bool = MISSING
     disable_layerwise_load: bool = MISSING

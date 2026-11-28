@@ -222,7 +222,7 @@ class QuantizationRegistry:
         for line in lines:
             target_logger.info(line)
         target_logger.info(
-            "Set CHITU_LOGGING_LEVEL=chitu.backend:DEBUG to see the full model structure, including where each selected module is used."
+            "Set logging.loggers: {chitu.backend: DEBUG} in serve_config.yaml to see the full model structure, including where each selected module is used."
         )
         return True
 

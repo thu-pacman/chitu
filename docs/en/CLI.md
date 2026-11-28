@@ -994,8 +994,15 @@ an unavailable instance is restarted.
 
 Additional configs for PD disaggregation.
 
-> TIPS: To enable verbose logging for PD disaggregation, set the following:
-> `CHITU_LOGGING_LEVEL=chitu.distributed.pd_disaggregation:DEBUG;chitu.hooks:DEBUG;chitu.scheduler:DEBUG`
+TIPS:
+1. To enable verbose logging for PD disaggregation, pass
+`logging.level=DEBUG` on the command line to enable DEBUG output for all
+`chitu` loggers.
+2. To enable it only for the PD-related loggers, add the
+following to `logging.loggers` in `serve_config.yaml`:
+`chitu.categories.pd_stage: DEBUG`, `chitu.categories.pd_trace: DEBUG`.
+The command-line equivalent is
+`'+logging.loggers={chitu.categories.pd_stage:DEBUG,chitu.categories.pd_trace:DEBUG}'`.
 
 #### Argument `multi_inst.pd_disaggregation.kv_transfer_backend`
 
@@ -1241,6 +1248,51 @@ Acceptable values:
 - True: Skip inter-op auto-tuning.
 
 *Default: `False`.*
+
+## `logging`
+
+Logging configuration.
+
+### Argument `logging.level`
+
+Log level for the `chitu` logger. This is the default level for every
+`chitu.*` logger, including the category loggers under
+`chitu.categories.*`, unless that logger is overridden by
+`logging.loggers`.
+
+Acceptable values: NOTSET, DEBUG, INFO, WARNING, ERROR, CRITICAL.
+
+Example: `logging.level=DEBUG` on the command line enables DEBUG output
+for the whole service.
+
+*Default: `INFO`.*
+
+### Argument `logging.loggers`
+
+Per-logger level overrides. Keys are full logger names and values are
+levels. Two kinds of names are useful:
+
+- Module loggers, e.g. `chitu.hooks`, `chitu.scheduler`, or
+  `chitu.distributed.pd_disaggregation`. Setting a package logger also
+  applies to its submodules, because they inherit the level.
+- Category loggers declared in `chitu/log_categories.py`, i.e.
+  `chitu.categories.pd_stage` and `chitu.categories.pd_trace`.
+
+A logger's own level takes precedence over `logging.level`.
+
+Example:
+  loggers:
+    chitu.categories.pd_stage: DEBUG
+    chitu.categories.pd_trace: DEBUG
+
+Command-line overrides: Hydra treats dots in an override key as nested
+maps, so `+logging.loggers.chitu.hooks=DEBUG` does NOT work. It creates a
+`chitu` entry whose value is a map, which fails validation. Replace the
+whole map instead, and quote the argument because of the braces and
+commas: `'+logging.loggers={chitu.hooks:DEBUG,chitu.scheduler:DEBUG}'`.
+This merges with the entries already present in `serve_config.yaml`.
+
+*Default: `{}`.*
 
 ## Argument `float_16bit_variant`
 
