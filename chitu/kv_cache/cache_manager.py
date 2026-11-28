@@ -15,7 +15,6 @@ from chitu.kv_cache.prefix_caching import (
     TokenBlock,
     BlockIdentityChainBuilder,
     BlockRuntime,
-    KVBlockState,
 )
 from collections import defaultdict
 
@@ -443,11 +442,14 @@ class PagedKVCacheManager(KVCacheManagerBase):
             f"task_id={task.task_id}"
         )
 
+        owned_ids = self.task_to_cache_ids[task.task_id]
+        # An empty deferred allocation has no block list to retire.
+        token_blocks = (
+            self.task_to_token_blocks[task.task_id] if num_identity_blocks else []
+        )
         if self.enable_prefix_caching:
             # 被prefix caching击中block不占chunk prefill size的容量，也不增加额外的kv cache block需求
-            for idx in range(
-                len(self.task_to_cache_ids[task.task_id]), task_num_cached_blocks
-            ):
+            for idx in range(len(owned_ids), task_num_cached_blocks):
                 identity = task_identities[idx]
                 assert (
                     identity.blk_hash in self.identity_runtime_pool
@@ -455,43 +457,34 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
                 # 从identity_runtime_pool获取runtime，并更新runtime信息
                 runtime = self.identity_runtime_pool[identity.blk_hash]
-                block = TokenBlock(identity=identity, runtime=runtime)
-                block.runtime.active_cnt += 1
-                assert (
-                    block.runtime.state == KVBlockState.ACTIVE
-                ), f"{block.runtime.state.value} vs {KVBlockState.ACTIVE.value}"
-                self.cached_idle_blocks.pop(block.cache_idx, None)
-                self.active_blocks[block.cache_idx] = block.runtime
+                cache_idx = runtime.cache_idx
+                runtime.active_cnt += 1
+                assert cache_idx is not None and runtime.active_cnt > 0
+                self.cached_idle_blocks.pop(cache_idx, None)
+                self.active_blocks[cache_idx] = runtime
 
                 # 更新任务状态
-                new_cache_ids.append(block.cache_idx)
-                self.task_to_cache_ids[task.task_id].add(block.cache_idx)
-                self.task_to_token_blocks[task.task_id].append(block)
+                new_cache_ids.append(cache_idx)
+                owned_ids.add(cache_idx)
+                token_blocks.append(TokenBlock(identity, runtime))
 
-        assert (
-            len(self.task_to_cache_ids.get(task.task_id, set()))
-            == task_num_cached_blocks
-        ), (
+        assert len(owned_ids) == task_num_cached_blocks, (
             f"task_id={task.task_id} manager={getattr(self,'manager_name',type(self).__name__)} "
             f"block_size={self.block_size} type={task.task_type} consumed={task.consumed_req_tokens} "
             f"prefix_len={task.prefix_tokens_len} target_seq_len={target_seq_len} "
-            f"n_owned={len(self.task_to_cache_ids.get(task.task_id,set()))} "
+            f"n_owned={len(owned_ids)} "
             f"n_cached={task_num_cached_blocks} n_target={num_target_blocks}"
         )
 
-        for idx in range(
-            len(self.task_to_cache_ids[task.task_id]), num_target_blocks, 1
-        ):
+        for idx in range(len(owned_ids), num_target_blocks):
             identity = task_identities[idx]
             cache_idx = self.get_free_cache_idx()
-            assert (
-                cache_idx not in self.task_to_cache_ids[task.task_id]
-            ), f"{cache_idx} is already in {self.task_to_cache_ids[task.task_id]}"
+            assert cache_idx not in owned_ids, f"{cache_idx} is already in {owned_ids}"
             new_cache_ids.append(cache_idx)
             block = TokenBlock(identity, runtime=BlockRuntime(cache_idx, active_cnt=1))
-            self.active_blocks[block.cache_idx] = block.runtime
-            self.task_to_cache_ids[task.task_id].add(cache_idx)
-            self.task_to_token_blocks[task.task_id].append(block)
+            self.active_blocks[cache_idx] = block.runtime
+            owned_ids.add(cache_idx)
+            token_blocks.append(block)
 
         if eager_prefix_cache_insert:
             # 非PD-Decode-Only节点调用prepare_metadata_before_prefill后立刻进入 prefill 前向，可视为cache就绪可复用
@@ -635,44 +628,46 @@ class PagedKVCacheManager(KVCacheManagerBase):
         cached_blocks = self.task_to_token_blocks[task.task_id]
         num_cached_blocks = len(cached_blocks)
         identities = self._make_task_identities(task)
-        valid_kv_len = task.cached_seq_len
-        prefix_ready = task.task_id not in self._deferred_prefix_publish
+        publishable_blocks = (
+            min(
+                len(identities),
+                task.cached_seq_len // (self.block_size * self.dcp_size),
+            )
+            if task.task_id not in self._deferred_prefix_publish
+            else 0
+        )
 
         # 更新blockruntime、self.active_blocks、self.cached_idle_blocks以及self.identity_runtime_pool
         for i in range(num_cached_blocks - 1, -1, -1):
             # 倒序遍历cached_blocks，确保lru逐出顺序为: 先逐出后缀、再逐出前缀
             # decode 按 mtp 可能多预分配块，超出 prefix identity 链的块不入 prefix pool
-            blk_hash = identities[i].blk_hash if i < len(identities) else None
             runtime = cached_blocks[i].runtime
+            cache_idx = runtime.cache_idx
 
             runtime.active_cnt -= 1
             assert (
                 runtime.active_cnt >= 0
             ), f"TokenBlock.activte_cnt ({runtime.active_cnt}) shouldn't smaller than 0."
 
-            if runtime.state == KVBlockState.IDLE:
-                self.active_blocks.pop(runtime.cache_idx)
-                self.cached_idle_blocks[runtime.cache_idx] = runtime
-                self.cached_idle_blocks.move_to_end(runtime.cache_idx, last=True)
+            if runtime.active_cnt == 0 and cache_idx is not None:
+                self.active_blocks.pop(cache_idx)
+                self.cached_idle_blocks[cache_idx] = runtime
+                self.cached_idle_blocks.move_to_end(cache_idx, last=True)
 
-            if (
-                blk_hash is not None
-                and prefix_ready
-                and (i + 1) * self.block_size * self.dcp_size <= valid_kv_len
-            ):
-                if (
-                    blk_hash not in self.identity_runtime_pool
-                    and self.enable_prefix_caching
-                ):
+            if i < publishable_blocks:
+                blk_hash = identities[i].blk_hash
+                if blk_hash is None:
+                    continue
+                blk_visible_runtime = self.identity_runtime_pool.get(blk_hash)
+                if blk_visible_runtime is None and self.enable_prefix_caching:
                     self.identity_runtime_pool[blk_hash] = runtime
-                    self.cache_idx_to_hash[runtime.cache_idx] = blk_hash
+                    self.cache_idx_to_hash[cache_idx] = blk_hash
                 elif (
-                    blk_hash in self.identity_runtime_pool
-                    and self.identity_runtime_pool[blk_hash] is not runtime
+                    blk_visible_runtime is not None
+                    and blk_visible_runtime is not runtime
                 ):
                     # task侧的runtime与identity_runtime_pool侧不一致时，task侧的runtime永远不会被引用到，因此移至左侧最先被逐出
-                    self.cached_idle_blocks.move_to_end(runtime.cache_idx, last=False)
-                    blk_visible_runtime = self.identity_runtime_pool[blk_hash]
+                    self.cached_idle_blocks.move_to_end(cache_idx, last=False)
                     if blk_visible_runtime.cache_idx in self.cached_idle_blocks:
                         self.cached_idle_blocks.move_to_end(
                             blk_visible_runtime.cache_idx, last=True
