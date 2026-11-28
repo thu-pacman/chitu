@@ -92,37 +92,10 @@ class MoECPETPTokenDispatcher(MoETokenDispatcher):
                 expected_n_tokens_per_expert=x.expected_n_tokens_per_expert,
                 expert_ids_are_local=x.expert_ids_are_local,
             )
-            expected_n_local = cp_ctx.expected_n_local
-        else:
-            expected_n_local = self.local_num_tokens
-
-        global_m = self.group_size * expected_n_local
-        global_activation = torch.empty(
-            global_m,
-            *x.activation.shape[1:],
-            device=x.activation.device,
-            dtype=x.activation.dtype,
-        )
-        global_topk_ids = torch.empty(
-            global_m,
-            *x.token_to_expert_indices.shape[1:],
-            device=x.token_to_expert_indices.device,
-            dtype=x.token_to_expert_indices.dtype,
-        )
-        global_topk_weights = torch.empty(
-            global_m,
-            *topk_weights.shape[1:],
-            device=topk_weights.device,
-            dtype=topk_weights.dtype,
-        )
-        self.cp_group.all_gather_into_tensor(
-            global_activation, x.activation.contiguous()
-        )
-        self.cp_group.all_gather_into_tensor(
-            global_topk_ids, x.token_to_expert_indices.contiguous()
-        )
-        self.cp_group.all_gather_into_tensor(
-            global_topk_weights, topk_weights.contiguous()
+        global_activation, global_topk_ids, global_topk_weights = (
+            self.cp_group.all_gather_coalesced(
+                (x.activation, x.token_to_expert_indices, topk_weights)
+            )
         )
 
         return (

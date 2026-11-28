@@ -144,3 +144,30 @@ def test_cartesian_product_2():
         [0, 1, 2, 3],
         [4, 5, 6, 7],
     ] + [[i] for i in range(8, world_size)]
+
+
+def test_all_gather_coalesced_preserves_mixed_types_and_subgroup_order():
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    if not torch.distributed.is_initialized():
+        auto_set_ib_envs()
+        torch.distributed.init_process_group("nccl")
+    _init_global_args()
+    rank = torch.distributed.get_rank()
+    world = torch.distributed.get_world_size()
+    if world < 3:
+        pytest.skip("Requires a two-rank subgroup and at least one singleton")
+    group = CommGroup([[0, 1]] + [[i] for i in range(2, world)], rank)
+    base = torch.arange(12, device="cuda", dtype=torch.int32).reshape(2, 6)
+
+    def payload(source):
+        values = base + source - 6
+        return values[:, ::2], values[:, 0].to(torch.bfloat16), values.to(torch.int8)
+
+    inputs = payload(rank)
+    outputs = group.all_gather_coalesced(inputs)
+    for i, output in enumerate(outputs):
+        expected = torch.cat([payload(source)[i] for source in group.rank_list])
+        assert output.dtype == expected.dtype
+        assert output.is_contiguous()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
