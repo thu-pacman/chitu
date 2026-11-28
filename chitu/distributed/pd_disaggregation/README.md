@@ -700,7 +700,7 @@ observe_stage_duration("decode", "kv_recv", duration_s)
 | `created pd request: <rid> -> P{k}-D{m}` | Router            | 请求分配到具体 P/D     |
 
 
-启用详细日志：设置环境变量 `CHITU_LOGGING_LEVEL=chitu.distributed.pd_disaggregation:DEBUG;chitu.hooks:DEBUG;chitu.scheduler:DEBUG`。
+启用详细日志：`logging.level=DEBUG` 会打开所有 `chitu` logger 的 DEBUG 输出。只想看 PD 相关日志时，在 `serve_config.yaml` 的 `logging.loggers` 中设置 `chitu.categories.pd_stage: DEBUG`、`chitu.categories.pd_trace: DEBUG`；命令行的等价写法是 `'+logging.loggers={chitu.categories.pd_stage:DEBUG,chitu.categories.pd_trace:DEBUG}'`（引号必需）。不能用 `+logging.loggers.chitu.hooks=DEBUG` 这种逐项写法：logger 名中的点会被 Hydra 解析成嵌套 map，导致校验失败。
 
 ### Prometheus Server 集成
 

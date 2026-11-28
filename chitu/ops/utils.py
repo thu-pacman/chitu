@@ -151,7 +151,7 @@ def emit_observed_op_impl_summary(target_logger=None) -> bool:
     for line in lines:
         target_logger.info(line)
     target_logger.info(
-        "Set CHITU_LOGGING_LEVEL=chitu.ops:DEBUG for dispatchment details"
+        "Set logging.loggers: {chitu.ops: DEBUG} in serve_config.yaml for dispatchment details"
     )
     return True
 

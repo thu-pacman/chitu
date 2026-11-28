@@ -11,6 +11,8 @@ from chitu.boot.arg_utils import apply_multi_inst_override
 
 logger = getLogger(__name__)
 
+_LOG_LEVELS = {"NOTSET", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
 
 class ServeConfigRules(Callback):
     def __init__(self) -> None:
@@ -141,6 +143,29 @@ class ServeConfigRules(Callback):
             self._exit_with_error(
                 f"bind_process_to_cpu must be one of [auto, none, one_numa_per_rank numa_near_device], got {bind_process_to_cpu}"
             )
+
+        logging_config = config.get("logging", {}) or {}
+        log_level = logging_config.get("level", "INFO")
+        if not isinstance(log_level, str) or log_level.upper() not in _LOG_LEVELS:
+            self._exit_with_error(
+                "logging.level must be one of [NOTSET, DEBUG, INFO, WARNING, "
+                f"ERROR, CRITICAL], got {log_level}"
+            )
+        loggers = logging_config.get("loggers", {}) or {}
+        if not (isinstance(loggers, dict) or OmegaConf.is_dict(loggers)):
+            self._exit_with_error(
+                f"logging.loggers must be a mapping of logger name to level, got {loggers}"
+            )
+        for name, level in loggers.items():
+            if not isinstance(name, str) or not name:
+                self._exit_with_error(
+                    f"logging.loggers keys must be non-empty logger names, got {name!r}"
+                )
+            if not isinstance(level, str) or level.upper() not in _LOG_LEVELS:
+                self._exit_with_error(
+                    f"logging.loggers[{name!r}] must be one of "
+                    f"[NOTSET, DEBUG, INFO, WARNING, ERROR, CRITICAL], got {level}"
+                )
 
         bind_thread_to_cpu = config.infer.bind_thread_to_cpu
         if bind_thread_to_cpu not in {"physical_core", "logical_core"}:
