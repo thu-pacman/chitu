@@ -66,6 +66,7 @@ import pytest
 import zmq
 from omegaconf import OmegaConf
 
+import chitu.distributed.pd_disaggregation.kv_transfer.decode as decode_module
 import chitu.distributed.pd_disaggregation.kv_transfer.prefill as prefill_module
 from chitu.backend import Backend
 from chitu.distributed.pd_disaggregation.kv_transfer.base import (
@@ -1064,6 +1065,7 @@ def test_get_send_buffers_keeps_an_empty_list_for_a_fully_hit_prefix(monkeypatch
     assert buffers is not None
     assert "kv" in buffers.cache_block_ids
     assert len(buffers.cache_block_ids["kv"]) == 0
+    assert buffers.sequence_page_indices["kv"].tolist() == []
 
 
 def test_get_send_buffers_returns_the_blocks_decode_does_not_have_yet(monkeypatch):
@@ -1093,6 +1095,40 @@ def test_get_send_buffers_returns_the_blocks_decode_does_not_have_yet(monkeypatc
     # the Decode side and is skipped from the front.
     assert list(buffers.cache_block_ids["kv"]) == [4]
     assert list(buffers.cache_block_ids["mtp"]) == [7]
+    assert buffers.sequence_page_indices["kv"].tolist() == [1]
+
+
+@pytest.mark.parametrize(
+    "dcp_size, allocated, expected, sequence_pages",
+    [
+        (1, [11, 12, 13, 14, 15, 16], [12, 13, 14, 15], None),
+        (2, [11, 12, 13, 14], [11, 12], [1, 3]),
+    ],
+)
+def test_recv_buffers_keep_lookahead_out_of_transferred_pages(
+    monkeypatch, dcp_size, allocated, expected, sequence_pages
+):
+    cache = _FakePagedCache("kv", block_size=4, dcp_size=dcp_size)
+    cache.dcp_rank = dcp_size - 1
+    monkeypatch.setattr(Backend, "cache_dict", {"kv": cache})
+    monkeypatch.setattr(decode_module, "PagedKVCache", _FakePagedCache)
+    info = _info(
+        "req",
+        prefix_len=20,
+        cache_manager_new_block_ids={"kv": allocated},
+        cache_manager_hit_block_counts={"kv": 1},
+    )
+    manager = object.__new__(KVManagerDecode)
+    monkeypatch.setattr(manager, "_info", lambda request_id: info)
+    buffers = manager.get_recv_buffers("req")
+    assert buffers.cache_block_ids["kv"].tolist() == expected
+    assert info.cache_transfer_block_ids["kv"] == expected
+    assert info.cache_new_block_ids["kv"] == allocated
+    assert info.cache_new_block_ids["kv"] is not allocated
+    if sequence_pages is None:
+        assert not buffers.sequence_page_indices
+    else:
+        assert buffers.sequence_page_indices["kv"].tolist() == sequence_pages
 
 
 # --------------------------------------------------------------------------

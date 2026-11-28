@@ -156,11 +156,10 @@ class KVManagerDecode(KVManagerBase):
                     f"{len(new_block_ids)} blocks for the request, expect "
                     f"mtp_size={cache.mtp_size}"
                 )
-                full_block_ids = list(new_block_ids)
+                need = len(new_block_ids)
                 skip = 0
             else:
                 need = ceil_div(info.prefix_len, cache.block_size * cache.dcp_size)
-                full_block_ids = new_block_ids[:need]
                 # Prefix hits are counted in block_size-token sequence pages.
                 skip = min(
                     max(
@@ -172,6 +171,7 @@ class KVManagerDecode(KVManagerBase):
 
             sequence_page_indices = None
             if cache.dcp_size > 1:
+                full_block_ids = new_block_ids[:need]
                 if len(full_block_ids) != need:
                     raise ValueError(
                         f"KV transfer needs {need} logical blocks for decode cp, got {len(full_block_ids)}"
@@ -190,7 +190,7 @@ class KVManagerDecode(KVManagerBase):
                     # full_block_ids is indexed by group_index
                     transfer_block_ids.append(full_block_ids[group_index])
             else:
-                transfer_block_ids = full_block_ids[skip:]
+                transfer_block_ids = new_block_ids[skip:need]
 
             # Keep lookahead allocations addressable without transferring
             # unwritten pages beyond the prompt.
